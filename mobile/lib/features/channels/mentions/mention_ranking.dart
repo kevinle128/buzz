@@ -7,6 +7,9 @@ import '../../../shared/utils/string_utils.dart';
 @immutable
 class MentionCandidate {
   final String pubkey;
+
+  /// Restored identity only: eligibility must come from current community state.
+  final bool requiresRevalidation;
   final String? displayName;
   final String? secondaryLabel;
   final String? avatarUrl;
@@ -15,8 +18,13 @@ class MentionCandidate {
   final String? role;
   final String? ownerPubkey;
 
+  /// Contextual identity label for the picker row. Presentation only: the
+  /// inserted mention text still uses [label] and binds the exact [pubkey].
+  final String? contextLabel;
+
   const MentionCandidate({
     required this.pubkey,
+    this.requiresRevalidation = false,
     this.displayName,
     this.secondaryLabel,
     this.avatarUrl,
@@ -24,7 +32,24 @@ class MentionCandidate {
     this.isMember = false,
     this.role,
     this.ownerPubkey,
+    this.contextLabel,
   });
+
+  /// The row label shown in the picker.
+  String get pickerLabel => contextLabel ?? label;
+
+  MentionCandidate withContextLabel(String? contextLabel) => MentionCandidate(
+    pubkey: pubkey,
+    requiresRevalidation: requiresRevalidation,
+    displayName: displayName,
+    secondaryLabel: secondaryLabel,
+    avatarUrl: avatarUrl,
+    isAgent: isAgent,
+    isMember: isMember,
+    role: role,
+    ownerPubkey: ownerPubkey,
+    contextLabel: contextLabel,
+  );
 
   String get label {
     final name = displayName?.trim();

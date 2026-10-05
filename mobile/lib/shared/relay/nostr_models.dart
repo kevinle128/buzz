@@ -36,8 +36,8 @@ abstract final class EventKind {
   /// Kind:9038 owner/admin App lifecycle command. Relay-admin only.
   static const appAdminCommand = 9038;
 
-  /// Kind:39007 parameterized-replaceable App metadata. Relay-signed.
-  static const appMetadata = 39007;
+  /// Kind:39008 parameterized-replaceable App metadata. Relay-signed.
+  static const appMetadata = 39008;
   static const streamMessageEdit = 40003;
   static const streamMessageDiff = 40008;
   static const systemMessage = 40099;

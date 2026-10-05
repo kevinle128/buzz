@@ -67,6 +67,7 @@ import { KIND_REACTION } from "@/shared/constants/kinds";
 import { topChromeInset } from "@/shared/layout/chromeLayout";
 import { cn } from "@/shared/lib/cn";
 import { normalizePubkey } from "@/shared/lib/pubkey";
+import { getStorageItem, setStorageItem } from "@/shared/lib/safeStorage";
 import { useElementWidth } from "@/shared/hooks/use-mobile";
 import { useThreadPanelWidth } from "@/shared/hooks/useThreadPanelWidth";
 import { AUXILIARY_PANEL_SINGLE_COLUMN_BREAKPOINT_PX } from "@/shared/layout/AuxiliaryPanel";
@@ -82,6 +83,8 @@ const INBOX_SEARCH_KEYS = [
   "profileTab",
   "profileView",
 ] as const;
+
+const INBOX_UNREAD_ONLY_STORAGE_KEY = "buzz.desktop.inbox-unread-only";
 
 export function HomeView({
   feed,
@@ -99,7 +102,15 @@ export function HomeView({
     homeInboxWidthPx > 0 &&
     homeInboxWidthPx < INBOX_SINGLE_COLUMN_BREAKPOINT_PX;
   const [filter, setFilter] = React.useState<InboxFilter>("all");
-  const [unreadOnly, setUnreadOnly] = React.useState(false);
+  const [unreadOnly, setUnreadOnly] = React.useState(
+    () => getStorageItem(INBOX_UNREAD_ONLY_STORAGE_KEY) === "true",
+  );
+  const handleUnreadOnlyChange = React.useCallback((value: boolean) => {
+    setUnreadOnly(value);
+    // Match other local preferences: storage failures keep the current view
+    // usable, while safeStorage records a warning if persistence is unavailable.
+    setStorageItem(INBOX_UNREAD_ONLY_STORAGE_KEY, String(value));
+  }, []);
   // Explicit selections are mirrored to the URL (`?item=`), so back/forward
   // restores the detail pane each history entry was showing and reloads
   // restore it from the URL. Default/automatic selection stays local-only —
@@ -739,7 +750,7 @@ export function HomeView({
                 handleUserSelectItem(null);
                 setSelectedReminderId(reminderId);
               }}
-              onUnreadOnlyChange={setUnreadOnly}
+              onUnreadOnlyChange={handleUnreadOnlyChange}
               reminderPubkey={currentPubkey}
               reminders={pendingReminders}
               selectedConversationId={selectedConversationId}

@@ -12,8 +12,11 @@ use buzz_core::app::AppStatus;
 use buzz_core::kind::KIND_APP_METADATA;
 use buzz_core::{CommunityId, StoredEvent};
 
+use buzz_datastore_tracing::datastore_span;
+
 use crate::error::{DbError, Result};
 use crate::event::insert_event_with_thread_metadata_tx;
+use crate::Db;
 
 const GET_APP: &str = "SELECT community_id, id, name, description, icon_url, status, \
      secret_hash, created_by, created_at, updated_at \
@@ -126,6 +129,24 @@ pub async fn list_apps(pool: &PgPool, community_id: CommunityId) -> Result<Vec<A
     rows.into_iter().map(row_to_app).collect()
 }
 
+impl Db {
+    /// Load one App in `community_id`, or `None` if it does not exist there.
+    #[datastore_span(name = "get_app", system = "postgresql")]
+    pub async fn get_app(
+        &self,
+        community_id: CommunityId,
+        app_id: Uuid,
+    ) -> Result<Option<AppRecord>> {
+        get_app(&self.pool, community_id, app_id).await
+    }
+
+    /// List Apps in `community_id` ordered by creation time.
+    #[datastore_span(name = "list_apps", system = "postgresql")]
+    pub async fn list_apps(&self, community_id: CommunityId) -> Result<Vec<AppRecord>> {
+        list_apps(&self.pool, community_id).await
+    }
+}
+
 /// Insert the kind `9038` command event with `ON CONFLICT DO NOTHING`.
 ///
 /// Returns `true` when this transaction claimed the event and `false` when it
@@ -186,7 +207,7 @@ pub async fn update_app(
 
 /// Replace the stored secret digest and bump private `updated_at`.
 ///
-/// Does not write kind `39007` metadata.
+/// Does not write kind `39008` metadata.
 pub async fn rotate_app_secret(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
@@ -223,7 +244,7 @@ pub async fn set_app_status(
     require_app_row(app_id, row)
 }
 
-/// Next kind `39007` `created_at` for `app_id`: `max(now_seconds, head + 1)`.
+/// Next kind `39008` `created_at` for `app_id`: `max(now_seconds, head + 1)`.
 pub async fn next_app_metadata_created_at(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
@@ -249,7 +270,7 @@ pub async fn next_app_metadata_created_at(
     })
 }
 
-/// Replace kind `39007` by `(community, kind, relay pubkey, d)` with NIP-33
+/// Replace kind `39008` by `(community, kind, relay pubkey, d)` with NIP-33
 /// ordering (`created_at` desc, then lexicographically lower event ID).
 ///
 /// Does not call [`crate::Db::replace_parameterized_event`] or
@@ -267,7 +288,7 @@ pub async fn replace_app_metadata(
     }
     let d_tag = crate::event::extract_d_tag(event)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| DbError::InvalidData("kind 39007 requires a d tag".into()))?;
+        .ok_or_else(|| DbError::InvalidData("kind 39008 requires a d tag".into()))?;
     let pubkey_bytes = event.pubkey.to_bytes();
     let created_at_secs = event.created_at.as_secs() as i64;
     let created_at = DateTime::from_timestamp(created_at_secs, 0)

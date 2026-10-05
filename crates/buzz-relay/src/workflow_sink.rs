@@ -794,7 +794,7 @@ mod postgres_tests {
 
     /// Real-PG state mirroring `handlers::event::tests::test_state_with_redis_url`.
     async fn test_state() -> Arc<AppState> {
-        let mut config = crate::config::Config::from_env().expect("default config loads");
+        let mut config = crate::config::Config::for_test(); // [FI-TRACE-ENV-RACE]
         config.require_relay_membership = false;
         config.redis_url = "redis://127.0.0.1:1".to_string();
         let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
@@ -1098,6 +1098,7 @@ mod postgres_tests {
                 "root message",
                 &author_hex,
                 None,
+                None,
             )
             .await
             .expect("send root");
@@ -1111,6 +1112,7 @@ mod postgres_tests {
                 "threaded reply",
                 &author_hex,
                 Some(&root_hex),
+                None,
             )
             .await
             .expect("send reply");
@@ -1254,6 +1256,7 @@ mod postgres_tests {
                 "workflow reply",
                 &author_hex,
                 Some(&parent_hex),
+                None,
             )
             .await
             .expect("send reply");
@@ -1336,6 +1339,7 @@ mod postgres_tests {
                 "workflow reply to root-only parent",
                 &author_hex,
                 Some(&root_only_parent_hex),
+                None,
             )
             .await
             .expect("send root-only reply");
@@ -1399,6 +1403,7 @@ mod postgres_tests {
                 "orphan reply",
                 &author_hex,
                 Some(&unknown),
+                None,
             )
             .await
             .expect_err("reply to a non-existent parent must fail");

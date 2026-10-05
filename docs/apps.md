@@ -6,7 +6,7 @@ actor attested by the relay. It is not a user, agent, workflow, or channel
 member. It cannot choose a community, channel, project, author, kind, or tags.
 
 Owners and admins manage Apps through signed Nostr commands (kind `9038`) and
-discover them through relay-signed metadata (kind `39007`). There is no App-list
+discover them through relay-signed metadata (kind `39008`). There is no App-list
 HTTP endpoint. The only App HTTP surface is the callback:
 
 ```text
@@ -47,7 +47,7 @@ buzz apps enable --app <uuid>
 buzz apps disable --app <uuid>
 ```
 
-`list` queries NIP-11 `self` plus verified kind `39007` events. Compact list
+`list` queries NIP-11 `self` plus verified kind `39008` events. Compact list
 fields are `app_id`, `name`, `status`, and `callback_url` — never a secret.
 
 Create and rotate print the raw secret only in the successful JSON:
@@ -280,7 +280,7 @@ not revalidate a stored workflow route.
 - **Rotate** replaces the stored secret hash immediately. The old secret
   receives `401` / `unauthorized`. Public metadata does not change. Capture the
   new secret from the one-time response and update every provider binding.
-- **Disable** keeps kind `39007` queryable so historical messages still render
+- **Disable** keeps kind `39008` queryable so historical messages still render
   as the App. New callbacks receive `404` / `app_not_found`.
 - **Enable** restores callbacks with the current secret.
 - A lost secret is recovered only by rotating.
@@ -307,7 +307,7 @@ Clients trust App attribution only when **all** of these hold:
 
 1. The message signature is valid for the **active community relay** key.
 2. `buzz:app` is a canonical App UUID.
-3. The latest kind `39007` metadata for that UUID is signed by the **same**
+3. The latest kind `39008` metadata for that UUID is signed by the **same**
    relay in the **same** community.
 
 Any failure — invalid signature, wrong relay key, malformed tags, missing

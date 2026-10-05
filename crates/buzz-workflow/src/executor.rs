@@ -38,6 +38,10 @@ pub struct TriggerContext {
     pub emoji: String,
     /// Event ID of the triggering message (hex string).
     pub message_id: String,
+    /// True when the triggering event is itself a threaded reply (carries a
+    /// NIP-10 `reply` marker). Lets a `message_posted` filter select only
+    /// top-level messages via `trigger_is_reply == false`.
+    pub is_reply: bool,
     /// Arbitrary webhook body fields (webhook trigger).
     pub webhook_fields: HashMap<String, String>,
 }
@@ -214,6 +218,7 @@ fn apply_filter(value: String, filter: &str) -> Result<String, WorkflowError> {
 /// | `trigger.timestamp`               | `trigger_timestamp`       |
 /// | `trigger.emoji`                   | `trigger_emoji`           |
 /// | `trigger.message_id`              | `trigger_message_id`      |
+/// | `trigger.is_reply`                | `trigger_is_reply` (bool) |
 /// | `steps.STEP_ID.output.FIELD`      | `steps_STEP_ID_output_FIELD` |
 ///
 /// Also registers string helper functions that the `cron` crate's `evalexpr` v11
@@ -300,6 +305,14 @@ pub fn build_eval_context(
         ctx.set_value((*name).into(), Value::String((*val).to_owned()))
             .map_err(|e| WorkflowError::ConditionError(e.to_string()))?;
     }
+
+    // `trigger_is_reply` is boolean (not a string field), so a filter can read
+    // `trigger_is_reply == false` to fire only on top-level messages.
+    ctx.set_value(
+        "trigger_is_reply".into(),
+        Value::Boolean(trigger_ctx.is_reply),
+    )
+    .map_err(|e| WorkflowError::ConditionError(e.to_string()))?;
 
     for (step_id, output) in step_outputs {
         if let JsonValue::Object(map) = output {
@@ -545,7 +558,7 @@ fn resolve_send_message_channel_for_run(
 /// `RequestApproval` returns `StepResult::Suspended` — the caller must
 /// persist state and stop the execution loop.
 pub async fn dispatch_action(
-    step_id: &str,
+    step: &Step,
     action: &ActionDef,
     engine: &WorkflowEngine,
     community_id: CommunityId,
@@ -553,6 +566,8 @@ pub async fn dispatch_action(
     trigger_ctx: &TriggerContext,
 ) -> Result<StepResult, WorkflowError> {
     use ActionDef::*;
+
+    let step_id = &step.id;
 
     // The workflow engine can outlive the serving request that spawned it.
     // Revalidate the durable community fence immediately before every external
@@ -637,7 +652,12 @@ pub async fn dispatch_action(
                     };
                     let authored_text = match &step.action {
                         SendMessage { text, .. } => text.as_str(),
-                        _ => unreachable!("resolved action must match authored step"),
+                        _ => {
+                            return Err(WorkflowError::InvalidDefinition(
+                                "SendMessage: resolved action does not match its authored step"
+                                    .into(),
+                            ));
+                        }
                     };
 
                     info!(
@@ -1245,7 +1265,7 @@ async fn execute_steps(
         let dispatch_result = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
             dispatch_action(
-                &step.id,
+                step,
                 &resolved_action,
                 engine,
                 community_id,
@@ -1335,6 +1355,7 @@ mod tests {
             timestamp: "1700000000".to_owned(),
             emoji: "fire".to_owned(),
             message_id: "event-id-hex".to_owned(),
+            is_reply: false,
             webhook_fields: HashMap::new(),
         }
     }
@@ -1452,6 +1473,56 @@ mod tests {
                 .await
                 .unwrap();
         assert!(!result);
+    }
+
+    #[tokio::test]
+    async fn condition_trigger_is_reply_selects_top_level_only() {
+        // The top-level-only filter from the feature's use case.
+        let mut ctx = make_trigger();
+
+        ctx.is_reply = false;
+        assert!(
+            evaluate_condition("trigger_is_reply == false", &ctx, &HashMap::new())
+                .await
+                .unwrap(),
+            "top-level message should pass the filter"
+        );
+
+        ctx.is_reply = true;
+        assert!(
+            !evaluate_condition("trigger_is_reply == false", &ctx, &HashMap::new())
+                .await
+                .unwrap(),
+            "threaded reply should be filtered out"
+        );
+    }
+
+    #[test]
+    fn resolve_step_templates_carries_reply_in_thread() {
+        let ctx = make_trigger();
+        let step = Step {
+            id: "reply".to_owned(),
+            name: None,
+            if_expr: None,
+            timeout_secs: None,
+            action: ActionDef::SendMessage {
+                text: "hi {{trigger.author}}".to_owned(),
+                channel: None,
+                reply_in_thread: true,
+            },
+        };
+        let resolved = resolve_step_templates(&step, &ctx, &HashMap::new()).unwrap();
+        match resolved {
+            ActionDef::SendMessage {
+                text,
+                reply_in_thread,
+                ..
+            } => {
+                assert_eq!(text, "hi abc123def456");
+                assert!(reply_in_thread, "reply_in_thread must survive resolution");
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
     }
 
     #[tokio::test]

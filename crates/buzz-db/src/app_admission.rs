@@ -16,8 +16,11 @@ use uuid::Uuid;
 
 use buzz_core::{CommunityId, StoredEvent};
 
+use buzz_datastore_tracing::datastore_span;
+
 use crate::error::{DbError, Result};
 use crate::event::insert_event_with_thread_metadata_tx;
+use crate::Db;
 
 const SELECT_EXISTING_DELIVERY: &str = r#"
         SELECT community_id, id, app_id, idempotency_key_hash, payload_hash, event_type,
@@ -351,6 +354,29 @@ pub async fn begin_app_admission(
             payload_hash: *payload_hash,
             event_type: event_type.to_owned(),
         })),
+    }
+}
+
+impl Db {
+    /// Begin serialized idempotent admission for an App callback delivery.
+    #[datastore_span(name = "begin_app_admission", system = "postgresql")]
+    pub async fn begin_app_admission(
+        &self,
+        community_id: CommunityId,
+        app_id: Uuid,
+        idempotency_key_hash: &[u8; 32],
+        payload_hash: &[u8; 32],
+        event_type: &str,
+    ) -> Result<BeginAppAdmission> {
+        begin_app_admission(
+            &self.pool,
+            community_id,
+            app_id,
+            idempotency_key_hash,
+            payload_hash,
+            event_type,
+        )
+        .await
     }
 }
 

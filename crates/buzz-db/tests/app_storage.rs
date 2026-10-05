@@ -1,5 +1,5 @@
 //! App lifecycle storage: constraints, tenant isolation, command claim, and
-//! kind `39007` replacement.
+//! kind `39008` replacement.
 
 use buzz_core::app::AppStatus;
 use buzz_core::kind::{KIND_APP_ADMIN_COMMAND, KIND_APP_METADATA};
@@ -602,7 +602,7 @@ async fn rotate_updates_hash_and_private_timestamp_without_metadata_replacement(
         .expect("head after rotate");
     assert_eq!(
         head_after.1, head_before.1,
-        "rotate must not replace kind 39007"
+        "rotate must not replace kind 39008"
     );
     assert_eq!(live_metadata_count(&pool, community, app_id).await, 1);
 }

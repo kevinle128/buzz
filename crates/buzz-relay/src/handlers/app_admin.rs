@@ -632,6 +632,9 @@ mod tests {
                     "unexpected rejection: {message}"
                 );
             }
+            IngestError::CanvasConflict(message) => {
+                panic!("canvas conflict: {message}")
+            }
             IngestError::Internal(message) => panic!("internal error: {message}"),
         }
         let apps = state
@@ -926,7 +929,7 @@ mod tests {
         assert_eq!(
             metadata.pubkey,
             state.relay_keypair.public_key(),
-            "kind 39007 must be relay-signed"
+            "kind 39008 must be relay-signed"
         );
         assert_eq!(metadata.kind.as_u16() as u32, KIND_APP_METADATA);
         assert_eq!(metadata.content, "CI notifications");

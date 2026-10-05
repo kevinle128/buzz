@@ -4,6 +4,7 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
+import 'package:lucide_icons_flutter/lucide_icons.dart';
 import 'package:scrollable_positioned_list/scrollable_positioned_list.dart';
 
 import '../../shared/community/relay_information_provider.dart';
@@ -21,6 +22,7 @@ import '../../shared/widgets/message_author_meta.dart';
 import '../../shared/profile/user_cache_provider.dart';
 import '../../shared/profile/user_profile.dart';
 import 'android_ime_lift.dart';
+import 'channel_identity_names_provider.dart';
 import 'channel_link_navigation.dart';
 import 'channel_messages_provider.dart';
 import 'channel_typing_provider.dart';
@@ -133,16 +135,17 @@ class ThreadDetailPage extends HookConsumerWidget {
         const <NostrEvent>[];
     final relaySelf = ref.watch(relaySelfProvider).value;
     final apps = ref.watch(appMetadataProvider).value ?? const {};
-    final replyMessages = repliesState.whenData((events) {
-      return formatTimeline(
-        mergeThreadEvents(events, liveChannelEvents),
-        currentPubkey: currentPubkey,
-        relaySelfPubkey: relaySelf,
-        apps: apps,
-      );
-    });
-
-    final fetchedReplies = replyMessages.value;
+    // Loading/error states can still carry replies from the last query.
+    // whenData drops that retained value during retries.
+    final replyEvents = repliesState.value;
+    final fetchedReplies = replyEvents == null
+        ? null
+        : formatTimeline(
+            mergeThreadEvents(replyEvents, liveChannelEvents),
+            currentPubkey: currentPubkey,
+            relaySelfPubkey: relaySelf,
+            apps: apps,
+          );
     final hasFetchedReplies = fetchedReplies != null;
     // A terminal query error cannot produce a more authoritative list. Keep
     // loading states provisional, but let the hydrated route snapshot drive
@@ -154,8 +157,13 @@ class ThreadDetailPage extends HookConsumerWidget {
       liveChannelEvents,
       threadHead.id,
     );
-    final allMsgs = fetchedReplies == null
-        ? allMessages
+    final allMsgs = fetchedReplies == null || !relayRepliesAvailable
+        ? _provisionalThreadMessages(
+            allMessages,
+            fetchedReplies ??
+                formatTimeline(liveChannelEvents, currentPubkey: currentPubkey),
+            liveChannelEvents,
+          )
         : [
             // Only fall back to the pushed-route snapshot when neither source
             // carries the head, and no live deletion has suppressed it. That
@@ -831,6 +839,9 @@ class ThreadDetailPage extends HookConsumerWidget {
     return FrostedScaffold(
       resizeToAvoidBottomInset: !usesFixedAndroidImeViewport,
       appBar: FrostedAppBar(
+        alwaysFrosted: true,
+        nativeViewSuppressed: messageActionBackdropActive,
+        nativeTitle: 'Thread',
         leading: usesNativeIosGlassBackButton
             ? IosGlassNavigationButton(
                 key: const ValueKey('thread-ios-glass-back'),
@@ -899,6 +910,9 @@ class ThreadDetailPage extends HookConsumerWidget {
                   itemPositionsListener: itemPositionsListener,
                   bottomInset: timelineBottomInset,
                   replies: replies,
+                  relayReplyState: relayReplyState,
+                  onRetryReplies: () =>
+                      ref.invalidate(threadRepliesProvider(repliesArgs)),
                   localSendAnimations: localSendAnimations,
                   trackActiveScrollPosition: trackActiveScrollPosition,
                   headIsDeleted: liveDeletionHidesHead,
@@ -918,7 +932,11 @@ class ThreadDetailPage extends HookConsumerWidget {
                 ),
               ),
               if (!isMember || isArchived)
-                _ThreadTypingIndicator(entries: threadTyping, animated: false),
+                _ThreadTypingIndicator(
+                  channelId: channelId,
+                  entries: threadTyping,
+                  animated: false,
+                ),
             ],
           ),
           if (threadViewportVisible)
@@ -941,7 +959,10 @@ class ThreadDetailPage extends HookConsumerWidget {
                   child: Column(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      _ThreadTypingIndicator(entries: threadTyping),
+                      _ThreadTypingIndicator(
+                        channelId: channelId,
+                        entries: threadTyping,
+                      ),
                       ComposeBar(
                         channelId: channelId,
                         focusNode: composerFocusNode,

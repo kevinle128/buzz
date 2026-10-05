@@ -7,7 +7,7 @@ const EVENT = {
   id: "ab".repeat(32),
   pubkey: "cd".repeat(32),
   created_at: 1,
-  kind: 39007,
+  kind: 39008,
   tags: [["d", "6eb31227-8ed2-42ec-9024-863497cbeed2"]],
   content: "",
   sig: "ef".repeat(32),

@@ -1,4 +1,4 @@
-//! `buzz apps` — community App lifecycle via kind 9038 and verified kind 39007.
+//! `buzz apps` — community App lifecycle via kind 9038 and verified kind 39008.
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -18,7 +18,7 @@ const APP_METADATA_QUERY_LIMIT: u32 = 500;
 const DUPLICATE_NO_SECRET_MSG: &str =
     "duplicate create or rotate returned no secret; use `buzz apps rotate-secret --app <uuid>`";
 
-/// Verified public App metadata folded from a kind 39007 head.
+/// Verified public App metadata folded from a kind 39008 head.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AppListEntry {
     app_id: Uuid,
@@ -500,12 +500,12 @@ mod tests {
     }
 
     #[test]
-    fn metadata_query_filter_is_kind_39007_self_limit_500() {
+    fn metadata_query_filter_is_kind_39008_self_limit_500() {
         let self_hex = "ab".repeat(32);
         assert_eq!(
             app_metadata_filter(&self_hex),
             json!({
-                "kinds": [39007],
+                "kinds": [39008],
                 "authors": [self_hex],
                 "limit": 500
             })

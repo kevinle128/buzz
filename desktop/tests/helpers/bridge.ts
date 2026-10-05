@@ -159,19 +159,19 @@ type MockBridgeOptions = {
   projectHeadBranch?: string;
   /** Relay NIP-11 identity used to sign authoritative repository state. */
   relaySelf?: string | null;
-  /** Signed kind 39007 events served to `useAppsQuery`. */
+  /** Signed kind 39008 events served to `useAppsQuery`. */
   appMetadataEvents?: RelayEvent[];
-  /** Community-scoped kind 39007 events keyed by relay URL. */
+  /** Community-scoped kind 39008 events keyed by relay URL. */
   appMetadataEventsByRelay?: Record<string, RelayEvent[]>;
-  /** Hex-encoded relay secret used to sign kind 39007 after kind 9038 mutations. */
+  /** Hex-encoded relay secret used to sign kind 39008 after kind 9038 mutations. */
   appRelaySecret?: string;
   /** One-time secret returned by mocked App create. */
   appCreateSecret?: string;
   /** One-time secret returned by mocked App rotate. */
   appRotateSecret?: string;
-  /** Delay EOSE for kind 39007 App metadata queries. */
+  /** Delay EOSE for kind 39008 App metadata queries. */
   appMetadataEoseDelayMs?: number;
-  /** CLOSED the kind 39007 App metadata query. */
+  /** CLOSED the kind 39008 App metadata query. */
   appMetadataQueryError?: boolean;
   /** Delay kind 9038 OK so mutation-pending UI is observable. */
   appAdminDelayMs?: number;
@@ -308,6 +308,13 @@ type MockBridgeOptions = {
   deepHistoryMessageCount?: number;
   feedReadError?: string;
   canvasReadError?: string;
+  /** Seed canvas revisions (oldest first); see e2eBridge mock config. */
+  canvasRevisions?: Array<{
+    content: string;
+    createdAt?: number;
+    eventId?: string;
+    author?: string;
+  }>;
   /** Delay (ms) for `apply_workspace`; see e2eBridge mock config. */
   applyCommunityDelayMs?: number;
   /** Reject `clear_pending_navigation_deep_links` with this message. */
@@ -349,6 +356,8 @@ type MockBridgeOptions = {
   /** Delay (ms) for newest-page fetches; see e2eBridge mock config. */
   channelHeadDelayMs?: number;
   profileReadDelayMs?: number;
+  /** Hold `get_profile` responses until `__BUZZ_E2E_RELEASE_PROFILE_READS__()`. */
+  deferProfileReads?: boolean;
   profileReadError?: string;
   /** Override whether get_profile reports a real kind:0 event. */
   profileHasEvent?: boolean;
@@ -493,6 +502,8 @@ type MockBridgeOptions = {
    * can exercise the "Thread deleted" label / disabled-send path.
    */
   deletedEventIds?: string[];
+  /** Reject one identity read after the configured number of successful reads. */
+  identityReadErrorAfter?: { message: string; successfulReads: number };
   /**
    * When true, `get_identity` returns `lost: true` until `persist_current_identity`
    * or `import_identity` is invoked. Drives the identity-lost recovery UX in tests.
@@ -620,6 +631,8 @@ type MockBridgeOptions = {
    * returning a catalog. Exercises the discovery-failure UI path.
    */
   discoverAgentModelsError?: string;
+  /** ACP commands returned by `discover_acp_commands`. Defaults to `[]`. */
+  acpCommands?: Array<{ command: string; binaryPath: string }>;
   /**
    * Providers returned by `discover_backend_providers`. Defaults to `[]`
    * (the "Run on" section stays hidden). Setting this renders the remote
