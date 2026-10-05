@@ -267,7 +267,10 @@ impl WorkflowDef {
             for step in &self.steps {
                 if matches!(
                     step.action,
-                    ActionDef::SendMessage { reply_in_thread: true, .. }
+                    ActionDef::SendMessage {
+                        reply_in_thread: true,
+                        ..
+                    }
                 ) {
                     return Err(WorkflowError::InvalidDefinition(format!(
                         "step '{}': reply_in_thread requires a message-based trigger",

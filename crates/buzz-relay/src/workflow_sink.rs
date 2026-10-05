@@ -10,7 +10,9 @@ use std::sync::{Arc, Weak};
 
 use buzz_core::kind::KIND_STREAM_MESSAGE;
 use buzz_core::tenant::CommunityId;
-use buzz_workflow::action_sink::{route_provenance_tags, ActionSink, ActionSinkError, WorkflowMessageRoute};
+use buzz_workflow::action_sink::{
+    route_provenance_tags, ActionSink, ActionSinkError, WorkflowMessageRoute,
+};
 use chrono::Utc;
 use nostr::{EventBuilder, Kind, Tag};
 use tracing::info;
