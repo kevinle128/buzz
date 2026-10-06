@@ -63,10 +63,15 @@ export function GitHubPullRequestRow({
   pullRequest: ProjectPullRequest;
 }) {
   const statusClassName = githubPullRequestStatusClassName(pullRequest.status);
-  const branchLabel = githubPullRequestBranchLabel(
+  const sourceBranch = githubPullRequestBranchLabel(
     pullRequest,
     pullRequest.cloneUrls[0] ?? "",
   );
+  const targetBranch = pullRequest.targetBranch?.trim() ?? "";
+  const branchLabel =
+    sourceBranch && targetBranch
+      ? `${sourceBranch} → ${targetBranch}`
+      : sourceBranch || targetBranch;
   return (
     <ProjectFeedRow
       eventId={pullRequest.id}
@@ -230,8 +235,170 @@ function GitHubPullRequestCommitRow({
   );
 }
 
+type GithubPullRequestCommentsView = {
+  data?: ProjectPullRequestComment[] | undefined;
+  error: unknown;
+  isError: boolean;
+  isLoading: boolean;
+  refetch: () => Promise<unknown> | unknown;
+};
+
+/** GitHub detail header: title, #N, login author, and body. No write chrome. */
+export function GitHubPullRequestDetailHeader({
+  pullRequest,
+}: {
+  pullRequest: ProjectPullRequest;
+}) {
+  return (
+    <header className="min-w-0 space-y-1 p-4 pb-4">
+      <h3 className="line-clamp-2 min-w-0 text-xl font-semibold text-foreground">
+        {pullRequest.title}{" "}
+        <span className="font-normal text-muted-foreground">
+          #{pullRequest.id}
+        </span>
+        <ShareLinkButton
+          className="ml-1 inline-flex h-7 w-7 align-text-bottom"
+          label="Copy pull request link"
+          link={pullRequestShareLink(pullRequest)}
+          testId="project-pull-request-copy-link"
+        />
+      </h3>
+      <p className="flex flex-wrap items-center gap-x-1 gap-y-1 text-xs font-medium text-muted-foreground">
+        <GitPullRequest className="h-3.5 w-3.5 shrink-0" />
+        <GitHubLoginIdentity
+          avatarUrl={pullRequest.authorAvatarUrl}
+          login={pullRequest.author}
+        />
+        <span title={formatExactTimestamp(pullRequest.createdAt)}>
+          created {relativeTime(pullRequest.createdAt)}
+        </span>
+      </p>
+      {pullRequest.content ? (
+        <ProjectRichContent
+          className="pt-3"
+          content={pullRequest.content}
+          tags={[]}
+        />
+      ) : null}
+    </header>
+  );
+}
+
+/** GitHub meta rail: status, login author, and branches. No reviewers. */
+export function GitHubPullRequestMetaRail({
+  pullRequest,
+}: {
+  pullRequest: ProjectPullRequest;
+}) {
+  const branchLabel = githubPullRequestBranchLabel(
+    pullRequest,
+    pullRequest.cloneUrls[0] ?? "",
+  );
+  return (
+    <aside className="min-w-0 space-y-6 border-t border-border/60 p-4 xl:border-l xl:border-t-0">
+      <OverviewRailSection title="Status">
+        <span
+          className={`inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium text-white ${githubPullRequestStatusBadgeClassName(pullRequest.status)}`}
+        >
+          <GitPullRequest className="h-3.5 w-3.5" />
+          {pullRequest.status}
+        </span>
+      </OverviewRailSection>
+      <OverviewRailSection title="Author">
+        <GitHubLoginIdentity
+          avatarUrl={pullRequest.authorAvatarUrl}
+          login={pullRequest.author}
+        />
+      </OverviewRailSection>
+      <OverviewRailSection title="Branches">
+        <p className="font-mono text-xs text-muted-foreground">{branchLabel}</p>
+      </OverviewRailSection>
+    </aside>
+  );
+}
+
+/** Injected-comment conversation, one-commit list, or empty checks state. */
+function GitHubPullRequestPresentationalDetail({
+  commentsQuery,
+  mode,
+  onSelectedPullRequestIdChange,
+  pullRequest,
+}: {
+  commentsQuery: GithubPullRequestCommentsView;
+  mode: "conversation" | "commits" | "checks";
+  onSelectedPullRequestIdChange: (id: string | null) => void;
+  pullRequest: ProjectPullRequest;
+}) {
+  const comments = commentsQuery.data ?? EMPTY_GITHUB_PULL_REQUEST_COMMENTS;
+  const parsed = parseProjectPullRequestMergeError(commentsQuery.error);
+  React.useEffect(() => {
+    if (parsed?.code === "github_pr_unavailable") {
+      toast.error("Pull request not found.");
+      onSelectedPullRequestIdChange(null);
+    }
+  }, [onSelectedPullRequestIdChange, parsed?.code]);
+
+  if (mode === "commits") {
+    return (
+      <section>
+        <GitHubPullRequestCommitRow pullRequest={pullRequest} />
+      </section>
+    );
+  }
+
+  if (mode === "checks") {
+    return (
+      <p className="p-4 text-sm text-muted-foreground">
+        No checks have been reported for this pull request yet.
+      </p>
+    );
+  }
+
+  return (
+    <section className="space-y-3 p-4">
+      {commentsQuery.isLoading ? (
+        <p className="text-sm text-muted-foreground">Loading comments…</p>
+      ) : commentsQuery.isError && parsed?.code !== "github_pr_unavailable" ? (
+        <GitHubRepoStateRecovery
+          error={commentsQuery.error}
+          onRetry={() => void commentsQuery.refetch()}
+          titleId="github-pull-request-comments-recovery-title"
+          unavailableTitle="Could not load GitHub comments"
+        />
+      ) : (
+        <ProjectIssueCommentTimeline
+          comments={comments}
+          githubMode
+          key={pullRequest.id}
+        />
+      )}
+    </section>
+  );
+}
+
 /** Read-only GitHub pull-request detail with login identities and no writes. */
-export function GitHubPullRequestDetail(props: {
+export function GitHubPullRequestDetail(
+  props:
+    | {
+        commentsQuery: GithubPullRequestCommentsView;
+        mode: "conversation" | "commits" | "checks";
+        onSelectedPullRequestIdChange: (id: string | null) => void;
+        pullRequest: ProjectPullRequest;
+      }
+    | {
+        onOpenCommit?: (commitHash: string) => void;
+        onSelectedPullRequestIdChange: (id: string | null) => void;
+        project: Repository;
+        pullRequest: ProjectPullRequest;
+      },
+): React.ReactElement {
+  if ("project" in props) {
+    return <GitHubPullRequestWorkspaceDetail {...props} />;
+  }
+  return <GitHubPullRequestPresentationalDetail {...props} />;
+}
+
+function GitHubPullRequestWorkspaceDetail(props: {
   onOpenCommit?: (commitHash: string) => void;
   onSelectedPullRequestIdChange: (id: string | null) => void;
   project: Repository;

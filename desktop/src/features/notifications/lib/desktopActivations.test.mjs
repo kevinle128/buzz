@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import { describe, test } from "node:test";
 
 // revealDesktopAppWindow and listenForDesktopNotificationActions cross the
 // Tauri IPC boundary through window.__TAURI_INTERNALS__ — stub it before the
@@ -85,57 +85,64 @@ test("reveal resolves without the timer when the invoke chain settles", async (t
   await revealDesktopAppWindow();
 });
 
-test("window focus re-drains activations stranded by a lost emit", async () => {
-  const received = [];
-  const dispose = await listenForDesktopNotificationActions((target) => {
-    received.push(target);
+// Both tests share the module-level activation queue, and the product
+// listener drains on focus and visibilitychange. Run them one at a time so
+// one test's event cannot land in the other's callback.
+describe("macOS activation redrain", { concurrency: false }, () => {
+  test("window focus re-drains activations stranded by a lost emit", async () => {
+    const received = [];
+    const dispose = await listenForDesktopNotificationActions((target) => {
+      received.push(target);
+    });
+
+    // The Tauri emit was lost, but the Rust queue still holds the clicked
+    // target. macOS foregrounds the app anyway; WebKit fires window focus.
+    pendingActivations = [
+      { channelId: "channel-1", eventId: "event-1", kind: 9 },
+    ];
+    window.dispatchEvent(new Event("focus"));
+    await flushPendingWork();
+
+    assert.deepEqual(received, [
+      {
+        agentPubkey: undefined,
+        channelId: "channel-1",
+        channelName: null,
+        content: undefined,
+        createdAt: null,
+        eventId: "event-1",
+        kind: 9,
+        pubkey: undefined,
+        threadRootId: null,
+      },
+    ]);
+
+    dispose();
+    pendingActivations = [
+      { channelId: "channel-2", eventId: "event-2", kind: 9 },
+    ];
+    window.dispatchEvent(new Event("focus"));
+    await flushPendingWork();
+    assert.equal(received.length, 1, "disposed listener must not re-drain");
+    // Leave the queue empty so the next test's mount-time drain starts clean.
+    pendingActivations = [];
   });
 
-  // The Tauri emit was lost, but the Rust queue still holds the clicked
-  // target. macOS foregrounds the app anyway; WebKit fires window focus.
-  pendingActivations = [
-    { channelId: "channel-1", eventId: "event-1", kind: 9 },
-  ];
-  window.dispatchEvent(new Event("focus"));
-  await flushPendingWork();
+  test("visibilitychange re-drains activations stranded by a lost emit", async () => {
+    const received = [];
+    const dispose = await listenForDesktopNotificationActions((target) => {
+      received.push(target);
+    });
 
-  assert.deepEqual(received, [
-    {
-      channelId: "channel-1",
-      channelName: null,
-      content: undefined,
-      createdAt: null,
-      eventId: "event-1",
-      kind: 9,
-      pubkey: undefined,
-      threadRootId: null,
-    },
-  ]);
+    pendingActivations = [
+      { channelId: "channel-3", eventId: "event-3", kind: 9 },
+    ];
+    document.dispatchEvent(new Event("visibilitychange"));
+    await flushPendingWork();
 
-  dispose();
-  pendingActivations = [
-    { channelId: "channel-2", eventId: "event-2", kind: 9 },
-  ];
-  window.dispatchEvent(new Event("focus"));
-  await flushPendingWork();
-  assert.equal(received.length, 1, "disposed listener must not re-drain");
-  // Leave the queue empty so the next test's mount-time drain starts clean.
-  pendingActivations = [];
-});
-
-test("visibilitychange re-drains activations stranded by a lost emit", async () => {
-  const received = [];
-  const dispose = await listenForDesktopNotificationActions((target) => {
-    received.push(target);
+    assert.equal(received.length, 1);
+    assert.equal(received[0].channelId, "channel-3");
+    assert.equal(received[0].agentPubkey, undefined);
+    dispose();
   });
-
-  pendingActivations = [
-    { channelId: "channel-3", eventId: "event-3", kind: 9 },
-  ];
-  document.dispatchEvent(new Event("visibilitychange"));
-  await flushPendingWork();
-
-  assert.equal(received.length, 1);
-  assert.equal(received[0].channelId, "channel-3");
-  dispose();
 });

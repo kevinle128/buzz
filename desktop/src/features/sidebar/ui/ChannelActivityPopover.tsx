@@ -7,6 +7,7 @@ import type { ActiveChannelTurnSummary } from "@/features/agents/activeAgentTurn
 import { formatElapsed } from "@/features/agents/ui/agentSessionUtils";
 import { useOpenAgentActivity } from "@/features/agents/useOpenAgentActivity";
 import { buildInboxItems, type InboxItem } from "@/features/home/lib/inbox";
+import { MessageAppBadge } from "@/features/messages/ui/MessageAuthorIdentity";
 import { getGroupedInboxItemIds } from "@/features/home/useHomeInboxReadState";
 import { useUsersBatchQuery } from "@/features/profile/hooks";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
@@ -77,7 +78,7 @@ function RowActionButton({
   );
 }
 
-function ThreadPreviewRow({
+export function ThreadPreviewRow({
   isAgent,
   item,
   onMarkRead,
@@ -114,6 +115,7 @@ function ThreadPreviewRow({
             <span className="min-w-0 flex-1 truncate text-sm font-semibold leading-4 text-foreground">
               {item.senderLabel}
             </span>
+            {item.isApp ? <MessageAppBadge /> : null}
             <span className="shrink-0 text-xs leading-4 text-muted-foreground/70 transition-opacity group-hover/activity-row:opacity-0 group-focus-within/activity-row:opacity-0">
               {item.timestampLabel}
             </span>

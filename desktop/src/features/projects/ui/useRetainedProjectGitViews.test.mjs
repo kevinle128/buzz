@@ -227,6 +227,7 @@ const workspaceTabsStub = {
   localSnapshot: null,
   localSnapshotError: null,
   localSnapshotLoading: false,
+  onBranchChange: noop,
   onSelectedCommitHashChange: noop,
   onSelectedIssueIdChange: noop,
   onSelectedPullRequestIdChange: noop,
