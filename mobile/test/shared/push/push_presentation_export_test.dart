@@ -542,23 +542,29 @@ void main() {
   );
 }
 
+// Reuse real signatures across retry cases; each export still verifies them.
+final _signedFixtures = <(int, int, String, String), Map<String, dynamic>>{};
+
 NostrEvent _signed(
   int kind,
   int createdAt, {
   String channelID = 'channel',
   String secretKey = _secret,
 }) => NostrEvent.fromJson(
-  nostr.Event.from(
-    kind: kind,
-    createdAt: createdAt,
-    content: kind == 0 ? '{"name":"Synthetic profile"}' : '',
-    tags: kind == 0
-        ? []
-        : [
-            ['d', channelID],
-          ],
-    secretKey: secretKey,
-  ).toMap(),
+  _signedFixtures.putIfAbsent(
+    (kind, createdAt, channelID, secretKey),
+    () => nostr.Event.from(
+      kind: kind,
+      createdAt: createdAt,
+      content: kind == 0 ? '{"name":"Synthetic profile"}' : '',
+      tags: kind == 0
+          ? []
+          : [
+              ['d', channelID],
+            ],
+      secretKey: secretKey,
+    ).toMap(),
+  ),
 );
 
 NostrEvent _tampered(NostrEvent event) => NostrEvent(

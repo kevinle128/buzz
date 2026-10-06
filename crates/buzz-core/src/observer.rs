@@ -1,6 +1,6 @@
 //! Agent observer frame helpers.
 //!
-//! Observer frames are transient, owner-scoped agent telemetry/control messages.
+//! Observer frames are transient, per-recipient telemetry and owner-only controls.
 //! They use a Buzz ephemeral event kind and carry NIP-44 encrypted JSON in the
 //! event content so relays can route frames without reading ACP internals.
 
@@ -13,7 +13,7 @@ use zeroize::Zeroize;
 pub const OBSERVER_AGENT_TAG: &str = "agent";
 /// Tag name that identifies the cleartext frame direction.
 pub const OBSERVER_FRAME_TAG: &str = "frame";
-/// Frame value for agent-to-owner observer telemetry.
+/// Frame value for agent-to-viewer observer telemetry.
 pub const OBSERVER_FRAME_TELEMETRY: &str = "telemetry";
 /// Frame value for owner-to-agent observer control commands.
 pub const OBSERVER_FRAME_CONTROL: &str = "control";
@@ -108,6 +108,148 @@ pub fn decrypt_observer_payload<T: DeserializeOwned>(
     let result = serde_json::from_str(&plaintext);
     plaintext.zeroize();
     Ok(result?)
+}
+
+/// Observer transport direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObserverDirection {
+    /// Agent telemetry addressed to one viewer.
+    Telemetry,
+    /// Owner control addressed to the agent.
+    Control,
+}
+
+/// Signed routing metadata for an encrypted observer frame.
+#[derive(Debug, Clone, Copy)]
+pub struct ObserverRoute {
+    /// Agent whose observer stream is addressed.
+    pub agent: PublicKey,
+    /// Encryption recipient.
+    pub recipient: PublicKey,
+    /// Channel scope, absent only for legacy owner frames.
+    pub channel_id: Option<uuid::Uuid>,
+    /// Telemetry or owner control.
+    pub direction: ObserverDirection,
+}
+
+/// Parse a verified observer event's routing tags.
+///
+/// The caller must verify the event signature and current authorization.
+/// A present but invalid channel never falls back to the legacy owner route.
+/// Unknown legacy frame values retain their silent-drop behavior.
+pub fn parse_observer_route(event: &Event) -> Result<Option<ObserverRoute>, String> {
+    if event.kind.as_u16() as u32 != crate::kind::KIND_AGENT_OBSERVER_FRAME {
+        return Err("invalid: not an observer frame".into());
+    }
+    if !content_looks_like_nip44(&event.content) {
+        return Err("invalid: observer content must be NIP-44 encrypted".into());
+    }
+    let recipient = PublicKey::from_hex(observer_tag(event, "p")?)
+        .map_err(|_| "invalid: observer p tag must be a hex pubkey")?;
+    let agent = PublicKey::from_hex(observer_tag(event, OBSERVER_AGENT_TAG)?)
+        .map_err(|_| "invalid: observer agent tag must be a hex pubkey")?;
+    let frame = observer_tag(event, OBSERVER_FRAME_TAG)?;
+    let channel_id = if event
+        .tags
+        .iter()
+        .any(|tag| tag.as_slice().first().map(String::as_str) == Some("h"))
+    {
+        Some(
+            observer_tag(event, "h")?
+                .parse::<uuid::Uuid>()
+                .map_err(|_| "invalid: observer h tag must be a channel UUID")?,
+        )
+    } else {
+        None
+    };
+    let direction = if event.pubkey == agent && recipient != agent {
+        ObserverDirection::Telemetry
+    } else if event.pubkey != agent && recipient == agent {
+        ObserverDirection::Control
+    } else {
+        return Err(
+            "invalid: observer frame must be agent-to-viewer telemetry or owner-to-agent control"
+                .into(),
+        );
+    };
+    if channel_id.is_some()
+        && (direction != ObserverDirection::Telemetry || frame != OBSERVER_FRAME_TELEMETRY)
+    {
+        return Err("invalid: channel observer frames must be agent telemetry".into());
+    }
+    let expected = match direction {
+        ObserverDirection::Telemetry => OBSERVER_FRAME_TELEMETRY,
+        ObserverDirection::Control => OBSERVER_FRAME_CONTROL,
+    };
+    if frame != expected {
+        return Ok(None);
+    }
+    Ok(Some(ObserverRoute {
+        agent,
+        recipient,
+        channel_id,
+        direction,
+    }))
+}
+
+fn observer_tag<'a>(event: &'a Event, name: &str) -> Result<&'a str, String> {
+    let mut tags = event
+        .tags
+        .iter()
+        .filter(|tag| tag.as_slice().first().map(String::as_str) == Some(name));
+    let tag = tags
+        .next()
+        .ok_or_else(|| format!("invalid: observer frame missing {name} tag"))?;
+    if tags.next().is_some() {
+        return Err(format!("invalid: observer frame has multiple {name} tags"));
+    }
+    tag.content()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("invalid: observer frame missing {name} value"))
+}
+
+/// Bind decrypted channel telemetry and every batch item to the signed channel.
+/// Nested batches are not part of the observer wire format and are rejected.
+pub fn validate_observer_channel_payload(
+    payload: &serde_json::Value,
+    channel: &str,
+) -> Result<(), String> {
+    if payload
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .filter(|kind| !kind.is_empty())
+        .is_none()
+    {
+        return Err("observer payload must have a string kind".into());
+    }
+    if payload.get("channelId").and_then(serde_json::Value::as_str) != Some(channel) {
+        return Err("observer payload does not match signed channel".into());
+    }
+    if payload.get("kind").and_then(serde_json::Value::as_str) == Some("batch") {
+        let events = payload
+            .get("payload")
+            .and_then(|value| value.get("events"))
+            .and_then(serde_json::Value::as_array)
+            .filter(|events| !events.is_empty())
+            .ok_or_else(|| "observer batch must contain events".to_string())?;
+        for item in events {
+            if item
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .filter(|kind| !kind.is_empty())
+                .is_none()
+            {
+                return Err("observer batch item must have a string kind".into());
+            }
+            if item.get("kind").and_then(serde_json::Value::as_str) == Some("batch") {
+                return Err("nested observer batches are not supported".into());
+            }
+            if item.get("channelId").and_then(serde_json::Value::as_str) != Some(channel) {
+                return Err("observer batch item does not match signed channel".into());
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

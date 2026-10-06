@@ -39,14 +39,18 @@ class _ThreadMessage extends HookConsumerWidget {
     final profile =
         ref.watch(userCacheProvider.select((cache) => cache[pk])) ??
         ref.read(userCacheProvider.notifier).get(pk);
-    final displayName = watchChannelIdentityLabel(ref, channelId, pk);
+    final displayName = message.isApp
+        ? message.appDisplayName ?? 'App'
+        : watchChannelIdentityLabel(ref, channelId, pk);
     final isAgent =
-        ref.watch(agentMentionPubkeysProvider(channelId)).contains(pk) ||
-        profile?.ownerPubkey != null;
+        !message.isApp &&
+        (ref.watch(agentMentionPubkeysProvider(channelId)).contains(pk) ||
+            profile?.ownerPubkey != null);
     final canManageMessage =
-        currentPubkey?.toLowerCase() == pk ||
-        (profile?.ownerPubkey != null &&
-            profile?.ownerPubkey == currentPubkey?.toLowerCase());
+        !message.isApp &&
+        (currentPubkey?.toLowerCase() == pk ||
+            (profile?.ownerPubkey != null &&
+                profile?.ownerPubkey == currentPubkey?.toLowerCase()));
 
     final userCache = ref.watch(userCacheProvider);
     final knownAgentPubkeys = agentPubkeysWithProfileOwners(
@@ -161,14 +165,18 @@ class _ThreadMessage extends HookConsumerWidget {
                       children: [
                         if (showAuthor)
                           GestureDetector(
-                            onTap: () => showUserProfileSheet(
-                              context,
-                              message.pubkey,
-                              names: channelIdentityNamesProvider(channelId),
-                            ),
+                            onTap: message.isApp
+                                ? null
+                                : () => showUserProfileSheet(
+                                    context,
+                                    message.pubkey,
+                                    names: channelIdentityNamesProvider(
+                                      channelId,
+                                    ),
+                                  ),
                             child: _Avatar(
                               profile: profile,
-                              pubkey: message.pubkey,
+                              message: message,
                               isAgent: isAgent,
                             ),
                           )
@@ -193,24 +201,28 @@ class _ThreadMessage extends HookConsumerWidget {
                                         Expanded(
                                           child: MessageAuthorMeta(
                                             displayName: displayName,
-                                            username: messageUsernameLabel(
-                                              profile,
-                                            ),
+                                            username: message.isApp
+                                                ? null
+                                                : messageUsernameLabel(profile),
+                                            badge: message.isApp
+                                                ? const AppBadge()
+                                                : null,
                                             timestamp: formatMessageTime(
                                               message.createdAt,
                                             ),
                                             nameColor: context.colors.onSurface,
                                             metadataColor:
                                                 context.colors.onSurfaceVariant,
-                                            onAuthorTap: () =>
-                                                showUserProfileSheet(
-                                                  context,
-                                                  message.pubkey,
-                                                  names:
-                                                      channelIdentityNamesProvider(
-                                                        channelId,
-                                                      ),
-                                                ),
+                                            onAuthorTap: message.isApp
+                                                ? null
+                                                : () => showUserProfileSheet(
+                                                    context,
+                                                    message.pubkey,
+                                                    names:
+                                                        channelIdentityNamesProvider(
+                                                          channelId,
+                                                        ),
+                                                  ),
                                             displayNameKey: ValueKey(
                                               'thread-message-author-${message.id}',
                                             ),

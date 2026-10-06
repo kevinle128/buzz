@@ -1026,3 +1026,32 @@ mod real_relay {
         println!("  archived_event_scopes: {scope_count} row(s)");
     }
 }
+
+#[test]
+fn shared_observer_archive_rejects_undecryptable_channel_frame_before_write() {
+    let conn = in_memory();
+    let owner = Keys::generate();
+    let agent = Keys::generate();
+    let recipient = owner.public_key().to_hex();
+    let relay = "wss://relay.example";
+    add_sub(&conn, &recipient, relay, "owner_p", &recipient, "[24200]");
+    let event = EventBuilder::new(Kind::Custom(24200), "A".repeat(200))
+        .tags([
+            Tag::parse(["p", &recipient]).unwrap(),
+            Tag::parse(["agent", &agent.public_key().to_hex()]).unwrap(),
+            Tag::parse(["frame", "telemetry"]).unwrap(),
+            Tag::parse(["h", "11111111-1111-4111-8111-111111111111"]).unwrap(),
+        ])
+        .sign_with_keys(&agent)
+        .unwrap();
+    let result = run_batch_sync_with_keys(
+        vec![candidate(&event, ScopeType::OwnerP, &recipient)],
+        &recipient,
+        relay,
+        &conn,
+        vec![],
+        &owner,
+    );
+    assert_eq!(result.persisted, 0);
+    assert_eq!(result.dropped, 1);
+}

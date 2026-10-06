@@ -4,6 +4,7 @@
 
 mod admission;
 mod build_info;
+mod observer;
 mod rejection;
 
 /// Shared NIP-FI assertion evaluation, denial rendering, and key pairing.

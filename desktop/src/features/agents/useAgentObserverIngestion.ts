@@ -5,7 +5,10 @@ import {
   useManagedAgentsQuery,
   useRelayAgentsQuery,
 } from "@/features/agents/hooks";
-import { useManagedAgentObserverBridge } from "@/features/agents/observerRelayStore";
+import {
+  ensureRelayObserverSubscription,
+  useManagedAgentObserverBridge,
+} from "@/features/agents/observerRelayStore";
 import { useUsersBatchQuery } from "@/features/profile/hooks";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import type { ManagedAgent } from "@/shared/api/types";
@@ -19,9 +22,8 @@ type IngestionAgent = Pick<ManagedAgent, "pubkey" | "status">;
  *
  * Managed agents keep their real status; owned relay agents that are not
  * managed locally are treated as `deployed` so the observer subscription
- * starts and their frames decrypt. Registering non-owned agents would be
- * pointless — observer frames are `#p`-addressed to the owner, so frames for
- * agents we do not own never arrive on our subscription in the first place.
+ * starts and their frames decrypt. This list grants legacy owner-global trust.
+ * Channel-shared frames use native admission and never expand this list.
  */
 export function combineObserverIngestionAgents(
   managedAgents: readonly IngestionAgent[],
@@ -98,7 +100,7 @@ export function useObserverIngestionAgents(): Array<
 }
 
 /**
- * App-level owner-global observer ingestion.
+ * App-level observer ingestion with separate legacy owner-global trust.
  *
  * Mounted once in AppShell so observer frames (kind 24200) are received,
  * decrypted, and folded into the derived active-turns store regardless of
@@ -116,7 +118,11 @@ export function useObserverIngestionAgents(): Array<
  * managed-agent observer coverage during startup.
  */
 export function useAgentObserverIngestion() {
+  const currentPubkey = useIdentityQuery().data?.pubkey;
   const ingestionAgents = useObserverIngestionAgents();
+  React.useEffect(() => {
+    if (currentPubkey) void ensureRelayObserverSubscription();
+  }, [currentPubkey]);
   useManagedAgentObserverBridge(ingestionAgents);
   useActiveAgentTurnsBridge(ingestionAgents);
 }

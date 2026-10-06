@@ -212,6 +212,7 @@ fn record_with(
 ) -> crate::managed_agents::types::ManagedAgentRecord {
     crate::managed_agents::types::ManagedAgentRecord {
         session_policy: Default::default(),
+        permission_policy: None,
         description: None,
         pubkey: String::new(),
         name: "r".to_string(),

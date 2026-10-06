@@ -128,6 +128,7 @@ fn git(args: &[&str], cwd: &Path, owner_nsec: &str) -> String {
 
 struct GitS3Probe {
     bucket: Box<Bucket>,
+    prefix: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,7 +187,11 @@ impl GitS3Probe {
             region_name,
             addressing_style,
         );
-        Self { bucket }
+        let prefix = buzz_media::config::normalize_s3_prefix(
+            &std::env::var("BUZZ_S3_PREFIX").unwrap_or_default(),
+        )
+        .expect("valid BUZZ_S3_PREFIX");
+        Self { bucket, prefix }
     }
 
     fn pointer_key(owner: &str, repo: &str) -> String {
@@ -199,7 +204,11 @@ impl GitS3Probe {
 
     async fn pointer(&self, owner: &str, repo: &str) -> Option<PointerSnapshot> {
         let key = Self::pointer_key(owner, repo);
-        match self.bucket.get_object(&key).await {
+        match self
+            .bucket
+            .get_object(format!("{}{key}", self.prefix))
+            .await
+        {
             Ok(resp) => {
                 let etag = resp
                     .headers()
@@ -233,7 +242,11 @@ impl GitS3Probe {
 
     async fn assert_manifest_exists(&self, digest: &str) {
         let key = format!("manifests/{digest}");
-        match self.bucket.get_object(&key).await {
+        match self
+            .bucket
+            .get_object(format!("{}{key}", self.prefix))
+            .await
+        {
             Ok(_) => {}
             Err(e) => panic!("pointer named manifest {key}, but GET failed: {e}"),
         }

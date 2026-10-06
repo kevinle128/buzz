@@ -218,7 +218,10 @@ fn file_and_stdin_run_one_fresh_equipped_session_without_service() {
             .iter()
             .filter(|v| v["method"] == "session/set_config_option")
             .collect();
-        for expected in ["chosen", "high", "bypassPermissions"] {
+        assert!(!options
+            .iter()
+            .any(|v| v["params"]["value"] == "bypassPermissions"));
+        for expected in ["chosen", "high", "dontAsk"] {
             assert!(
                 options.iter().any(|v| v["params"]["value"] == expected),
                 "missing {expected}: {wire:?}"

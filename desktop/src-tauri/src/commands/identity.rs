@@ -189,27 +189,32 @@ fn sign_event_json(
 #[tauri::command]
 pub async fn decrypt_observer_event(
     event_json: String,
+    archive_replay: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
     let keys = state.signing_keys()?;
-
-    tauri::async_runtime::spawn_blocking(move || {
-        let event =
-            Event::from_json(event_json).map_err(|error| format!("invalid event: {error}"))?;
-
-        // Defense-in-depth: verify event ID and signature before decrypting.
-        if !event.verify_id() {
-            return Err("observer event has invalid ID".into());
+    let relay = relay_ws_url_with_override(&state);
+    let event = Event::from_json(event_json).map_err(|e| e.to_string())?;
+    let payload = crate::observer_admission::decrypt_bound_observer(&keys, &event)?;
+    if archive_replay.unwrap_or(false) {
+        let identity = keys.public_key().to_hex();
+        let target = relay.clone();
+        let id = event.id.to_hex();
+        let retained = state.archive_db.with_conn(move |conn| {
+            conn.query_row("SELECT EXISTS(SELECT 1 FROM archived_events WHERE identity_pubkey = ?1 AND relay_url = ?2 AND id = ?3)", rusqlite::params![identity, target, id], |row| row.get::<_, bool>(0)).map_err(|e| e.to_string())
+        }).await?;
+        if !retained {
+            return Err("observer event is not in local history".into());
         }
-        if !event.verify_signature() {
-            return Err("observer event has invalid signature".into());
-        }
-
-        buzz_core_pkg::observer::decrypt_observer_payload(&keys, &event)
-            .map_err(|error| format!("decrypt observer event failed: {error}"))
-    })
-    .await
-    .map_err(|e| format!("spawn_blocking failed: {e}"))?
+    } else {
+        crate::observer_admission::authorize_shared_observer(&state, &event, &keys, &relay).await?;
+    }
+    if state.signing_keys()?.public_key() != keys.public_key()
+        || relay_ws_url_with_override(&state) != relay
+    {
+        return Err("observer context changed".into());
+    }
+    Ok(payload)
 }
 
 #[tauri::command]

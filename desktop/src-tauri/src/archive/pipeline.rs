@@ -358,6 +358,15 @@ pub(super) fn commit_archive(
     // Fully local validation — no relay query.
     let mut validated_ephemeral: Vec<(String, &Parsed)> = Vec::new();
     for p in &ephemeral {
+        if p.event
+            .tags
+            .iter()
+            .any(|tag| tag.as_slice().first().is_some_and(|name| name == "h"))
+            && crate::observer_admission::decrypt_bound_observer(owner_keys, &p.event).is_err()
+        {
+            dropped += 1;
+            continue;
+        }
         match validate_ephemeral_frame(
             &p.event,
             identity_pk,

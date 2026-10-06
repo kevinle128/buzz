@@ -160,7 +160,7 @@ impl ArchiveDb {
 impl ArchiveDb {
     /// Build an adapter bound to a fixed DB path (no nest required), so the
     /// barrier and guard-lifetime contracts can be exercised in isolation.
-    fn with_test_path(path: PathBuf) -> Self {
+    pub(crate) fn with_test_path(path: PathBuf) -> Self {
         Self {
             init: OnceCell::new(),
             maintenance: RwLock::new(()),

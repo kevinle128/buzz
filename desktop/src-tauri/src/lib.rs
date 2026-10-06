@@ -36,6 +36,7 @@ mod native_websocket_batch;
 mod nostr_bind;
 pub mod nostr_convert;
 mod observed_unread;
+mod observer_admission;
 mod persona_catalog;
 mod prevent_sleep;
 mod ptt_shortcut;
@@ -574,6 +575,24 @@ pub fn run() {
             get_git_identity,
             get_project_repo_snapshot,
             get_project_repo_file_content,
+            get_github_repository_state,
+            list_github_pull_requests,
+            create_github_pull_request,
+            list_github_pull_request_comments,
+            list_github_issues,
+            create_github_issue,
+            list_github_issue_comments,
+            update_github_issue_state,
+            create_github_issue_comment,
+            list_github_repo_labels,
+            add_github_issue_labels,
+            remove_github_issue_label,
+            list_github_repo_assignees,
+            add_github_issue_assignees,
+            remove_github_issue_assignee,
+            get_github_authenticated_user,
+            get_github_repository_snapshot,
+            get_github_ahead_behind,
             get_project_repo_diff,
             get_project_local_repo_diff,
             get_project_local_repo_snapshot,

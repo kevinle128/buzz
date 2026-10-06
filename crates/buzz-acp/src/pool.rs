@@ -3629,10 +3629,12 @@ pub async fn run_prompt_task(
         }
         Err(e) => {
             tracing::error!(target: "pool::prompt", "session_prompt error: {e}");
-            // AgentError means the agent caught a problem before mutating
-            // session state (e.g. bad LLM response). The session is healthy —
-            // don't invalidate it. Other errors may have corrupted state.
-            if !matches!(e, AcpError::AgentError { .. }) {
+            // A missing session must be recreated before the queued batch retries.
+            // Other application errors leave the session intact.
+            let missing_session = matches!(&e,
+                AcpError::AgentError { code: -32002, message }
+                    if message == "Unknown session");
+            if missing_session || !matches!(e, AcpError::AgentError { .. }) {
                 agent.state.invalidate(&source);
             }
             let usage = agent.acp.take_turn_usage();
@@ -7216,6 +7218,58 @@ pub(crate) mod tests {
                 expected_root.map(serde_json::Value::from).as_ref(),
                 "production liveness wiring must identify only the canonical thread scope"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn run_prompt_task_invalidates_only_missing_session_errors() {
+        for (message, invalidated) in [("Unknown session", true), ("Model not found", false)] {
+            let response = serde_json::json!({
+                "jsonrpc": "2.0", "id": 0,
+                "error": {"code": -32002, "message": message}
+            });
+            let script = format!(
+                "read -r line; printf '%s\\n' '{}'; cat >/dev/null",
+                response
+            );
+            let acp = AcpClient::spawn("bash", &["-c".into(), script], &[], false)
+                .await
+                .expect("spawn ACP error response");
+            let mut agent = OwnedAgent {
+                index: 0,
+                acp,
+                state: SessionState::default(),
+                model_capabilities: None,
+                desired_model: None,
+                model_overridden: false,
+                desired_model_request_id: None,
+                desired_model_pending_ack: false,
+                startup_effort: None,
+                agent_name: "test-agent".into(),
+                goose_system_prompt_supported: None,
+                protocol_version: 1,
+            };
+            agent.state.heartbeat_session = Some("expired-session".into());
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            run_prompt_task(
+                agent,
+                None,
+                Some("test".into()),
+                Arc::new(make_prompt_context_no_owner()),
+                tx,
+                None,
+                "test-turn".into(),
+                Default::default(),
+            )
+            .await;
+            let mut result = rx.recv().await.expect("prompt result");
+            assert!(matches!(result.outcome, PromptOutcome::Error(_)));
+            assert_eq!(
+                result.agent.state.heartbeat_session.is_none(),
+                invalidated,
+                "{message}"
+            );
+            result.agent.acp.shutdown().await;
         }
     }
 

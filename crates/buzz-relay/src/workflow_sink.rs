@@ -220,7 +220,6 @@ impl ActionSink for RelayActionSink {
         let authored_text = authored_text.to_owned();
         let author_pubkey = author_pubkey.to_owned();
         let reply_to = reply_to.map(str::to_owned);
-        let route = route;
 
         Box::pin(async move {
             // 0. Upgrade weak reference — fails only during shutdown.

@@ -583,6 +583,11 @@ async fn connect_services_with_store(store: DeletionStore) -> Result<Services> {
         s3_access_key,
         s3_secret_key,
         s3_bucket: required_env("BUZZ_S3_BUCKET")?,
+        s3_prefix: match std::env::var("BUZZ_S3_PREFIX") {
+            Ok(value) => value,
+            Err(std::env::VarError::NotPresent) => String::new(),
+            Err(_) => anyhow::bail!("BUZZ_S3_PREFIX must be valid Unicode"),
+        },
         s3_region: s3_region_from_env(),
         s3_addressing_style: std::env::var("BUZZ_S3_ADDRESSING_STYLE")
             .unwrap_or_else(|_| "path".to_string())
@@ -1921,6 +1926,7 @@ mod postgres_tests {
                     s3_access_key: "unused".to_string(),
                     s3_secret_key: "unused".to_string(),
                     s3_bucket: "unused".to_string(),
+                    s3_prefix: String::new(),
                     s3_region: "us-east-1".to_string(),
                     s3_addressing_style: buzz_media::S3AddressingStyle::Path,
                     max_image_bytes: 1,
@@ -1991,6 +1997,7 @@ mod postgres_tests {
                     s3_access_key: "unused".to_string(),
                     s3_secret_key: "unused".to_string(),
                     s3_bucket: "unused".to_string(),
+                    s3_prefix: String::new(),
                     s3_region: "us-east-1".to_string(),
                     s3_addressing_style: buzz_media::S3AddressingStyle::Path,
                     max_image_bytes: 1,
@@ -2360,6 +2367,7 @@ mod postgres_tests {
                 s3_access_key: access_key,
                 s3_secret_key: secret_key,
                 s3_bucket: bucket,
+                s3_prefix: String::new(),
                 s3_region: std::env::var("BUZZ_TEST_S3_REGION")
                     .or_else(|_| std::env::var("BUZZ_S3_REGION"))
                     .unwrap_or_else(|_| "us-east-1".to_string()),

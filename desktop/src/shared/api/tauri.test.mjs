@@ -145,3 +145,17 @@ test("fromRawAcpRuntimeCatalogEntry omits maxParallelism when max_parallelism is
     "uncapped harness must have maxParallelism: undefined",
   );
 });
+
+// Both managed-agent decoders must preserve the fork's session policy.
+test("managedAgentWire preserves thread policy and defaults old records to channel", async () => {
+  const { fromRawManagedAgent } = await import("./managedAgentWire.ts");
+  assert.equal(
+    fromRawManagedAgent({ session_policy: "thread" }).sessionPolicy,
+    "thread",
+  );
+  assert.equal(
+    fromRawManagedAgent({ session_policy: "channel" }).sessionPolicy,
+    "channel",
+  );
+  assert.equal(fromRawManagedAgent({}).sessionPolicy, "channel");
+});

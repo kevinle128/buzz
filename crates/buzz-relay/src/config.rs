@@ -939,6 +939,15 @@ impl Config {
             s3_secret_key: std::env::var("BUZZ_S3_SECRET_KEY")
                 .unwrap_or_else(|_| "buzz_dev_secret".to_string()),
             s3_bucket: std::env::var("BUZZ_S3_BUCKET").unwrap_or_else(|_| "buzz-media".to_string()),
+            s3_prefix: match std::env::var("BUZZ_S3_PREFIX") {
+                Ok(value) => value,
+                Err(std::env::VarError::NotPresent) => String::new(),
+                Err(_) => {
+                    return Err(ConfigError::InvalidValue(
+                        "BUZZ_S3_PREFIX must be valid Unicode".to_string(),
+                    ))
+                }
+            },
             s3_region: std::env::var("BUZZ_S3_REGION")
                 .or_else(|_| std::env::var("AWS_REGION"))
                 .unwrap_or_else(|_| "us-east-1".to_string()),
@@ -976,6 +985,8 @@ impl Config {
                 .map(|s| s.trim().to_lowercase())
                 .filter(|s| !s.is_empty()),
         };
+        buzz_media::config::normalize_s3_prefix(&media.s3_prefix)
+            .map_err(ConfigError::InvalidValue)?;
         let media_max_concurrent_uploads: usize =
             std::env::var("BUZZ_MEDIA_MAX_CONCURRENT_UPLOADS")
                 .ok()
@@ -2004,6 +2015,47 @@ mod tests {
             Err(ConfigError::InvalidValue(ref message))
                 if message.contains("BUZZ_PARTITION_MANAGER_CREATE_ENABLED")
         ));
+    }
+
+    #[test]
+    fn s3_prefix_env_defaults_empty_and_rejects_unsafe_values() {
+        let _guards = env_guards();
+        let previous = std::env::var_os("BUZZ_S3_PREFIX");
+        std::env::remove_var("BUZZ_S3_PREFIX");
+        let default = Config::from_env();
+        std::env::set_var("BUZZ_S3_PREFIX", "buzz-media");
+        let configured = Config::from_env();
+        std::env::set_var("BUZZ_S3_PREFIX", "../other");
+        let invalid = Config::from_env();
+        match previous {
+            Some(value) => std::env::set_var("BUZZ_S3_PREFIX", value),
+            None => std::env::remove_var("BUZZ_S3_PREFIX"),
+        }
+        assert_eq!(default.expect("default prefix").media.s3_prefix, "");
+        assert_eq!(
+            configured.expect("configured prefix").media.s3_prefix,
+            "buzz-media"
+        );
+        assert!(
+            matches!(invalid, Err(ConfigError::InvalidValue(ref message)) if message.contains("BUZZ_S3_PREFIX"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn s3_prefix_env_rejects_non_unicode_values() {
+        use std::os::unix::ffi::OsStringExt;
+        let _guards = env_guards();
+        let previous = std::env::var_os("BUZZ_S3_PREFIX");
+        std::env::set_var("BUZZ_S3_PREFIX", std::ffi::OsString::from_vec(vec![0xff]));
+        let invalid = Config::from_env();
+        match previous {
+            Some(value) => std::env::set_var("BUZZ_S3_PREFIX", value),
+            None => std::env::remove_var("BUZZ_S3_PREFIX"),
+        }
+        assert!(
+            matches!(invalid, Err(ConfigError::InvalidValue(ref message)) if message.contains("BUZZ_S3_PREFIX must be valid Unicode"))
+        );
     }
 
     #[test]

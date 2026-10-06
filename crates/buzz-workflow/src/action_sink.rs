@@ -10,15 +10,22 @@ use buzz_core::tenant::CommunityId;
 use nostr::Tag;
 use uuid::Uuid;
 
+/// Verified workflow context attached to messages produced by a run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowMessageRoute {
+    /// The workflow run that produced the message.
     pub run_id: Uuid,
+    /// The workflow definition used by the run.
     pub workflow_id: Uuid,
+    /// The channel that owns the workflow run.
     pub home_channel_id: Uuid,
+    /// The repository event coordinate associated with the run.
     pub repository_coordinate: String,
+    /// The project event coordinate associated with the run.
     pub project_coordinate: String,
 }
 
+/// Build repository, project, and run provenance tags from verified context.
 pub fn route_provenance_tags(route: &WorkflowMessageRoute) -> Result<[Tag; 3], ActionSinkError> {
     Ok([
         Tag::parse(["a", &route.repository_coordinate])
@@ -85,8 +92,13 @@ pub trait ActionSink: Send + Sync {
     /// - `reply_to`: when `Some(event_id_hex)`, the message is posted as a
     ///   threaded reply to that event (NIP-10 root/reply tags + real thread
     ///   metadata); when `None`, it is a top-level channel message.
+    /// - `route`: verified project and workflow context for provenance tags.
     ///
     /// Returns the event ID hex string on success.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Keep the existing public workflow action sink contract."
+    )]
     fn send_message(
         &self,
         community_id: CommunityId,

@@ -360,6 +360,16 @@ export function parseBuzzCliCommand(
   const range = findBuzzCommand(tokens);
   if (!range) return null;
 
+  for (let i = range.buzzIndex + 1; i < tokens.length; i++) {
+    const token = tokens[i];
+    if (isCommandSeparator(token) || token === "--") break;
+    if (token === "--content") {
+      i += 1;
+    } else if (token === "--help" || token === "-h") {
+      return null;
+    }
+  }
+
   const group = tokens[range.groupIndex];
   const verb = tokens[range.verbIndex] ?? "run";
   const operation = `${group}.${verb}`;

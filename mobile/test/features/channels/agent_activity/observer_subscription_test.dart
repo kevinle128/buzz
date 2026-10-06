@@ -1,5 +1,9 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
+import 'package:pointycastle/digests/sha256.dart';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
@@ -10,6 +14,199 @@ import 'package:buzz/shared/crypto/nip44.dart';
 import 'package:buzz/shared/relay/relay.dart';
 
 void main() {
+  test('shared channel rejects malformed batch before admission', () async {
+    final owner = nostr.Keys.generate();
+    final agent = nostr.Keys.generate();
+    final session = _RecordingRelaySession();
+    final container = ProviderContainer(
+      overrides: [
+        relaySessionProvider.overrideWith(() => session),
+        relayConfigProvider.overrideWith(
+          () => _FakeRelayConfigNotifier(nsec: owner.nsec),
+        ),
+      ],
+    );
+    addTearDown(container.dispose);
+    container.read(observerRelayProvider);
+    await Future<void>.delayed(Duration.zero);
+    session.emit(
+      _observerEvent(
+        ownerKeychain: owner,
+        agentKeychain: agent,
+        channelId: '00000000-0000-4000-8000-000000000001',
+        payload: {
+          'seq': 1,
+          'timestamp': '2026-10-05T00:00:00Z',
+          'kind': 'batch',
+          'channelId': '00000000-0000-4000-8000-000000000001',
+          'payload': {},
+        },
+      ),
+    );
+    await Future<void>.delayed(Duration.zero);
+    expect(container.read(observerRelayProvider).framesByAgent, isEmpty);
+  });
+
+  test(
+    'shared channel accepts eligible member and stops on roster or policy loss',
+    () async {
+      final viewer = nostr.Keys.generate();
+      final owner = nostr.Keys.generate();
+      final agent = nostr.Keys.generate();
+      final relay = nostr.Keys.generate();
+      const channel = '00000000-0000-4000-8000-000000000001';
+      final digest = SHA256Digest().process(
+        Uint8List.fromList(utf8.encode('nostr:agent-auth:${agent.public}:')),
+      );
+      final message = digest
+          .map((b) => b.toRadixString(16).padLeft(2, '0'))
+          .join();
+      NostrEvent signed(
+        nostr.Keys keys,
+        int kind,
+        List<List<String>> tags,
+        String content,
+      ) => NostrEvent.fromJson(
+        nostr.Event.from(
+          kind: kind,
+          tags: tags,
+          content: content,
+          secretKey: keys.secret,
+          verify: false,
+        ).toMap(),
+      );
+      final profile = signed(agent, 0, [
+        [
+          'auth',
+          owner.public,
+          '',
+          nostr.Schnorr.sign(secretKey: owner.secret, message: message),
+        ],
+      ], '{}');
+      var member = true;
+      var mode = 'anyone';
+      final session = _RecordingRelaySession();
+      session.query = (filters) async {
+        final kind = filters.single.kinds.single;
+        if (kind == 0) return [profile];
+        if (kind == 39002) {
+          return [
+            signed(relay, kind, [
+              ['d', channel],
+              ['p', agent.public],
+              if (member) ['p', viewer.public],
+            ], ''),
+          ];
+        }
+        if (kind == 39000) {
+          return [
+            signed(relay, kind, [
+              ['d', channel],
+            ], ''),
+          ];
+        }
+        return [
+          signed(
+            owner,
+            30177,
+            [
+              ['d', agent.public],
+            ],
+            jsonEncode({'name': 'agent', 'parallelism': 1, 'respond_to': mode}),
+          ),
+        ];
+      };
+      final container = ProviderContainer(
+        overrides: [
+          relaySessionProvider.overrideWith(() => session),
+          relayConfigProvider.overrideWith(
+            () => _FakeRelayConfigNotifier(nsec: viewer.nsec),
+          ),
+        ],
+      );
+      addTearDown(container.dispose);
+      await http.runWithClient(
+        () async {
+          container.read(observerRelayProvider);
+          await Future<void>.delayed(Duration.zero);
+          Future<void> emit(int seq, {String kind = 'turn_started'}) async {
+            session.emit(
+              _observerEvent(
+                ownerKeychain: viewer,
+                agentKeychain: agent,
+                channelId: channel,
+                payload: {
+                  'seq': seq,
+                  'timestamp': '2026-10-05T00:00:0${seq}Z',
+                  'kind': kind,
+                  'channelId': channel,
+                  'payload': {},
+                },
+              ),
+            );
+            await Future<void>.delayed(Duration.zero);
+          }
+
+          await emit(1);
+          expect(
+            container.read(observerRelayProvider).framesByAgent[agent.public],
+            hasLength(1),
+          );
+          await emit(4, kind: '');
+          expect(
+            container.read(observerRelayProvider).framesByAgent[agent.public],
+            hasLength(1),
+          );
+          session.emit(
+            _observerEvent(
+              ownerKeychain: viewer,
+              agentKeychain: agent,
+              channelId: channel,
+              payload: {
+                'seq': 5,
+                'timestamp': '2026-10-05T00:00:05Z',
+                'kind': 'batch',
+                'channelId': channel,
+                'payload': {
+                  'events': [
+                    {
+                      'seq': 5,
+                      'timestamp': '2026-10-05T00:00:05Z',
+                      'kind': '',
+                      'channelId': channel,
+                      'payload': {},
+                    },
+                  ],
+                },
+              },
+            ),
+          );
+          await Future<void>.delayed(Duration.zero);
+          expect(
+            container.read(observerRelayProvider).framesByAgent[agent.public],
+            hasLength(1),
+          );
+          member = false;
+          await emit(2);
+          expect(
+            container.read(observerRelayProvider).framesByAgent[agent.public],
+            hasLength(1),
+          );
+          member = true;
+          mode = 'nobody';
+          await emit(3);
+          expect(
+            container.read(observerRelayProvider).framesByAgent[agent.public],
+            hasLength(1),
+          );
+        },
+        () => MockClient(
+          (_) async => http.Response(jsonEncode({'self': relay.public}), 200),
+        ),
+      );
+    },
+  );
+
   test('provider initializes without circular dependency error', () {
     // Regression test: reading the provider should NOT throw
     // "Bad state: Tried to read the state of an uninitialized provider".
@@ -537,6 +734,7 @@ NostrEvent _observerEvent({
   required nostr.Keys ownerKeychain,
   required nostr.Keys agentKeychain,
   required Map<String, dynamic> payload,
+  String? channelId,
 }) {
   final conversationKey = getConversationKey(
     agentKeychain.secret,
@@ -549,6 +747,7 @@ NostrEvent _observerEvent({
       ['p', ownerKeychain.public],
       ['agent', agentKeychain.public],
       ['frame', 'telemetry'],
+      if (channelId != null) ['h', channelId],
     ],
     secretKey: agentKeychain.secret,
     verify: false,
@@ -562,6 +761,13 @@ class _RecordingRelaySession extends RelaySessionNotifier {
   final List<void Function(String message)> _closedListeners = [];
   final List<Completer<void>> _subscribeGates = [];
   bool delaySubscribes = false;
+  Future<List<NostrEvent>> Function(List<NostrFilter>)? query;
+
+  @override
+  Future<List<NostrEvent>> queryRelay(
+    List<NostrFilter> filters, {
+    Duration timeout = const Duration(seconds: 8),
+  }) async => query == null ? [] : await query!(filters);
 
   @override
   SessionState build() => const SessionState(status: SessionStatus.connected);

@@ -310,6 +310,11 @@ fn storage_config_from_env() -> Result<MediaConfig> {
         s3_access_key: std::env::var("BUZZ_S3_ACCESS_KEY").unwrap_or_default(),
         s3_secret_key: std::env::var("BUZZ_S3_SECRET_KEY").unwrap_or_default(),
         s3_bucket: required("BUZZ_S3_BUCKET")?,
+        s3_prefix: match std::env::var("BUZZ_S3_PREFIX") {
+            Ok(value) => value,
+            Err(std::env::VarError::NotPresent) => String::new(),
+            Err(_) => return Err(anyhow::anyhow!("BUZZ_S3_PREFIX must be valid Unicode")),
+        },
         s3_region: std::env::var("BUZZ_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
         s3_addressing_style: addressing_style,
         max_image_bytes: 1,

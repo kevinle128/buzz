@@ -105,6 +105,48 @@ test("parseBuzzCliCommand preserves --content=inline for sends", () => {
   assert.equal(descriptor?.preview, "Acknowledged");
 });
 
+test("classifyTool keeps Buzz help commands as shell Activity", () => {
+  for (const command of [
+    "date -u +%Y-%m-%dT%H:%M:%SZ && buzz messages send --help",
+    "buzz messages send -h",
+    "buzz messages --help",
+  ]) {
+    assert.equal(parseBuzzCliCommand(command), null, command);
+    const descriptor = classifyTool({
+      title: "Run shell command",
+      toolName: "shell",
+      buzzToolName: null,
+      args: { command },
+      result: "Usage: buzz messages send [OPTIONS]",
+      isError: false,
+    });
+    assert.equal(descriptor.renderClass, "shell", command);
+    assert.equal(descriptor.preview, command);
+  }
+});
+
+test("Buzz help detection preserves real sends and help-like message content", () => {
+  for (const command of [
+    'buzz messages send --channel agents --content "Actual message"',
+    'buzz messages send --channel agents --content "--help"',
+    'buzz messages send --channel agents --content "-h"',
+    "buzz messages send --channel agents --content=--help",
+    'buzz messages send --channel agents --content "Actual message" && other --help',
+  ]) {
+    const descriptor = classifyTool({
+      title: "Run shell command",
+      toolName: "shell",
+      buzzToolName: null,
+      args: { command },
+      result: '{"event_id":"sent-event","accepted":true}',
+      isError: false,
+    });
+    assert.equal(descriptor.renderClass, "message", command);
+    assert.equal(descriptor.operation, "messages.send");
+    assert.ok(descriptor.preview);
+  }
+});
+
 test("parseBuzzCliCommand never surfaces --channel as preview for sends", () => {
   const commands = [
     "printf 'msg' | buzz messages send --channel my-uuid --content -",

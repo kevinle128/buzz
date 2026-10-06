@@ -205,6 +205,7 @@ mod tests {
             s3_access_key: String::new(),
             s3_secret_key: String::new(),
             s3_bucket: String::new(),
+            s3_prefix: String::new(),
             s3_region: "us-east-1".to_string(),
             s3_addressing_style: buzz_media_pkg::S3AddressingStyle::Path,
             max_image_bytes: 50 * 1024 * 1024,

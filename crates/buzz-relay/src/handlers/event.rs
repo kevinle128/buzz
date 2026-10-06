@@ -10,10 +10,6 @@ use buzz_core::kind::{
     event_kind_u32, is_ephemeral, is_unshared_gated_event, AUTHOR_ONLY_KINDS,
     KIND_AGENT_OBSERVER_FRAME, KIND_GIFT_WRAP, KIND_PRESENCE_UPDATE,
 };
-use buzz_core::observer::{
-    content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
-    OBSERVER_FRAME_TELEMETRY,
-};
 use buzz_core::tenant::TenantContext;
 use buzz_core::verification::verify_event;
 use buzz_core::CommunityId;
@@ -129,6 +125,39 @@ pub async fn filter_fanout_by_access(
             state.conn_manager.community_for_conn(*conn_id) == Some(community_id)
         })
         .collect();
+
+    // Both local and Redis observer deliveries require current audience access.
+    if event_kind_u32(&stored_event.event) == KIND_AGENT_OBSERVER_FRAME {
+        let has_channel = stored_event
+            .event
+            .tags
+            .iter()
+            .any(|tag| tag.as_slice().first().map(String::as_str) == Some("h"));
+        if has_channel {
+            if stored_event.event.verify().is_err() {
+                return Vec::new();
+            }
+            let Ok(Some(route)) = buzz_core::observer::parse_observer_route(&stored_event.event)
+            else {
+                return Vec::new();
+            };
+            if !matches!(
+                crate::observer::channel_observer_allowed(state, community_id, &route).await,
+                Ok(true)
+            ) {
+                return Vec::new();
+            }
+            return matches
+                .into_iter()
+                .filter(|(conn_id, _)| {
+                    state
+                        .conn_manager
+                        .pubkey_for_conn(*conn_id)
+                        .is_some_and(|key| key == route.recipient.as_bytes())
+                })
+                .collect();
+        }
+    }
 
     // Author-only kinds (NIP-ER reminders) may only ever be delivered to the
     // event's own author. This gate lives here — the chokepoint shared by the
@@ -1064,6 +1093,7 @@ struct AgentObserverRoute {
     agent: PublicKey,
     owner: PublicKey,
     direction: AgentObserverDirection,
+    channel_id: Option<uuid::Uuid>,
 }
 
 /// Check + bump the per-agent observer telemetry limit (100/sec window).
@@ -1094,9 +1124,9 @@ fn observer_frame_rate_limited(
 
 /// Handle encrypted agent observer frames (kind 24200).
 ///
-/// These frames bypass storage and are routed as global ephemeral events. The
-/// relay gates publication by the existing `agent_owner_pubkey` mapping and
-/// gates subscription in the REQ handler via the cleartext `p` tag.
+/// These frames bypass storage and use per-recipient global subscriptions.
+/// Signed channel telemetry requires current membership and owner policy.
+/// Legacy telemetry/control retain the existing `agent_owner_pubkey` mapping.
 async fn handle_agent_observer_event(
     event: Event,
     conn_id: uuid::Uuid,
@@ -1152,66 +1182,109 @@ async fn handle_agent_observer_event(
         }
     };
 
-    // Fast path: if this connection authenticated via NIP-OA and the verified
-    // owner matches the observer frame's target owner, skip the DB lookup entirely.
-    let session_owner_match = {
-        if let crate::connection::AuthState::Authenticated(ctx) = conn.auth_state_snapshot() {
-            ctx.agent_owner_pubkey.as_ref() == Some(&route.owner)
-        } else {
-            false
+    if let Some(channel) = route.channel_id {
+        let token_allows = match conn.auth_state_snapshot() {
+            AuthState::Authenticated(ctx) => ctx
+                .channel_ids
+                .as_ref()
+                .is_none_or(|ids| ids.contains(&channel)),
+            _ => false,
+        };
+        let shared_route = buzz_core::observer::ObserverRoute {
+            agent: route.agent,
+            recipient: route.owner,
+            channel_id: Some(channel),
+            direction: buzz_core::observer::ObserverDirection::Telemetry,
+        };
+        match crate::observer::channel_observer_allowed(
+            &state,
+            conn.tenant.community(),
+            &shared_route,
+        )
+        .await
+        {
+            Ok(true) if token_allows => {}
+            Ok(_) => {
+                reject("auth");
+                conn.send(RelayMessage::ok(
+                    event_id_hex,
+                    false,
+                    "restricted: channel observer recipient is not authorized",
+                ));
+                return;
+            }
+            Err(error) => {
+                warn!(%conn_id, "channel observer authorization failed: {error}");
+                conn.send(RelayMessage::ok(
+                    event_id_hex,
+                    false,
+                    "error: channel observer authorization unavailable",
+                ));
+                return;
+            }
         }
-    };
-
-    let agent_bytes = route.agent.to_bytes().to_vec();
-    let owner_bytes = route.owner.to_bytes().to_vec();
-    let cache_key = (
-        conn.tenant.community(),
-        agent_bytes.clone(),
-        owner_bytes.clone(),
-    );
-    let is_owner = if session_owner_match {
-        true
     } else {
-        match state.observer_owner_cache.get(&cache_key) {
-            Some(cached) => cached,
-            None => {
-                let result = state
-                    .db
-                    .is_agent_owner(conn.tenant.community(), &agent_bytes, &owner_bytes)
-                    .await;
-                match result {
-                    Ok(v) => {
-                        state.observer_owner_cache.insert(cache_key, v);
-                        v
-                    }
-                    Err(e) => {
-                        warn!(conn_id = %conn_id, event_id = %event_id_hex, "agent observer owner check failed: {e}");
-                        conn.send(RelayMessage::ok(
-                            event_id_hex,
-                            false,
-                            "error: internal server error",
-                        ));
-                        return;
+        // Fast path: if this connection authenticated via NIP-OA and the verified
+        // owner matches the observer frame's target owner, skip the DB lookup entirely.
+        let session_owner_match = {
+            if let crate::connection::AuthState::Authenticated(ctx) = conn.auth_state_snapshot() {
+                ctx.agent_owner_pubkey.as_ref() == Some(&route.owner)
+            } else {
+                false
+            }
+        };
+
+        let agent_bytes = route.agent.to_bytes().to_vec();
+        let owner_bytes = route.owner.to_bytes().to_vec();
+        let cache_key = (
+            conn.tenant.community(),
+            agent_bytes.clone(),
+            owner_bytes.clone(),
+        );
+        let is_owner = if session_owner_match {
+            true
+        } else {
+            match state.observer_owner_cache.get(&cache_key) {
+                Some(cached) => cached,
+                None => {
+                    let result = state
+                        .db
+                        .is_agent_owner(conn.tenant.community(), &agent_bytes, &owner_bytes)
+                        .await;
+                    match result {
+                        Ok(v) => {
+                            state.observer_owner_cache.insert(cache_key, v);
+                            v
+                        }
+                        Err(e) => {
+                            warn!(conn_id = %conn_id, event_id = %event_id_hex, "agent observer owner check failed: {e}");
+                            conn.send(RelayMessage::ok(
+                                event_id_hex,
+                                false,
+                                "error: internal server error",
+                            ));
+                            return;
+                        }
                     }
                 }
             }
+        };
+        if !is_owner {
+            reject("auth");
+            conn.send(RelayMessage::ok(
+                event_id_hex,
+                false,
+                "restricted: observer frame is not authorized for this agent owner",
+            ));
+            return;
         }
-    };
-    if !is_owner {
-        reject("auth");
-        conn.send(RelayMessage::ok(
-            event_id_hex,
-            false,
-            "restricted: observer frame is not authorized for this agent owner",
-        ));
-        return;
     }
 
     // Rate limit telemetry frames only (100/sec per agent).
     // Control frames (owner → agent) bypass the limiter — they are rare and must not
     // be starved by bursty telemetry from the agent.
     if matches!(route.direction, AgentObserverDirection::Telemetry) {
-        let agent_key: [u8; 32] = agent_bytes.as_slice().try_into().unwrap_or([0u8; 32]);
+        let agent_key = route.agent.to_bytes();
         if observer_frame_rate_limited(&state, conn.tenant.community(), agent_key) {
             conn.send(RelayMessage::ok(
                 event_id_hex,
@@ -1248,66 +1321,26 @@ async fn handle_agent_observer_event(
 }
 
 fn agent_observer_route(event: &Event) -> Result<Option<AgentObserverRoute>, String> {
-    if !content_looks_like_nip44(&event.content) {
-        return Err("invalid: observer content must be NIP-44 encrypted".into());
-    }
-
-    let recipient = parse_single_pubkey_tag(event, "p")?;
-    let agent = parse_single_pubkey_tag(event, OBSERVER_AGENT_TAG)?;
-    let frame = single_tag_content(event, OBSERVER_FRAME_TAG)?;
-
-    let (owner, direction, expected_frame) = if event.pubkey == agent && recipient != agent {
-        (
-            recipient,
-            AgentObserverDirection::Telemetry,
-            OBSERVER_FRAME_TELEMETRY,
-        )
-    } else if recipient == agent && event.pubkey != agent {
-        (
-            event.pubkey,
-            AgentObserverDirection::Control,
-            OBSERVER_FRAME_CONTROL,
-        )
-    } else {
-        return Err(
-            "invalid: observer frame must be agent-to-owner telemetry or owner-to-agent control"
-                .into(),
-        );
-    };
-
-    if frame != expected_frame {
-        // Unknown frame value — silently drop without notifying the publisher.
-        return Ok(None);
-    }
-
-    Ok(Some(AgentObserverRoute {
-        agent,
-        owner,
-        direction,
-    }))
-}
-
-fn parse_single_pubkey_tag(event: &Event, tag_name: &str) -> Result<PublicKey, String> {
-    let value = single_tag_content(event, tag_name)?;
-    PublicKey::from_hex(value)
-        .map_err(|_| format!("invalid: observer {tag_name} tag must be a hex pubkey"))
-}
-
-fn single_tag_content<'a>(event: &'a Event, tag_name: &str) -> Result<&'a str, String> {
-    let mut values = event
-        .tags
-        .iter()
-        .filter(|tag| tag.kind().to_string() == tag_name)
-        .filter_map(|tag| tag.content());
-    let Some(value) = values.next() else {
-        return Err(format!("invalid: observer frame missing {tag_name} tag"));
-    };
-    if values.next().is_some() {
-        return Err(format!(
-            "invalid: observer frame has multiple {tag_name} tags"
-        ));
-    }
-    Ok(value)
+    buzz_core::observer::parse_observer_route(event).map(|route| {
+        route.map(|route| AgentObserverRoute {
+            agent: route.agent,
+            owner: if matches!(
+                route.direction,
+                buzz_core::observer::ObserverDirection::Telemetry
+            ) {
+                route.recipient
+            } else {
+                event.pubkey
+            },
+            direction: match route.direction {
+                buzz_core::observer::ObserverDirection::Telemetry => {
+                    AgentObserverDirection::Telemetry
+                }
+                buzz_core::observer::ObserverDirection::Control => AgentObserverDirection::Control,
+            },
+            channel_id: route.channel_id,
+        })
+    })
 }
 
 #[cfg(test)]
@@ -1500,6 +1533,37 @@ mod tests {
 
         let err = super::agent_observer_route(&event).expect_err("route should reject plaintext");
         assert!(err.contains("NIP-44"));
+    }
+
+    #[test]
+    fn observer_channel_routing_does_not_fall_back_to_legacy_controls() {
+        let agent = Keys::generate();
+        let owner = Keys::generate();
+        for channel_tags in [
+            vec![Tag::parse(["h", "invalid"]).unwrap()],
+            vec![Tag::parse(["h", &Uuid::new_v4().to_string()]).unwrap()],
+            vec![Tag::parse(["h"]).unwrap()],
+        ] {
+            let content = encrypt_observer_payload(
+                &owner,
+                &agent.public_key(),
+                &serde_json::json!({"type":"cancel_turn"}),
+            )
+            .unwrap();
+            let event = EventBuilder::new(Kind::Custom(KIND_AGENT_OBSERVER_FRAME as u16), content)
+                .tags([
+                    Tag::public_key(agent.public_key()),
+                    Tag::parse([OBSERVER_AGENT_TAG, &agent.public_key().to_hex()]).unwrap(),
+                    Tag::parse([OBSERVER_FRAME_TAG, OBSERVER_FRAME_CONTROL]).unwrap(),
+                ])
+                .tags(channel_tags)
+                .sign_with_keys(&owner)
+                .unwrap();
+            assert!(
+                super::agent_observer_route(&event).is_err(),
+                "channel control must fail closed"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3293,6 +3357,216 @@ mod tests {
             {
                 axum::extract::ws::Message::Text(t) => t.to_string(),
                 other => panic!("expected a Text frame, got {other:?}"),
+            }
+        }
+
+        mod observer_postgres_tests {
+            use super::*;
+            #[tokio::test]
+            #[ignore = "requires Postgres"]
+            async fn channel_observer_signed_handler_accepts_member_with_current_anyone_policy() {
+                let state = crate::state::tests::test_state().await;
+                let host = format!("observer-{}.test", uuid::Uuid::new_v4().simple());
+                let community = state
+                    .db
+                    .ensure_configured_community(&host)
+                    .await
+                    .unwrap()
+                    .id;
+                let tenant = buzz_core::TenantContext::resolved(community, host);
+                let owner = nostr::Keys::generate();
+                let agent = nostr::Keys::generate();
+                let viewer = nostr::Keys::generate();
+                for keys in [&owner, &agent, &viewer] {
+                    state
+                        .db
+                        .ensure_user(community, keys.public_key().as_bytes())
+                        .await
+                        .unwrap();
+                }
+                state
+                    .db
+                    .set_agent_owner(
+                        community,
+                        agent.public_key().as_bytes(),
+                        owner.public_key().as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                let channel = state
+                    .db
+                    .create_channel(
+                        community,
+                        "observer",
+                        buzz_core::channel::ChannelType::Stream,
+                        buzz_core::channel::ChannelVisibility::Open,
+                        None,
+                        owner.public_key().as_bytes(),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                for keys in [&agent, &viewer] {
+                    state
+                        .db
+                        .add_member(
+                            community,
+                            channel.id,
+                            keys.public_key().as_bytes(),
+                            buzz_core::channel::MemberRole::Member,
+                            Some(owner.public_key().as_bytes()),
+                        )
+                        .await
+                        .unwrap();
+                }
+                let auth =
+                    buzz_sdk::nip_oa::compute_auth_tag(&owner, &agent.public_key(), "kind=0")
+                        .unwrap();
+                let profile = nostr::EventBuilder::new(nostr::Kind::Metadata, "{}")
+                    .tags([buzz_sdk::nip_oa::parse_auth_tag(&auth).unwrap()])
+                    .sign_with_keys(&agent)
+                    .unwrap();
+                let policy = nostr::EventBuilder::new(
+                    nostr::Kind::Custom(30177),
+                    r#"{"name":"test","parallelism":1,"respond_to":"anyone"}"#,
+                )
+                .tags([nostr::Tag::parse(["d", &agent.public_key().to_hex()]).unwrap()])
+                .sign_with_keys(&owner)
+                .unwrap();
+                state
+                    .db
+                    .insert_event(community, &profile, None)
+                    .await
+                    .unwrap();
+                state
+                    .db
+                    .insert_event(community, &policy, None)
+                    .await
+                    .unwrap();
+                let encrypted = buzz_core::observer::encrypt_observer_payload(
+                    &agent,
+                    &viewer.public_key(),
+                    &serde_json::json!({"kind":"turn_started","channelId":channel.id.to_string()}),
+                )
+                .unwrap();
+                let event = nostr::EventBuilder::new(nostr::Kind::Custom(24200), encrypted)
+                    .tags([
+                        nostr::Tag::public_key(viewer.public_key()),
+                        nostr::Tag::parse(["agent", &agent.public_key().to_hex()]).unwrap(),
+                        nostr::Tag::parse(["frame", "telemetry"]).unwrap(),
+                        nostr::Tag::parse(["h", &channel.id.to_string()]).unwrap(),
+                    ])
+                    .sign_with_keys(&agent)
+                    .unwrap();
+                let frame = ok_frame(&state, &tenant, &agent, event.clone()).await;
+                let ack: serde_json::Value = serde_json::from_str(&frame).unwrap();
+                assert_eq!(
+                    ack[2], true,
+                    "eligible signed channel observer must be accepted: {frame}"
+                );
+                assert!(
+                    state
+                        .db
+                        .get_event_by_id(community, event.id.as_bytes())
+                        .await
+                        .unwrap()
+                        .is_none(),
+                    "observer must remain ephemeral"
+                );
+                for (index, (content, expected)) in [
+                    (serde_json::json!({"name":"test","parallelism":1,"respond_to":"owner-only"}),false),
+                    (serde_json::json!({"name":"test","parallelism":1,"respond_to":"allowlist","respond_to_allowlist":[viewer.public_key().to_hex()]}),true),
+                    (serde_json::json!({"name":"test","parallelism":1,"respond_to":"allowlist"}),false),
+                    (serde_json::json!({"name":"test","parallelism":1,"respond_to":"nobody"}),false),
+                    (serde_json::json!({"respond_to":"anyone"}),false),
+                    (serde_json::json!({"name":"test","parallelism":1,"respond_to":"anyone"}),true),
+                ].into_iter().enumerate() {
+                    let saved = nostr::EventBuilder::new(nostr::Kind::Custom(30177),content.to_string())
+                        .tags([nostr::Tag::parse(["d", &agent.public_key().to_hex()]).unwrap()])
+                        .custom_created_at(nostr::Timestamp::from(policy.created_at.as_secs()+index as u64+1))
+                        .sign_with_keys(&owner).unwrap();
+                    state.db.insert_event(community,&saved,None).await.unwrap();
+                    let frame = ok_frame(&state,&tenant,&agent,event.clone()).await;
+                    let ack:serde_json::Value = serde_json::from_str(&frame).unwrap();
+                    assert_eq!(ack[2],expected,"current signed policy must determine audience: {frame}");
+                }
+                let other_host = format!("observer-other-{}.test", uuid::Uuid::new_v4().simple());
+                let other_community = state
+                    .db
+                    .ensure_configured_community(&other_host)
+                    .await
+                    .unwrap()
+                    .id;
+                let other_tenant = buzz_core::TenantContext::resolved(other_community, other_host);
+                let frame = ok_frame(&state, &other_tenant, &agent, event.clone()).await;
+                let ack: serde_json::Value = serde_json::from_str(&frame).unwrap();
+                assert_eq!(
+                    ack[2], false,
+                    "another community cannot authorize this channel"
+                );
+                state
+                    .db
+                    .remove_member(
+                        community,
+                        channel.id,
+                        agent.public_key().as_bytes(),
+                        owner.public_key().as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                let frame = ok_frame(&state, &tenant, &agent, event.clone()).await;
+                let ack: serde_json::Value = serde_json::from_str(&frame).unwrap();
+                assert_eq!(ack[2], false, "agent must itself remain a channel member");
+                state
+                    .db
+                    .add_member(
+                        community,
+                        channel.id,
+                        agent.public_key().as_bytes(),
+                        buzz_core::channel::MemberRole::Member,
+                        Some(owner.public_key().as_bytes()),
+                    )
+                    .await
+                    .unwrap();
+                state
+                    .db
+                    .remove_member(
+                        community,
+                        channel.id,
+                        viewer.public_key().as_bytes(),
+                        owner.public_key().as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                let frame = ok_frame(&state, &tenant, &agent, event).await;
+                let ack: serde_json::Value = serde_json::from_str(&frame).unwrap();
+                assert_eq!(
+                    ack[2], false,
+                    "removed viewer must fail even in an open channel"
+                );
+                for (sender, expected) in [(&owner, true), (&viewer, false)] {
+                    let encrypted = buzz_core::observer::encrypt_observer_payload(
+                        sender,
+                        &agent.public_key(),
+                        &serde_json::json!({"type":"cancel_turn"}),
+                    )
+                    .unwrap();
+                    let control = buzz_sdk::build_agent_observer_frame(
+                        &agent.public_key().to_hex(),
+                        &agent.public_key().to_hex(),
+                        "control",
+                        &encrypted,
+                    )
+                    .unwrap()
+                    .sign_with_keys(sender)
+                    .unwrap();
+                    let frame = ok_frame(&state, &tenant, sender, control).await;
+                    let ack: serde_json::Value = serde_json::from_str(&frame).unwrap();
+                    assert_eq!(
+                        ack[2], expected,
+                        "shared viewing must preserve owner-only controls: {frame}"
+                    );
+                }
             }
         }
 

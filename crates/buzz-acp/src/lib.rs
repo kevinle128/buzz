@@ -1,4 +1,5 @@
 #![deny(unsafe_code)]
+mod observer_audience;
 
 mod git;
 #[cfg(all(test, unix))]
@@ -1095,13 +1096,17 @@ impl ObserverPublishQueue {
             self.enqueue(source_events, ready);
         }
         let channel = self.events.front()?.2.channel_id.clone();
+        let owner_only = owner_only_observer_event(&self.events.front()?.2);
 
         let mut picked: Vec<observer::ObserverEvent> = Vec::new();
         let mut kept: VecDeque<(usize, u64, observer::ObserverEvent)> =
             VecDeque::with_capacity(self.events.len());
         let mut gathering = true;
         while let Some((bytes, source_events, event)) = self.events.pop_front() {
-            if gathering && event.channel_id == channel {
+            if gathering
+                && event.channel_id == channel
+                && owner_only_observer_event(&event) == owner_only
+            {
                 picked.push(event);
                 if picked.len() > 1
                     && serialized_len(&batch_envelope(&picked)) > OBSERVER_MAX_PLAINTEXT_LEN
@@ -1161,13 +1166,51 @@ fn batch_envelope(events: &[observer::ObserverEvent]) -> observer::ObserverEvent
     }
 }
 
+fn owner_only_observer_event(event: &observer::ObserverEvent) -> bool {
+    owner_only_observer_fields(&event.kind, event.channel_id.is_none(), &event.payload)
+}
+fn owner_only_observer_fields(kind: &str, global: bool, payload: &serde_json::Value) -> bool {
+    if kind == OBSERVER_BATCH_KIND {
+        return payload
+            .get("events")
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(|events| {
+                events.iter().any(|event| {
+                    owner_only_observer_fields(
+                        event["kind"].as_str().unwrap_or(""),
+                        event["channelId"].is_null(),
+                        &event["payload"],
+                    )
+                })
+            });
+    }
+    global
+        || matches!(
+            kind,
+            "control_result" | "session_config_captured" | "managed_agent_runtime_lifecycle"
+        )
+        || matches!(
+            payload.get("type").and_then(serde_json::Value::as_str),
+            Some("agent_management_request" | "project_channel_request")
+        )
+}
+
+#[cfg(test)]
+fn observer_test_rest_client() -> relay::RestClient {
+    relay::RestClient {
+        http: reqwest::Client::new(),
+        base_url: "http://127.0.0.1:1".into(),
+        keys: nostr::Keys::generate(),
+        auth_tag_json: None,
+    }
+}
+
 fn spawn_relay_observer_publisher(
     observer: observer::ObserverHandle,
     publisher: RelayEventPublisher,
     keys: nostr::Keys,
-    agent_pubkey_hex: String,
-    owner_pubkey_hex: String,
     owner_pubkey: PublicKey,
+    rest: relay::RestClient,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // Subscribe BEFORE snapshotting so an event emitted between the two
@@ -1176,16 +1219,7 @@ fn spawn_relay_observer_publisher(
         // high-water `seq` (monotonic, assigned at emit).
         let rx = observer.subscribe();
         let snapshot = observer.snapshot();
-        run_relay_observer_publisher(
-            snapshot,
-            rx,
-            publisher,
-            keys,
-            agent_pubkey_hex,
-            owner_pubkey_hex,
-            owner_pubkey,
-        )
-        .await;
+        run_relay_observer_publisher(snapshot, rx, publisher, keys, owner_pubkey, rest).await;
     })
 }
 
@@ -1194,10 +1228,13 @@ async fn run_relay_observer_publisher(
     mut rx: tokio::sync::broadcast::Receiver<observer::ObserverEvent>,
     publisher: RelayEventPublisher,
     keys: nostr::Keys,
-    agent_pubkey_hex: String,
-    owner_pubkey_hex: String,
     owner_pubkey: PublicKey,
+    rest: relay::RestClient,
 ) {
+    let agent_pubkey_hex = keys.public_key().to_hex();
+    let owner_pubkey_hex = owner_pubkey.to_hex();
+    let mut audience: Option<observer_audience::ObserverAudience> = None;
+    let mut pending: Option<(observer::ObserverEvent, Uuid, VecDeque<PublicKey>)> = None;
     let mut queue = ObserverPublishQueue::default();
     let max_snapshot_seq = snapshot.iter().map(|event| event.seq).max().unwrap_or(0);
     for event in snapshot {
@@ -1240,13 +1277,33 @@ async fn run_relay_observer_publisher(
                 }
             }
             _ = publish_tick.tick() => {
-                if let Some(frame) = queue.next_frame() {
-                    publish_relay_observer_event(
-                        &publisher, &keys, &agent_pubkey_hex,
-                        &owner_pubkey_hex, &owner_pubkey, frame,
-                    ).await;
+                if let Some((frame, channel, recipients)) = pending.as_mut() {
+                    if let Some(recipient) = recipients.pop_front() {
+                        // Each paced copy must use current signed authorization.
+                        if let Some(audience) = audience.as_mut() {
+                            if audience.recipients(keys.public_key(), *channel).await.is_ok_and(|current| current.contains(&recipient)) {
+                                publish_relay_observer_event(&publisher, &keys, &agent_pubkey_hex, &recipient.to_hex(), &recipient, frame.clone()).await;
+                            }
+                        }
+                    }
+                    if recipients.is_empty() { pending = None; }
+                } else if let Some(frame) = queue.next_frame() {
+                    if owner_only_observer_event(&frame) {
+                        publish_relay_observer_event(&publisher, &keys, &agent_pubkey_hex, &owner_pubkey_hex, &owner_pubkey, frame).await;
+                    } else if let Some(channel) = frame.channel_id.as_deref().and_then(|id| Uuid::parse_str(id).ok()) {
+                        if audience.is_none() { audience = Some(observer_audience::ObserverAudience::new(rest.clone()).await); }
+                        if let Some(audience) = audience.as_mut() {
+                            if let Ok(recipients) = audience.recipients(keys.public_key(), channel).await {
+                                let mut recipients: VecDeque<_> = recipients.into();
+                                if let Some(recipient) = recipients.pop_front() {
+                                    publish_relay_observer_event(&publisher, &keys, &agent_pubkey_hex, &recipient.to_hex(), &recipient, frame.clone()).await;
+                                }
+                                if !recipients.is_empty() { pending = Some((frame, channel, recipients)); }
+                            }
+                        }
+                    }
                 }
-                if closed && queue.is_empty() {
+                if closed && queue.is_empty() && pending.is_none() {
                     break;
                 }
             }
@@ -1599,12 +1656,37 @@ async fn publish_relay_observer_event(
             return;
         }
     };
-    let builder = match buzz_sdk::build_agent_observer_frame(
-        owner_pubkey_hex,
-        agent_pubkey_hex,
-        OBSERVER_FRAME_TELEMETRY,
-        &encrypted,
-    ) {
+    let builder = if owner_only_observer_event(&event) {
+        buzz_sdk::build_agent_observer_frame(
+            owner_pubkey_hex,
+            agent_pubkey_hex,
+            OBSERVER_FRAME_TELEMETRY,
+            &encrypted,
+        )
+    } else {
+        let Some(channel) = event
+            .channel_id
+            .as_deref()
+            .and_then(|id| Uuid::parse_str(id).ok())
+        else {
+            return;
+        };
+        let Ok(payload) = serde_json::to_value(&event) else {
+            return;
+        };
+        if buzz_core::observer::validate_observer_channel_payload(&payload, &channel.to_string())
+            .is_err()
+        {
+            return;
+        }
+        buzz_sdk::build_channel_agent_observer_frame(
+            owner_pubkey_hex,
+            agent_pubkey_hex,
+            channel,
+            &encrypted,
+        )
+    };
+    let builder = match builder {
         Ok(builder) => builder,
         Err(error) => {
             tracing::warn!("failed to build relay observer event: {error}");
@@ -2883,9 +2965,8 @@ async fn run_harness(
                         observer,
                         relay.event_publisher(),
                         config.keys.clone(),
-                        pubkey_hex.clone(),
-                        owner_pubkey_hex,
                         owner_pubkey,
+                        relay.rest_client(),
                     ));
                     relay
                         .subscribe_observer_controls()
@@ -2930,16 +3011,9 @@ async fn run_harness(
         }
     }
 
-    if let Some((observer, publisher, keys, agent_pubkey, owner_pubkey, owner)) =
-        relay_observer_publisher.take()
-    {
+    if let Some((observer, publisher, keys, owner, rest)) = relay_observer_publisher.take() {
         relay_observer_publisher_task = Some(spawn_relay_observer_publisher(
-            observer,
-            publisher,
-            keys,
-            agent_pubkey,
-            owner_pubkey,
-            owner,
+            observer, publisher, keys, owner, rest,
         ));
     }
 
@@ -8636,9 +8710,8 @@ mod observer_snapshot_race_tests {
             rx,
             publisher,
             agent_keys.clone(),
-            agent_keys.public_key().to_hex(),
-            owner_keys.public_key().to_hex(),
             owner_keys.public_key(),
+            observer_test_rest_client(),
         )
         .await;
 
@@ -9325,7 +9398,7 @@ mod observer_publish_cadence_tests {
 
     fn emit_on(observer: &observer::ObserverHandle, channel: Option<uuid::Uuid>, marker: &str) {
         observer.emit(
-            "test_event",
+            "control_result",
             None,
             &observer::context_for(channel, None, None),
             serde_json::json!({ "marker": marker }),
@@ -9361,9 +9434,8 @@ mod observer_publish_cadence_tests {
             rx,
             publisher,
             agent_keys.clone(),
-            agent_keys.public_key().to_hex(),
-            owner_keys.public_key().to_hex(),
             owner_keys.public_key(),
+            observer_test_rest_client(),
         ));
 
         // t=0: nothing may publish, no matter how full the snapshot was.
@@ -9440,9 +9512,8 @@ mod observer_publish_cadence_tests {
             rx,
             publisher,
             agent_keys.clone(),
-            agent_keys.public_key().to_hex(),
-            owner_keys.public_key().to_hex(),
             owner_keys.public_key(),
+            observer_test_rest_client(),
         ));
 
         settle().await;
@@ -9506,9 +9577,8 @@ mod observer_publish_cadence_tests {
             rx,
             publisher,
             agent_keys.clone(),
-            agent_keys.public_key().to_hex(),
-            owner_keys.public_key().to_hex(),
             owner_keys.public_key(),
+            observer_test_rest_client(),
         ));
         settle().await;
 
@@ -12976,3 +13046,7 @@ mod observer_payload_trim_tests {
         assert!(leaf.contains("[elided"));
     }
 }
+
+#[cfg(test)]
+#[path = "observer_audience_tests.rs"]
+mod observer_audience_tests;

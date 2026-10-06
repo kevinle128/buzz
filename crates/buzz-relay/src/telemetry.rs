@@ -474,6 +474,8 @@ mod tests {
 
     #[test]
     fn trace_context_lookup_does_not_enable_callsites() {
+        // Retain another registered subscriber, as parallel tests do.
+        let _other_dispatch = tracing::Dispatch::new(tracing_subscriber::registry());
         let context_lookup = TraceContextLookup::default();
         let subscriber = tracing_subscriber::registry().with(
             context_lookup
@@ -487,10 +489,19 @@ mod tests {
                 .get()
                 .and_then(tracing::dispatcher::WeakDispatch::upgrade)
                 .is_some());
-            assert!(!tracing::enabled!(
+            use tracing::callsite::Callsite as _;
+            let callsite = tracing::callsite! {
+                name: "trace_context_lookup_filter_test",
+                kind: tracing::metadata::Kind::EVENT,
                 target: "trace_context_lookup_filter_test",
-                tracing::Level::ERROR
-            ));
+                level: tracing::Level::ERROR,
+                fields:
+            };
+            // Test this subscriber's interest directly. `enabled!` can be
+            // conservative when another dispatch keeps this callsite active.
+            tracing::dispatcher::get_default(|dispatch| {
+                assert!(dispatch.register_callsite(callsite.metadata()).is_never());
+            });
         });
     }
 

@@ -663,8 +663,11 @@ async fn handle_active_connection(
         ctrl_rx,
         terminal_ctrl_rx,
         restart_rx,
-        send_cancel,
-        disconnect_reason,
+        WriterContext {
+            cancel: send_cancel,
+            disconnect_reason,
+            observer_context: Some((Arc::clone(&state), Arc::clone(&conn))),
+        },
     ));
 
     let missed_pongs = Arc::new(AtomicU8::new(0));
@@ -775,6 +778,13 @@ async fn handle_active_connection(
     drop(permit);
 }
 
+/// Connection state used by one socket writer.
+struct WriterContext {
+    cancel: CancellationToken,
+    disconnect_reason: watch::Receiver<Option<CommunityDisconnectReason>>,
+    observer_context: Option<(Arc<AppState>, Arc<ConnectionState>)>,
+}
+
 /// Send WebSocket messages in priority order: control frames before data frames.
 ///
 /// Control frames (Pong, Close) are drained first on every iteration,
@@ -787,8 +797,7 @@ async fn send_loop(
     ctrl_rx: mpsc::Receiver<WsMessage>,
     terminal_ctrl_rx: mpsc::Receiver<WsMessage>,
     restart_rx: mpsc::Receiver<RestartClose>,
-    cancel: CancellationToken,
-    disconnect_reason: watch::Receiver<Option<CommunityDisconnectReason>>,
+    context: WriterContext,
 ) {
     send_loop_inner(
         ws_send,
@@ -796,8 +805,7 @@ async fn send_loop(
         ctrl_rx,
         terminal_ctrl_rx,
         restart_rx,
-        cancel,
-        disconnect_reason,
+        context,
     )
     .await;
 }
@@ -826,20 +834,95 @@ where
     }
 }
 
+/// Inspect the signed EVENT envelope retained in the existing outbound queue.
+/// Other messages, including legacy owner controls, keep their existing path.
+fn queued_channel_observer(message: &WsMessage) -> Result<Option<nostr::Event>, ()> {
+    let WsMessage::Text(text) = message else {
+        return Ok(None);
+    };
+    let Ok(frame) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Ok(None);
+    };
+    if frame.get(0).and_then(serde_json::Value::as_str) != Some("EVENT") {
+        return Ok(None);
+    }
+    let Some(value) = frame.get(2) else {
+        return Ok(None);
+    };
+    if value.get("kind").and_then(serde_json::Value::as_u64)
+        != Some(buzz_core::kind::KIND_AGENT_OBSERVER_FRAME as u64)
+    {
+        return Ok(None);
+    }
+    let has_channel = value
+        .get("tags")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|tags| {
+            tags.iter()
+                .any(|tag| tag.get(0).and_then(serde_json::Value::as_str) == Some("h"))
+        });
+    if !has_channel {
+        return Ok(None);
+    }
+    serde_json::from_value(value.clone())
+        .map(Some)
+        .map_err(|_| ())
+}
+
 async fn feed_or_cancel<S>(
     sink: &mut S,
     message: WsMessage,
     cancel: &CancellationToken,
+    observer_context: &Option<(Arc<AppState>, Arc<ConnectionState>)>,
 ) -> WriterStep
 where
     S: Sink<WsMessage> + Unpin,
 {
+    let event = match queued_channel_observer(&message) {
+        Ok(None) => {
+            return tokio::select! {
+                biased;
+                _ = cancel.cancelled() => WriterStep::Cancelled,
+                result = sink.feed(message) => if result.is_ok() { WriterStep::Completed } else { WriterStep::Failed },
+            };
+        }
+        Ok(Some(event)) => event,
+        Err(()) => return WriterStep::Completed,
+    };
+    if event.verify().is_err() {
+        return WriterStep::Completed;
+    }
+    let Ok(Some(route)) = buzz_core::observer::parse_observer_route(&event) else {
+        return WriterStep::Completed;
+    };
+    let Some((state, conn)) = observer_context else {
+        return WriterStep::Completed;
+    };
+    let allowed_identity = match conn.auth_state_snapshot() {
+        AuthState::Authenticated(ctx) => {
+            ctx.pubkey == route.recipient
+                && ctx.channel_ids.as_ref().is_none_or(|ids| {
+                    route
+                        .channel_id
+                        .is_some_and(|channel| ids.contains(&channel))
+                })
+        }
+        _ => false,
+    };
+    if !allowed_identity {
+        return WriterStep::Completed;
+    }
     tokio::select! {
         biased;
         _ = cancel.cancelled() => WriterStep::Cancelled,
-        result = sink.feed(message) => {
-            if result.is_ok() { WriterStep::Completed } else { WriterStep::Failed }
-        }
+        result = async {
+            // Readiness can block indefinitely. Recheck only after it returns,
+            // then admit immediately without another asynchronous sink wait.
+            if std::future::poll_fn(|cx| std::pin::Pin::new(&mut *sink).poll_ready(cx)).await.is_err() { return WriterStep::Failed; }
+            if !matches!(crate::observer::channel_observer_allowed(state,conn.tenant.community(),&route).await,Ok(true)) { return WriterStep::Completed; }
+            if cancel.is_cancelled() { return WriterStep::Cancelled; }
+            if std::pin::Pin::new(sink).start_send(message).is_ok() { WriterStep::Completed } else { WriterStep::Failed }
+        } => result,
     }
 }
 
@@ -934,11 +1017,15 @@ async fn send_loop_inner<S>(
     mut ctrl_rx: mpsc::Receiver<WsMessage>,
     mut terminal_ctrl_rx: mpsc::Receiver<WsMessage>,
     mut restart_rx: mpsc::Receiver<RestartClose>,
-    cancel: CancellationToken,
-    disconnect_reason: watch::Receiver<Option<CommunityDisconnectReason>>,
+    context: WriterContext,
 ) where
     S: Sink<WsMessage> + Unpin,
 {
+    let WriterContext {
+        cancel,
+        disconnect_reason,
+        observer_context,
+    } = context;
     loop {
         // Priority: drain all pending control frames before data.
         while let Ok(ctrl_msg) = ctrl_rx.try_recv() {
@@ -1005,7 +1092,7 @@ async fn send_loop_inner<S>(
             }
             Some(msg) = data_rx.recv() => {
                 let mut batched = 1usize;
-                match feed_or_cancel(&mut ws_send, msg, &cancel).await {
+                match feed_or_cancel(&mut ws_send, msg, &cancel, &observer_context).await {
                     WriterStep::Completed => {}
                     WriterStep::Cancelled => {
                         flush_terminal_frames(
@@ -1024,7 +1111,7 @@ async fn send_loop_inner<S>(
                 while batched < MAX_WS_SEND_BATCH {
                     match data_rx.try_recv() {
                         Ok(next) => {
-                            match feed_or_cancel(&mut ws_send, next, &cancel).await {
+                            match feed_or_cancel(&mut ws_send, next, &cancel, &observer_context).await {
                                 WriterStep::Completed => {}
                                 WriterStep::Cancelled => {
                                     flush_terminal_frames(
@@ -2089,8 +2176,11 @@ pub(crate) mod tests {
             mpsc::channel(1).1,
             terminal_rx,
             mpsc::channel(1).1,
-            conn.cancel.clone(),
-            conn.community_control.disconnect_reason(),
+            WriterContext {
+                cancel: conn.cancel.clone(),
+                disconnect_reason: conn.community_control.disconnect_reason(),
+                observer_context: None,
+            },
         )
         .await;
         let mut recorded = state.lock().expect("mock sink poisoned");
@@ -2136,8 +2226,11 @@ pub(crate) mod tests {
             ctrl_rx,
             terminal_ctrl_rx,
             restart_rx,
-            cancel.clone(),
-            ordinary_disconnect_reason(),
+            WriterContext {
+                cancel: cancel.clone(),
+                disconnect_reason: ordinary_disconnect_reason(),
+                observer_context: None,
+            },
         ));
 
         ready_polled.notified().await;
@@ -2195,8 +2288,11 @@ pub(crate) mod tests {
             ctrl_rx,
             terminal_ctrl_rx,
             restart_rx,
-            cancel.clone(),
-            ordinary_disconnect_reason(),
+            WriterContext {
+                cancel: cancel.clone(),
+                disconnect_reason: ordinary_disconnect_reason(),
+                observer_context: None,
+            },
         ));
 
         ready_polled.notified().await;
@@ -2251,8 +2347,11 @@ pub(crate) mod tests {
             ctrl_rx,
             terminal_ctrl_rx,
             restart_rx,
-            cancel.clone(),
-            ordinary_disconnect_reason(),
+            WriterContext {
+                cancel: cancel.clone(),
+                disconnect_reason: ordinary_disconnect_reason(),
+                observer_context: None,
+            },
         ));
 
         // Cancel before the select! ever receives any data — fires the cancel arm.
@@ -2286,8 +2385,11 @@ pub(crate) mod tests {
             ctrl_rx,
             mpsc::channel(1).1,
             restart_rx,
-            CancellationToken::new(),
-            ordinary_disconnect_reason(),
+            WriterContext {
+                cancel: CancellationToken::new(),
+                disconnect_reason: ordinary_disconnect_reason(),
+                observer_context: None,
+            },
         )
         .await;
 
@@ -2316,8 +2418,11 @@ pub(crate) mod tests {
             ctrl_rx,
             mpsc::channel(1).1,
             restart_rx,
-            CancellationToken::new(),
-            ordinary_disconnect_reason(),
+            WriterContext {
+                cancel: CancellationToken::new(),
+                disconnect_reason: ordinary_disconnect_reason(),
+                observer_context: None,
+            },
         )
         .await;
 
@@ -2351,8 +2456,11 @@ pub(crate) mod tests {
             ctrl_rx,
             mpsc::channel(1).1,
             restart_rx,
-            CancellationToken::new(),
-            ordinary_disconnect_reason(),
+            WriterContext {
+                cancel: CancellationToken::new(),
+                disconnect_reason: ordinary_disconnect_reason(),
+                observer_context: None,
+            },
         )
         .await;
 
@@ -2384,8 +2492,11 @@ pub(crate) mod tests {
             ctrl_rx,
             mpsc::channel(1).1,
             restart_rx,
-            CancellationToken::new(),
-            ordinary_disconnect_reason(),
+            WriterContext {
+                cancel: CancellationToken::new(),
+                disconnect_reason: ordinary_disconnect_reason(),
+                observer_context: None,
+            },
         )
         .await;
 
@@ -2422,8 +2533,11 @@ pub(crate) mod tests {
             ctrl_rx,
             mpsc::channel(1).1,
             restart_rx,
-            CancellationToken::new(),
-            ordinary_disconnect_reason(),
+            WriterContext {
+                cancel: CancellationToken::new(),
+                disconnect_reason: ordinary_disconnect_reason(),
+                observer_context: None,
+            },
         )
         .await;
 
@@ -2448,8 +2562,11 @@ pub(crate) mod tests {
             ctrl_rx,
             mpsc::channel(1).1,
             restart_rx,
-            cancel,
-            deleted_community_disconnect_reason(),
+            WriterContext {
+                cancel,
+                disconnect_reason: deleted_community_disconnect_reason(),
+                observer_context: None,
+            },
         )
         .await;
 
@@ -2479,8 +2596,11 @@ pub(crate) mod tests {
             ctrl_rx,
             mpsc::channel(1).1,
             restart_rx,
-            cancel,
-            ordinary_disconnect_reason(),
+            WriterContext {
+                cancel,
+                disconnect_reason: ordinary_disconnect_reason(),
+                observer_context: None,
+            },
         )
         .await;
 
@@ -2514,8 +2634,11 @@ pub(crate) mod tests {
             ctrl_rx,
             mpsc::channel(1).1,
             restart_rx,
-            cancel,
-            ordinary_disconnect_reason(),
+            WriterContext {
+                cancel,
+                disconnect_reason: ordinary_disconnect_reason(),
+                observer_context: None,
+            },
         )
         .await;
 
@@ -2790,8 +2913,11 @@ pub(crate) mod tests {
             ctrl_rx,
             terminal_ctrl_rx,
             restart_rx,
-            cancel,
-            ordinary_disconnect_reason(),
+            WriterContext {
+                cancel,
+                disconnect_reason: ordinary_disconnect_reason(),
+                observer_context: None,
+            },
         )
         .await;
 
@@ -2860,8 +2986,11 @@ pub(crate) mod tests {
             ctrl_rx,
             terminal_ctrl_rx,
             restart_rx,
-            cancel,
-            disconnect_reason,
+            WriterContext {
+                cancel,
+                disconnect_reason,
+                observer_context: None,
+            },
         )
         .await;
 
@@ -3160,3 +3289,7 @@ pub(crate) mod tests {
         let _ = server.await;
     }
 }
+
+#[cfg(test)]
+#[path = "observer_shared_tests.rs"]
+mod observer_shared_tests;

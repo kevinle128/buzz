@@ -147,6 +147,9 @@ pub struct UpdatePersonaRequest {
 #[serde(rename_all = "camelCase")]
 pub struct CreateManagedAgentRequest {
     pub name: String,
+    /// An explicit agent override; absence inherits the global or built-in policy.
+    #[serde(default)]
+    pub permission_policy: Option<crate::managed_agents::permission_policy::PermissionPolicy>,
     #[serde(default)]
     pub persona_id: Option<String>,
     /// Optional deployment-time team binding for runtime instruction layering.
@@ -216,6 +219,10 @@ pub struct CreateManagedAgentRequest {
 #[serde(rename_all = "camelCase")]
 pub struct UpdateManagedAgentRequest {
     pub pubkey: String,
+    /// Absent = unchanged. Null = inherit. Present = set an agent override.
+    #[serde(default, deserialize_with = "crate::util::double_option")]
+    pub permission_policy:
+        Option<Option<crate::managed_agents::permission_policy::PermissionPolicy>>,
     /// Absent = don't touch. Present = rename the agent.
     #[serde(default)]
     pub name: Option<String>,
@@ -284,6 +291,58 @@ pub struct UpdateManagedAgentRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permission_policy_create_preserves_explicit_override_and_inheritance() {
+        let request: CreateManagedAgentRequest = serde_json::from_value(serde_json::json!({
+            "name": "agent", "permissionPolicy": "reject"
+        }))
+        .unwrap();
+        assert_eq!(
+            request.permission_policy,
+            Some(crate::managed_agents::permission_policy::PermissionPolicy::Reject)
+        );
+        let legacy: CreateManagedAgentRequest = serde_json::from_value(serde_json::json!({
+            "name": "agent"
+        }))
+        .unwrap();
+        assert_eq!(legacy.permission_policy, None);
+    }
+
+    #[test]
+    fn permission_policy_update_preserves_absent_null_and_explicit_values() {
+        use crate::managed_agents::permission_policy::PermissionPolicy;
+        for (extra, expected) in [
+            (serde_json::json!({}), None),
+            (serde_json::json!({"permissionPolicy": null}), Some(None)),
+            (
+                serde_json::json!({"permissionPolicy": "ask"}),
+                Some(Some(PermissionPolicy::Ask)),
+            ),
+            (
+                serde_json::json!({"permissionPolicy": "allow"}),
+                Some(Some(PermissionPolicy::Allow)),
+            ),
+            (
+                serde_json::json!({"permissionPolicy": "reject"}),
+                Some(Some(PermissionPolicy::Reject)),
+            ),
+        ] {
+            let mut value = serde_json::json!({"pubkey": "agent"});
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let request: UpdateManagedAgentRequest = serde_json::from_value(value).unwrap();
+            assert_eq!(request.permission_policy, expected);
+        }
+        assert!(
+            serde_json::from_value::<UpdateManagedAgentRequest>(serde_json::json!({
+                "pubkey": "agent", "permissionPolicy": "invalid"
+            }))
+            .is_err()
+        );
+    }
 
     fn record_with_quad() -> AgentDefinition {
         let mut record = record_without_quad();

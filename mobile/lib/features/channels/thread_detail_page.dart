@@ -161,7 +161,12 @@ class ThreadDetailPage extends HookConsumerWidget {
         ? _provisionalThreadMessages(
             allMessages,
             fetchedReplies ??
-                formatTimeline(liveChannelEvents, currentPubkey: currentPubkey),
+                formatTimeline(
+                  liveChannelEvents,
+                  currentPubkey: currentPubkey,
+                  relaySelfPubkey: relaySelf,
+                  apps: apps,
+                ),
             liveChannelEvents,
           )
         : [

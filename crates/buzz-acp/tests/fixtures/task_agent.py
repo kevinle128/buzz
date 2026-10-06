@@ -20,7 +20,7 @@ options = [
     {"id": "effort", "name": "Effort", "category": "thought_level", "type": "select",
      "currentValue": "low", "options": [{"value": "low", "name": "Low"}, {"value": "high", "name": "High"}]},
     {"id": "mode", "name": "Mode", "type": "select", "currentValue": "default",
-     "options": [{"value": "bypassPermissions", "name": "Bypass"}, {"value": "default", "name": "Default"}]},
+     "options": [{"value": "bypassPermissions", "name": "Bypass"}, {"value": "default", "name": "Default"}, {"value": "dontAsk", "name": "Do not ask"}]},
 ]
 prompt_id = None
 for line in sys.stdin:
@@ -36,7 +36,7 @@ for line in sys.stdin:
     elif method == "session/new":
         if mode == "session-hang":
             time.sleep(120)
-        result = {"sessionId": "fresh-" + str(os.getpid()), "configOptions": options, "modes": {"availableModes": [{"id": "bypassPermissions"}]}}
+        result = {"sessionId": "fresh-" + str(os.getpid()), "configOptions": options, "modes": {"availableModes": [{"id": "bypassPermissions"}, {"id": "dontAsk"}]}}
     elif method == "session/set_config_option":
         result = {"configOptions": options}
     elif method == "session/prompt":

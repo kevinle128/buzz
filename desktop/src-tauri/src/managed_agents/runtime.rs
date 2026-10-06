@@ -328,6 +328,9 @@ pub fn build_managed_agent_summary<R: tauri::Runtime>(
         .unwrap_or("")
         .to_string();
 
+    let (permission_policy, permission_policy_source) =
+        super::permission_policy::resolve_effective_permission_policy(record, global_config);
+
     Ok(ManagedAgentSummary {
         pubkey: record.pubkey.clone(),
         name: record.name.clone(),
@@ -369,6 +372,8 @@ pub fn build_managed_agent_summary<R: tauri::Runtime>(
         start_on_app_launch: record.start_on_app_launch,
         auto_restart_on_config_change: record.auto_restart_on_config_change,
         log_path,
+        permission_policy,
+        permission_policy_source,
         respond_to: record.respond_to,
         respond_to_allowlist: record.respond_to_allowlist.clone(),
     })
@@ -784,6 +789,9 @@ pub fn spawn_agent_child<R: tauri::Runtime>(
     // Resolve once and stamp the same value onto the environment and snapshot.
     let acp_session_policy = super::effective_acp_session_policy(record, &personas);
     super::apply_acp_session_policy_env(&mut command, acp_session_policy);
+    let (permission_policy, _) =
+        super::permission_policy::resolve_effective_permission_policy(record, &global);
+    command.env("BUZZ_ACP_PERMISSION_POLICY", permission_policy.as_str());
 
     crate::build_identity::apply_demo_config_home(&mut command)?;
     // Publish-first replay floor: written AFTER the `descriptor.env` loop, the
@@ -835,6 +843,7 @@ pub fn spawn_agent_child<R: tauri::Runtime>(
             provider: effective_provider.as_deref(),
             enforced_owner_only: super::owner_only_access_build(),
             session_policy: acp_session_policy,
+            permission_policy,
         },
     );
 

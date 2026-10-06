@@ -1,6 +1,8 @@
 import { AlertCircle, CheckCircle2, ShieldCheck, XCircle } from "lucide-react";
 import * as React from "react";
 
+import { useObserverIngestionAgents } from "@/features/agents/useAgentObserverIngestion";
+import { normalizePubkey } from "@/shared/lib/pubkey";
 import { sendPermissionDecision } from "@/shared/api/agentControl";
 import { formatTranscriptTimestampTitle } from "../agentSessionUtils";
 import { ActivityRow, ActivityRowLabel } from "./ActivityRow";
@@ -66,6 +68,10 @@ function PermissionDecisionButtons({
    */
   deliveryFailed?: number;
 }) {
+  const ownerAgents = useObserverIngestionAgents();
+  const isOwner = ownerAgents.some(
+    (agent) => normalizePubkey(agent.pubkey) === normalizePubkey(agentPubkey),
+  );
   const [pending, setPending] = React.useState<string | null>(null);
 
   // Re-enable buttons when the reducer signals delivery failure (non-`sent`
@@ -77,7 +83,7 @@ function PermissionDecisionButtons({
     }
   }, [deliveryFailed]);
 
-  if (options.length === 0) {
+  if (!isOwner || options.length === 0) {
     return null;
   }
 

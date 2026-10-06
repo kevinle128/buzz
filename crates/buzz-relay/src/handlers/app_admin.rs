@@ -46,7 +46,7 @@ pub(crate) async fn handle_app_admin(
 
     let mut tx = state
         .db
-        .begin_transaction()
+        .begin_event_write_transaction()
         .await
         .map_err(|err| IngestError::Internal(format!("error: begin transaction: {err}")))?;
     buzz_deletion::store(&state.db)

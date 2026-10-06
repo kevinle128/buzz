@@ -31,6 +31,7 @@ fn minio_config(bucket: String) -> MediaConfig {
         s3_access_key: env_or("BUZZ_S3_ACCESS_KEY", "buzz_dev"),
         s3_secret_key: env_or("BUZZ_S3_SECRET_KEY", "buzz_dev_secret"),
         s3_bucket: bucket,
+        s3_prefix: String::new(),
         s3_region: env_or("BUZZ_S3_REGION", "us-east-1"),
         s3_addressing_style: env_or("BUZZ_S3_ADDRESSING_STYLE", "path")
             .parse()

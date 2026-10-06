@@ -299,6 +299,22 @@ pub fn build_agent_observer_frame(
     .tags(tags))
 }
 
+/// Build per-recipient encrypted channel telemetry with a signed channel tag.
+pub fn build_channel_agent_observer_frame(
+    recipient_pubkey: &str,
+    agent_pubkey: &str,
+    channel_id: Uuid,
+    encrypted_content: &str,
+) -> Result<EventBuilder, SdkError> {
+    Ok(build_agent_observer_frame(
+        recipient_pubkey,
+        agent_pubkey,
+        OBSERVER_FRAME_TELEMETRY,
+        encrypted_content,
+    )?
+    .tags([tag(&["h", &channel_id.to_string()])?]))
+}
+
 /// Build a forum post thread root (kind 45001).
 pub fn build_forum_post(
     channel_id: Uuid,

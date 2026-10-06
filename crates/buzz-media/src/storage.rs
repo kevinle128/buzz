@@ -204,6 +204,7 @@ fn parse_object_versions_page(xml: &[u8]) -> Result<ObjectVersionsPage, MediaErr
 /// S3-compatible object storage client.
 pub struct MediaStorage {
     bucket: Box<Bucket>,
+    prefix: String,
 }
 
 impl MediaStorage {
@@ -218,6 +219,8 @@ impl MediaStorage {
     ///   instance-metadata providers, in that order. This lets the relay use
     ///   the pod's IAM role without long-lived static keys.
     pub fn new(config: &MediaConfig) -> Result<Self, MediaError> {
+        let prefix = crate::config::normalize_s3_prefix(&config.s3_prefix)
+            .map_err(MediaError::StorageError)?;
         let region = Region::Custom {
             region: config.s3_region.clone(),
             endpoint: config.s3_endpoint.clone(),
@@ -252,7 +255,32 @@ impl MediaStorage {
             S3AddressingStyle::Path => bucket.with_path_style(),
             S3AddressingStyle::Virtual => bucket,
         };
-        Ok(Self { bucket })
+        Ok(Self { bucket, prefix })
+    }
+
+    fn physical_key(&self, key: &str) -> String {
+        format!("{}{key}", self.prefix)
+    }
+
+    fn logical_key(&self, key: &str) -> Result<String, MediaError> {
+        key.strip_prefix(&self.prefix)
+            .map(str::to_string)
+            .ok_or_else(|| {
+                MediaError::StorageError("S3 returned a key outside BUZZ_S3_PREFIX".to_string())
+            })
+    }
+
+    fn normalize_delete_result(
+        &self,
+        mut result: s3::serde_types::DeleteObjectsResult,
+    ) -> Result<s3::serde_types::DeleteObjectsResult, MediaError> {
+        for deleted in &mut result.deleted {
+            deleted.key = self.logical_key(&deleted.key)?;
+        }
+        for error in &mut result.errors {
+            error.key = self.logical_key(&error.key)?;
+        }
+        Ok(result)
     }
 
     /// Store an object from a byte slice.
@@ -261,7 +289,7 @@ impl MediaStorage {
     /// [`put_file`] to avoid loading the entire blob into RAM.
     pub async fn put(&self, key: &str, bytes: &[u8], content_type: &str) -> Result<(), MediaError> {
         self.bucket
-            .put_object_with_content_type(key, bytes, content_type)
+            .put_object_with_content_type(&self.physical_key(key), bytes, content_type)
             .await?;
         Ok(())
     }
@@ -285,14 +313,14 @@ impl MediaStorage {
         let mut reader = tokio::io::BufReader::with_capacity(BUF, file);
 
         self.bucket
-            .put_object_stream_with_content_type(&mut reader, key, content_type)
+            .put_object_stream_with_content_type(&mut reader, &self.physical_key(key), content_type)
             .await?;
         Ok(())
     }
 
     /// Retrieve an object's bytes.
     pub async fn get(&self, key: &str) -> Result<Vec<u8>, MediaError> {
-        match self.bucket.get_object(key).await {
+        match self.bucket.get_object(&self.physical_key(key)).await {
             Ok(response) => Ok(response.to_vec()),
             Err(s3::error::S3Error::HttpFailWithBody(404, _)) => Err(MediaError::NotFound),
             Err(e) => Err(MediaError::StorageError(e.to_string())),
@@ -305,7 +333,11 @@ impl MediaStorage {
     /// is transferred from S3 — the full object is never loaded into RAM.
     /// Intended for HTTP 206 range responses on large video blobs.
     pub async fn get_range(&self, key: &str, start: u64, end: u64) -> Result<Vec<u8>, MediaError> {
-        match self.bucket.get_object_range(key, start, Some(end)).await {
+        match self
+            .bucket
+            .get_object_range(&self.physical_key(key), start, Some(end))
+            .await
+        {
             Ok(response) => Ok(response.to_vec()),
             Err(s3::error::S3Error::HttpFailWithBody(404, _)) => Err(MediaError::NotFound),
             Err(e) => Err(MediaError::StorageError(e.to_string())),
@@ -320,7 +352,7 @@ impl MediaStorage {
     pub async fn get_stream(&self, key: &str) -> Result<ByteStream, MediaError> {
         let response = self
             .bucket
-            .get_object_stream(key)
+            .get_object_stream(&self.physical_key(key))
             .await
             .map_err(|e| MediaError::StorageError(e.to_string()))?;
 
@@ -336,7 +368,7 @@ impl MediaStorage {
 
     /// Check if an object exists. Returns false on 404.
     pub async fn head(&self, key: &str) -> Result<bool, MediaError> {
-        match self.bucket.head_object(key).await {
+        match self.bucket.head_object(&self.physical_key(key)).await {
             Ok(_) => Ok(true),
             Err(s3::error::S3Error::HttpFailWithBody(404, _)) => Ok(false),
             Err(e) => Err(MediaError::StorageError(e.to_string())),
@@ -346,7 +378,7 @@ impl MediaStorage {
     /// Delete an object. Returns an error on failure — callers decide whether to propagate.
     pub async fn delete(&self, key: &str) -> Result<(), MediaError> {
         self.bucket
-            .delete_object(key)
+            .delete_object(&self.physical_key(key))
             .await
             .map_err(|e| MediaError::StorageError(e.to_string()))?;
         Ok(())
@@ -354,7 +386,7 @@ impl MediaStorage {
 
     /// HEAD with metadata — returns Content-Length (size).
     pub async fn head_with_metadata(&self, key: &str) -> Result<Option<BlobHeadMeta>, MediaError> {
-        match self.bucket.head_object(key).await {
+        match self.bucket.head_object(&self.physical_key(key)).await {
             Ok((result, _)) => Ok(Some(BlobHeadMeta {
                 size: result.content_length.unwrap_or(0) as u64,
             })),
@@ -376,7 +408,7 @@ impl MediaStorage {
         }
         let identifiers = keys
             .iter()
-            .map(|key| s3::serde_types::ObjectIdentifier::new(key.clone()))
+            .map(|key| s3::serde_types::ObjectIdentifier::new(self.physical_key(key)))
             .collect::<Vec<_>>();
         self.delete_object_identifiers(identifiers).await
     }
@@ -416,13 +448,16 @@ impl MediaStorage {
         if versions.is_empty() {
             return Ok(BulkDeleteOutcome::default());
         }
-        let identifiers = object_version_identifiers(versions);
+        let mut identifiers = object_version_identifiers(versions);
+        for identifier in &mut identifiers {
+            identifier.key = self.physical_key(&identifier.key);
+        }
         let result = self
             .bucket
             .delete_objects(identifiers)
             .await
             .map_err(|e| MediaError::StorageError(e.to_string()))?;
-        Ok(fold(result))
+        Ok(fold(self.normalize_delete_result(result)?))
     }
 
     async fn delete_object_identifiers(
@@ -434,7 +469,9 @@ impl MediaStorage {
             .delete_objects(identifiers)
             .await
             .map_err(|e| MediaError::StorageError(e.to_string()))?;
-        Ok(fold_bulk_delete_result(result))
+        Ok(fold_bulk_delete_result(
+            self.normalize_delete_result(result)?,
+        ))
     }
 
     /// Build the community-scoped sidecar key for a given sha256 (bare hash).
@@ -459,7 +496,7 @@ impl MediaStorage {
         sha256: &str,
     ) -> Result<BlobMeta, MediaError> {
         let key = Self::ctx_sidecar_key(ctx, sha256);
-        let resp = self.bucket.get_object(&key).await?;
+        let resp = self.bucket.get_object(&self.physical_key(&key)).await?;
         let meta: BlobMeta = serde_json::from_slice(&resp.to_vec())?;
         Ok(meta)
     }
@@ -532,7 +569,7 @@ impl MediaStorage {
         let (result, _status) = self
             .bucket
             .list_page(
-                prefix.to_string(),
+                self.physical_key(prefix),
                 None,
                 continuation_token,
                 None,
@@ -543,8 +580,8 @@ impl MediaStorage {
             objects: result
                 .contents
                 .into_iter()
-                .map(|obj| (obj.key, obj.size))
-                .collect(),
+                .map(|obj| self.logical_key(&obj.key).map(|key| (key, obj.size)))
+                .collect::<Result<_, _>>()?,
             next_continuation_token: result.next_continuation_token,
             is_truncated: result.is_truncated,
         })
@@ -567,11 +604,18 @@ impl MediaStorage {
     ) -> Result<ObjectVersionsPage, MediaError> {
         let mut query = HashMap::from([
             ("versions".to_string(), String::new()),
-            ("prefix".to_string(), prefix.to_string()),
+            ("prefix".to_string(), self.physical_key(prefix)),
             ("max-keys".to_string(), max_keys.to_string()),
         ]);
         if let Some(marker) = key_marker {
-            query.insert("key-marker".to_string(), marker);
+            query.insert(
+                "key-marker".to_string(),
+                if marker.is_empty() {
+                    marker
+                } else {
+                    self.physical_key(&marker)
+                },
+            );
         }
         if let Some(marker) = version_id_marker {
             query.insert("version-id-marker".to_string(), marker);
@@ -598,7 +642,21 @@ impl MediaStorage {
                 response.as_str().unwrap_or("")
             )));
         }
-        parse_object_versions_page(response.as_slice())
+        let mut page = parse_object_versions_page(response.as_slice())?;
+        for entry in &mut page.entries {
+            entry.key = self.logical_key(&entry.key)?;
+        }
+        page.next_key_marker = page
+            .next_key_marker
+            .map(|marker| {
+                if marker.is_empty() {
+                    Ok(marker)
+                } else {
+                    self.logical_key(&marker)
+                }
+            })
+            .transpose()?;
+        Ok(page)
     }
 }
 
@@ -957,6 +1015,7 @@ mod tests {
             s3_access_key: access.to_string(),
             s3_secret_key: secret.to_string(),
             s3_bucket: "buzz-media".to_string(),
+            s3_prefix: String::new(),
             s3_region: "us-west-2".to_string(),
             s3_addressing_style: S3AddressingStyle::Path,
             max_image_bytes: 50 * 1024 * 1024,

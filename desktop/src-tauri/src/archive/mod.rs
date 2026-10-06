@@ -170,15 +170,52 @@ pub(crate) async fn archive_candidates(
     // ── Phase 1: plan (blocking SQLite) ─────────────────────────────────────
     let plan_identity_pk = identity_pk.clone();
     let plan_relay_url = relay_url.clone();
-    let plan = state
+    let mut plan = state
         .archive_db
         .with_conn(move |conn| plan_archive(candidates, &plan_identity_pk, &plan_relay_url, conn))
         .await?;
+
+    // Shared ciphertext must pass current admission before canonical storage.
+    let keys = state.signing_keys().ok();
+    let mut admitted = Vec::new();
+    for candidate in plan.ephemeral {
+        let shared = candidate
+            .event
+            .tags
+            .iter()
+            .any(|tag| tag.as_slice().first().is_some_and(|name| name == "h"));
+        let authorized = if shared {
+            if let Some(keys) = keys.as_ref() {
+                crate::observer_admission::decrypt_bound_observer(keys, &candidate.event).is_ok()
+                    && crate::observer_admission::authorize_shared_observer(
+                        state,
+                        &candidate.event,
+                        keys,
+                        &relay_url,
+                    )
+                    .await
+                    .is_ok()
+            } else {
+                false
+            }
+        } else {
+            true
+        };
+        if authorized {
+            admitted.push(candidate);
+        } else {
+            plan.pre_dropped += 1;
+        }
+    }
+    plan.ephemeral = admitted;
 
     // ── Phase 2: relay queries (async) ───────────────────────────────────────
     let bucket_results = query_buckets(plan.buckets, state).await;
 
     // ── Phase 3: persist (blocking SQLite) ──────────────────────────────────
+    if identity_pubkey(state)? != identity_pk || relay_ws_url_with_override(state) != relay_url {
+        return Err("observer archive context changed".into());
+    }
     let owner_keys = {
         let keys_guard = state.keys.lock().map_err(|e| e.to_string())?;
         keys_guard.clone()
