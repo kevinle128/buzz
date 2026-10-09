@@ -5167,6 +5167,23 @@ fn is_auth_error(error: &acp::AcpError) -> bool {
     message.contains("Re-authenticate") || message.contains("API Error: 401")
 }
 
+fn should_replace_agent_after_error(error: &acp::AcpError) -> bool {
+    matches!(
+        error,
+        acp::AcpError::Io(_)
+            | acp::AcpError::WriteTimeout(_)
+            | acp::AcpError::Timeout(_)
+            | acp::AcpError::Protocol(_)
+            | acp::AcpError::PermissionPoisoned
+    ) || matches!(
+        error,
+        acp::AcpError::AgentError {
+            code: -32002,
+            message,
+        } if message == "Unknown session"
+    )
+}
+
 /// Thread placement for a batch's terminal failure notice.
 ///
 /// Ordinary events keep their own thread tags. An edit follows its verified
@@ -5585,17 +5602,10 @@ fn handle_prompt_result(
             pool.return_agent(result.agent);
         }
         PromptOutcome::Error(ref e) => {
-            let is_transport_error = matches!(
-                e,
-                acp::AcpError::Io(_)
-                    | acp::AcpError::WriteTimeout(_)
-                    | acp::AcpError::Timeout(_)
-                    | acp::AcpError::Protocol(_)
-                    // A poisoned process wrote a partial permission response
-                    // and must NOT be returned to the pool — the pipe state is
-                    // uncertain and re-use would corrupt the next turn's writes.
-                    | acp::AcpError::PermissionPoisoned
-            );
+            // An exact missing-session response means the upstream agent lost
+            // its state. Replace the harness so a queued retry gets a fresh
+            // ACP connection as well as a fresh session.
+            let is_transport_error = should_replace_agent_after_error(e);
             let error_code = match &e {
                 acp::AcpError::AgentError { code, .. } => Some(*code),
                 _ => None,
@@ -12699,23 +12709,53 @@ mod error_outcome_emission_tests {
     /// standard requeue path so today's behavior is unchanged.
     #[tokio::test]
     async fn non_auth_application_error_is_requeued() {
-        assert_application_error_is_requeued(acp::AcpError::AgentError {
-            code: -32000,
-            message: "Usage credits required for 1M context".to_string(),
-        })
+        assert_error_requeue_outcome(
+            acp::AcpError::AgentError {
+                code: -32000,
+                message: "Usage credits required for 1M context".to_string(),
+            },
+            false,
+        )
         .await;
     }
 
     #[tokio::test]
     async fn non_model_resource_not_found_is_requeued() {
-        assert_application_error_is_requeued(acp::AcpError::AgentError {
-            code: -32002,
-            message: "Resource not found: session no longer exists".to_string(),
-        })
+        assert_error_requeue_outcome(
+            acp::AcpError::AgentError {
+                code: -32002,
+                message: "Resource not found: session no longer exists".to_string(),
+            },
+            false,
+        )
         .await;
     }
 
-    async fn assert_application_error_is_requeued(error: acp::AcpError) {
+    #[tokio::test]
+    async fn missing_agent_session_requeues_and_replaces_process() {
+        assert_error_requeue_outcome(
+            acp::AcpError::AgentError {
+                code: -32002,
+                message: "Unknown session".to_string(),
+            },
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn bare_agent_internal_error_requeues_without_replacing_process() {
+        assert_error_requeue_outcome(
+            acp::AcpError::AgentError {
+                code: -32603,
+                message: "Internal error".to_string(),
+            },
+            false,
+        )
+        .await;
+    }
+
+    async fn assert_error_requeue_outcome(error: acp::AcpError, expect_process_replacement: bool) {
         let keys = nostr::Keys::generate();
         let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "test")
             .sign_with_keys(&keys)
@@ -12794,6 +12834,17 @@ mod error_outcome_emission_tests {
             1,
             "non-auth application error must preserve the event for retry"
         );
+        assert_eq!(
+            pool.live_count(),
+            usize::from(!expect_process_replacement),
+            "only a poisoned process must be removed from the idle pool"
+        );
+        assert_eq!(
+            respawn_tasks.len(),
+            usize::from(expect_process_replacement),
+            "a poisoned process must have one replacement task"
+        );
+        respawn_tasks.abort_all();
     }
 }
 
