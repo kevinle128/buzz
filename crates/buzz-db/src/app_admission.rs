@@ -11,7 +11,7 @@
 use chrono::{DateTime, Utc};
 use nostr::Event;
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, Postgres, Row, Transaction};
+use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use buzz_core::{CommunityId, StoredEvent};
@@ -67,7 +67,7 @@ pub struct AppDeliveryCommit {
 ///
 /// Dropping the guard rolls the transaction back and inserts nothing.
 pub struct AppAdmissionGuard {
-    tx: Transaction<'static, Postgres>,
+    tx: crate::AdmittedTx,
     community_id: CommunityId,
     app_id: Uuid,
     delivery_id: Uuid,
@@ -157,7 +157,7 @@ impl AppAdmissionGuard {
     /// List latest live global parameterized heads of `kind` on this transaction.
     pub async fn list_latest_parameterized_heads(&mut self, kind: i32) -> Result<Vec<StoredEvent>> {
         crate::project_heads::list_latest_parameterized_heads_on(
-            &mut self.tx,
+            self.tx.conn(),
             self.community_id,
             kind,
         )
@@ -178,7 +178,7 @@ impl AppAdmissionGuard {
         )
         .bind(self.community_id.as_uuid())
         .bind(channel_id)
-        .fetch_optional(&mut *self.tx)
+        .fetch_optional(self.tx.conn())
         .await?;
         row.map(|row| {
             Ok(AppAdmissionChannel {
@@ -207,7 +207,7 @@ impl AppAdmissionGuard {
         )
         .bind(self.community_id.as_uuid())
         .bind(channel_id)
-        .fetch_all(&mut *self.tx)
+        .fetch_all(self.tx.conn())
         .await?;
         rows.into_iter()
             .map(|row| {
@@ -235,21 +235,15 @@ impl AppAdmissionGuard {
     ) -> Result<AppDeliveryCommit> {
         let community_id = self.community_id;
         let mut tx = self.tx;
-        let (stored_event, was_inserted) = insert_event_with_thread_metadata_tx(
-            &mut tx,
-            community_id,
-            event,
-            Some(route.channel_id),
-            None,
-        )
-        .await?;
+        let (stored_event, was_inserted) =
+            insert_event_with_thread_metadata_tx(&mut tx, event, Some(route.channel_id), None)
+                .await?;
         if !was_inserted {
             return Err(DbError::InvalidData(
                 "app callback event id already exists".into(),
             ));
         }
-        crate::insert_mentions_in_transaction(&mut tx, community_id, event, Some(route.channel_id))
-            .await?;
+        crate::insert_mentions_in_transaction(&mut tx, event, Some(route.channel_id)).await?;
         let snapshot_json = serde_json::to_value(route)?;
         let row = sqlx::query(INSERT_DELIVERY)
             .bind(community_id.as_uuid())
@@ -262,7 +256,7 @@ impl AppAdmissionGuard {
             .bind("delivered")
             .bind(event.id.as_bytes().as_slice())
             .bind(Option::<&str>::None)
-            .fetch_one(&mut *tx)
+            .fetch_one(tx.conn())
             .await?;
         let record = row_to_delivery(row)?;
         tx.commit().await?;
@@ -295,7 +289,7 @@ impl AppAdmissionGuard {
             .bind(status)
             .bind(event_id)
             .bind(failure_code)
-            .fetch_one(&mut *tx)
+            .fetch_one(tx.conn())
             .await?;
         let record = row_to_delivery(row)?;
         tx.commit().await?;
@@ -315,7 +309,12 @@ pub async fn begin_app_admission(
     payload_hash: &[u8; 32],
     event_type: &str,
 ) -> Result<BeginAppAdmission> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::begin_community_event_write_transaction(
+        pool,
+        community_id,
+        crate::observability::WriterOperation::EventWrite,
+    )
+    .await?;
     let lock_key = format!(
         "buzz_app_admission:{}:{}:{}",
         community_id.as_uuid(),
@@ -324,14 +323,14 @@ pub async fn begin_app_admission(
     );
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
         .bind(&lock_key)
-        .execute(&mut *tx)
+        .execute(tx.conn())
         .await?;
 
     let row = sqlx::query(SELECT_EXISTING_DELIVERY)
         .bind(community_id.as_uuid())
         .bind(app_id)
         .bind(idempotency_key_hash.as_slice())
-        .fetch_optional(&mut *tx)
+        .fetch_optional(tx.conn())
         .await?;
 
     match row {
