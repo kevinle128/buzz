@@ -307,6 +307,7 @@ mod tests {
 
     #[test]
     fn trace_context_json_correlates_nested_span_logs() {
+        let _tracing = crate::test_support::tracing_dispatch_lock();
         let output = Arc::new(Mutex::new(Vec::new()));
         let output_writer = Arc::clone(&output);
         let exporter = InMemorySpanExporter::default();
@@ -476,6 +477,7 @@ mod tests {
     fn trace_context_lookup_does_not_enable_callsites() {
         // Retain another registered subscriber, as parallel tests do.
         let _other_dispatch = tracing::Dispatch::new(tracing_subscriber::registry());
+        let _tracing = crate::test_support::tracing_dispatch_lock();
         let context_lookup = TraceContextLookup::default();
         let subscriber = tracing_subscriber::registry().with(
             context_lookup

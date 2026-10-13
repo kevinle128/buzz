@@ -10,7 +10,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/physics.dart';
 import 'package:flutter/services.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
-import 'package:lucide_icons_flutter/lucide_icons.dart';
+import 'package:buzz/shared/theme/buzz_icons.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:photo_manager/photo_manager.dart';
 import 'package:share_plus/share_plus.dart';
@@ -30,6 +30,7 @@ import '../../shared/emoji/emoji_data_provider.dart';
 import '../../shared/reminders/remind_me_later_sheet.dart';
 import '../../shared/reminders/reminder_service.dart';
 import 'channel_management_provider.dart';
+import 'channels_provider.dart';
 import 'emoji_picker.dart';
 import 'message_action_backdrop_state.dart';
 import 'message_actions/native_message_action_selection.dart';
@@ -41,6 +42,7 @@ import '../../shared/read_state/read_state_provider.dart';
 import 'thread_detail_page.dart';
 import 'thread_follows/thread_follows_provider.dart';
 import 'timeline_message.dart';
+import 'unread_badge/is_high_priority_event.dart';
 
 part 'message_actions/reaction_popover.dart';
 part 'message_actions/quick_reaction_row.dart';
@@ -194,6 +196,7 @@ Future<void> showMessageActions({
                         _MarkReadUnreadTile(
                           message: message,
                           channelId: channelId,
+                          currentPubkey: currentPubkey,
                         ),
                         _FollowThreadTile(message: message),
                       ],
@@ -202,7 +205,7 @@ Future<void> showMessageActions({
                       children: [
                         // Export: take the content out of the conversation.
                         ListTile(
-                          leading: const Icon(LucideIcons.copy),
+                          leading: const Icon(BuzzIcons.copy),
                           title: const Text('Copy text'),
                           onTap: () {
                             Navigator.of(sheetContext).pop();
@@ -218,7 +221,7 @@ Future<void> showMessageActions({
                     SheetActionSection(
                       children: [
                         ListTile(
-                          leading: const Icon(LucideIcons.pencil),
+                          leading: const Icon(BuzzIcons.pencil),
                           title: const Text('Edit message'),
                           onTap: () {
                             Navigator.of(sheetContext).pop();
@@ -232,7 +235,7 @@ Future<void> showMessageActions({
                         ),
                         ListTile(
                           leading: Icon(
-                            LucideIcons.trash2,
+                            BuzzIcons.trash2,
                             color: sheetContext.colors.error,
                           ),
                           title: Text(
@@ -293,7 +296,7 @@ void showImageActions({
                 SheetActionSection(
                   children: [
                     ListTile(
-                      leading: const Icon(LucideIcons.download),
+                      leading: const Icon(BuzzIcons.download),
                       title: const Text('Save image'),
                       onTap: () {
                         Navigator.of(sheetContext).pop();
@@ -301,7 +304,7 @@ void showImageActions({
                       },
                     ),
                     ListTile(
-                      leading: const Icon(LucideIcons.share2),
+                      leading: const Icon(BuzzIcons.share2),
                       title: const Text('Share image'),
                       onTap: () {
                         final renderBox =
@@ -322,7 +325,7 @@ void showImageActions({
                       },
                     ),
                     ListTile(
-                      leading: const Icon(LucideIcons.link2),
+                      leading: const Icon(BuzzIcons.link2),
                       title: const Text('Copy image link'),
                       onTap: () {
                         Navigator.of(sheetContext).pop();
@@ -340,7 +343,7 @@ void showImageActions({
                     children: [
                       ListTile(
                         leading: Icon(
-                          LucideIcons.trash2,
+                          BuzzIcons.trash2,
                           color: sheetContext.colors.error,
                         ),
                         title: Text(
@@ -489,6 +492,41 @@ Future<void> _shareImage(
   }
 }
 
+/// Whether the actions menu should offer **Mark read** for `message`.
+///
+/// This is the one decision every menu presentation (sheet, popover, native)
+/// uses. Mentions are classified with the signing key, not the optional
+/// profile, so a user without a published profile sees the same read state
+/// as the badge and the channel list. `activity:<channel>` reads only
+/// ordinary top-level messages in a known non-DM channel; an unknown channel
+/// or reader counts as not read, because a DM or mention needs its own mark.
+bool messageActionShowsUnread(
+  WidgetRef ref,
+  ReadStateState readState, {
+  required String channelId,
+  required TimelineMessage message,
+}) {
+  final readerPubkey = ref.read(myPubkeyProvider);
+  final channels = ref.read(channelsProvider).asData?.value;
+  final channel = channels?.where((c) => c.id == channelId).firstOrNull;
+  final channelCatchUp =
+      readerPubkey != null &&
+      channel != null &&
+      readByChannelCatchUp(
+        isDm: channel.isDm,
+        isReply: message.parentId != null,
+        highPriority: isHighPriorityEvent(message.tags, readerPubkey),
+      );
+  return isMessageUnread(
+    readState,
+    channelId: channelId,
+    messageId: message.id,
+    createdAt: message.createdAt,
+    threadRootId: message.rootId,
+    channelCatchUp: channelCatchUp,
+  );
+}
+
 /// Canonical `buzz://message` link for a timeline message, including thread
 /// context when the message is a reply.
 String messageLinkFor({
@@ -505,24 +543,28 @@ String messageLinkFor({
 class _MarkReadUnreadTile extends ConsumerWidget {
   final TimelineMessage message;
   final String channelId;
+  final String? currentPubkey;
 
-  const _MarkReadUnreadTile({required this.message, required this.channelId});
+  const _MarkReadUnreadTile({
+    required this.message,
+    required this.channelId,
+    required this.currentPubkey,
+  });
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final readState = ref.watch(readStateProvider);
     if (!readState.isReady) return const SizedBox.shrink();
 
-    final unread = isMessageUnread(
+    final unread = messageActionShowsUnread(
+      ref,
       readState,
       channelId: channelId,
-      messageId: message.id,
-      createdAt: message.createdAt,
-      threadRootId: message.rootId,
+      message: message,
     );
 
     return ListTile(
-      leading: Icon(unread ? LucideIcons.mailCheck : LucideIcons.mailOpen),
+      leading: Icon(unread ? BuzzIcons.mailCheck : BuzzIcons.mailOpen),
       title: Text(unread ? 'Mark read' : 'Mark unread'),
       onTap: () {
         Navigator.of(context).pop();
@@ -563,7 +605,7 @@ class _FollowThreadTile extends ConsumerWidget {
     final following = follows.isFollowing(rootId);
 
     return ListTile(
-      leading: Icon(following ? LucideIcons.bellOff : LucideIcons.bellRing),
+      leading: Icon(following ? BuzzIcons.bellOff : BuzzIcons.bellRing),
       title: Text(following ? 'Unfollow thread' : 'Follow thread'),
       onTap: () {
         Navigator.of(context).pop();
@@ -608,7 +650,7 @@ class _FastActionsRow extends ConsumerWidget {
     final tiles = <Widget>[
       if (messages != null)
         _FastActionTile(
-          icon: LucideIcons.messageSquareReply,
+          icon: BuzzIcons.messageSquareReply,
           label: 'Reply',
           onTap: () {
             Navigator.of(context).pop();
@@ -627,7 +669,7 @@ class _FastActionsRow extends ConsumerWidget {
           },
         ),
       _FastActionTile(
-        icon: LucideIcons.link2,
+        icon: BuzzIcons.link2,
         label: 'Copy link',
         onTap: () {
           Navigator.of(context).pop();
@@ -640,7 +682,7 @@ class _FastActionsRow extends ConsumerWidget {
       ),
       if (canRemind)
         _FastActionTile(
-          icon: LucideIcons.clock,
+          icon: BuzzIcons.clock,
           label: 'Remind me',
           onTap: () {
             final rootContext = Navigator.of(

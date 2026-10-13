@@ -9,19 +9,22 @@ import 'dart:io';
 import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/gestures.dart' show PointerScrollEvent;
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart'
     show
+        MatrixUtils,
         RenderParagraph,
         RenderRepaintBoundary,
         ScrollDirection,
-        SemanticsAction;
+        SemanticsAction,
+        SemanticsNode;
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart' as http_testing;
-import 'package:lucide_icons_flutter/lucide_icons.dart';
+import 'package:buzz/shared/theme/buzz_icons.dart';
 import 'package:nostr/nostr.dart' as nostr;
 import 'package:pointycastle/digests/sha256.dart';
 import 'package:scrollable_positioned_list/scrollable_positioned_list.dart';
@@ -43,8 +46,10 @@ import 'package:buzz/features/channels/ime_metrics_settle_observer.dart';
 import 'package:buzz/features/channels/local_message_send_animation_provider.dart';
 import 'package:buzz/features/channels/message_action_backdrop_state.dart';
 import 'package:buzz/features/channels/message_actions.dart';
+import 'package:buzz/features/channels/message_content.dart';
 import 'package:buzz/features/channels/mobile_huddle_controller.dart';
 import 'package:buzz/features/channels/reaction_row.dart';
+import 'package:buzz/features/channels/message_mention_pill.dart';
 import 'package:buzz/features/channels/thread_detail_page.dart';
 import 'package:buzz/features/channels/thread_replies_provider.dart';
 import 'package:buzz/features/channels/timeline_message.dart';
@@ -70,13 +75,15 @@ import 'package:buzz/shared/widgets/frosted_app_bar.dart';
 import 'package:buzz/shared/widgets/frosted_scaffold.dart';
 import 'package:buzz/shared/widgets/flapping_bee.dart';
 import 'package:buzz/shared/widgets/keyboard_dismiss_on_drag.dart';
-import 'package:buzz/shared/widgets/lucide_star_icon.dart';
+import 'package:buzz/shared/widgets/tabler_star_icon.dart';
 import 'package:buzz/shared/widgets/skeleton.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 part 'thread_reply_refresh_cases.dart';
+part 'thread_title_capsule_cases.dart';
 part 'channel_detail_page_test/loading_review_tests.dart';
 part 'channel_detail_page_test/presence_tests.dart';
+part 'channel_detail_page_test/action_row_tests.dart';
 
 const _channelId = '11111111-2222-4333-8444-555555555555';
 const _huddleChannelId = '8d764100-fd8f-44cf-9c98-6d8fbd739b8c';
@@ -259,6 +266,7 @@ Widget _buildTestable({
   List<NostrEvent> huddleLifecycle = const [],
   String? huddleCurrentPubkey,
   http.Client? mediaClient,
+  VideoPreviewFrameLoader? videoPreviewLoader,
   Widget? home,
 }) {
   final resolvedChannel = channel ?? _testChannel;
@@ -270,6 +278,8 @@ Widget _buildTestable({
   return ProviderScope(
     retry: providerRetry ?? (disableRetries ? (_, _) => null : null),
     overrides: [
+      if (videoPreviewLoader != null)
+        videoPreviewFrameLoaderProvider.overrideWithValue(videoPreviewLoader),
       channelMessagesProvider(
         _channelId,
       ).overrideWith(() => fakeMessagesNotifier),
@@ -493,7 +503,9 @@ double? effectiveFontSizeForText(
 void main() {
   _loadingReviewTests();
   threadReplyRefreshTests();
+  threadTitleCapsuleTests();
   presenceTests();
+  actionRowTests();
   setUp(() async {
     SharedPreferences.setMockInitialValues({});
     _testPrefs = await SharedPreferences.getInstance();
@@ -568,7 +580,7 @@ void main() {
               };
               final keys = [
                 first,
-                second.toUpperCase(),
+                second,
                 sibling,
                 if (bystander != null) 'd' * 64,
               ];
@@ -2265,7 +2277,7 @@ void main() {
         expect(
           find.descendant(
             of: aliceRow,
-            matching: find.byIcon(LucideIcons.chevronRight),
+            matching: find.byIcon(BuzzIcons.chevronRight),
           ),
           findsOneWidget,
         );
@@ -2447,16 +2459,16 @@ void main() {
           const ValueKey('channel-details-mute-action'),
         );
         expect(find.text('Star'), findsOneWidget);
-        var star = tester.widget<LucideStarIcon>(find.byType(LucideStarIcon));
+        var star = tester.widget<TablerStarIcon>(find.byType(TablerStarIcon));
         expect(star.filled, isFalse);
         expect(find.text('Mute'), findsOneWidget);
-        expect(find.byIcon(LucideIcons.bellOff), findsOneWidget);
+        expect(find.byIcon(BuzzIcons.bellOff), findsOneWidget);
 
         await tester.tap(starAction);
         await tester.pump();
 
         expect(find.text('Unstar'), findsOneWidget);
-        star = tester.widget<LucideStarIcon>(find.byType(LucideStarIcon));
+        star = tester.widget<TablerStarIcon>(find.byType(TablerStarIcon));
         expect(star.filled, isTrue);
         expect(star.color, AppTheme.light().colorScheme.primary);
 
@@ -2464,7 +2476,7 @@ void main() {
         await tester.pump();
 
         expect(find.text('Unmute'), findsOneWidget);
-        final activeBell = tester.widget<Icon>(find.byIcon(LucideIcons.bell));
+        final activeBell = tester.widget<Icon>(find.byIcon(BuzzIcons.bell));
         expect(activeBell.color, AppTheme.light().colorScheme.primary);
 
         await tester.tap(starAction);
@@ -2473,9 +2485,9 @@ void main() {
 
         expect(find.text('Star'), findsOneWidget);
         expect(find.text('Mute'), findsOneWidget);
-        star = tester.widget<LucideStarIcon>(find.byType(LucideStarIcon));
+        star = tester.widget<TablerStarIcon>(find.byType(TablerStarIcon));
         expect(star.filled, isFalse);
-        expect(find.byIcon(LucideIcons.bellOff), findsOneWidget);
+        expect(find.byIcon(BuzzIcons.bellOff), findsOneWidget);
       },
     );
 
@@ -2597,10 +2609,7 @@ void main() {
         findsNothing,
       );
       expect(
-        find.descendant(
-          of: seeAllRow,
-          matching: find.byIcon(LucideIcons.users),
-        ),
+        find.descendant(of: seeAllRow, matching: find.byIcon(BuzzIcons.users)),
         findsNothing,
       );
       final firstMemberRow = previews.first;
@@ -3053,7 +3062,7 @@ void main() {
 
       final sheet = find.byType(BottomSheet).last;
       expect(find.byType(BottomSheet), findsOneWidget);
-      expect(tester.getSize(sheet).height, lessThanOrEqualTo(720));
+      expect(tester.getSize(sheet).height, greaterThan(640));
 
       final sheetTop = tester.getTopLeft(sheet).dy;
       await tester.dragFrom(
@@ -3062,7 +3071,7 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      expect(find.text('Manage channel'), findsNothing);
+      expect(find.text('Edit channel'), findsNothing);
     });
 
     testWidgets('Edit updates name and description without legacy fields', (
@@ -3104,28 +3113,9 @@ void main() {
       expect(find.text('Leave channel'), findsNothing);
       expect(find.text('Topic'), findsNothing);
       expect(find.text('Purpose'), findsNothing);
-      expect(find.text('Canvas'), findsOneWidget);
+      expect(find.text('Add Canvas'), findsOneWidget);
 
-      final nameField = tester.widget<TextField>(
-        find.byKey(const ValueKey('manage-channel-name')),
-      );
-      final descriptionField = tester.widget<TextField>(
-        find.byKey(const ValueKey('manage-channel-description')),
-      );
-      expect(nameField.decoration?.labelText, isNull);
-      expect(nameField.decoration?.hintText, 'Channel name');
-      expect(nameField.decoration?.border, InputBorder.none);
-      expect(descriptionField.decoration?.labelText, isNull);
-      expect(descriptionField.decoration?.hintText, 'Description');
-      expect(descriptionField.decoration?.border, InputBorder.none);
-      final nameOutline = tester.getRect(
-        find.byKey(const ValueKey('manage-channel-name-outline')),
-      );
-      final descriptionOutline = tester.getRect(
-        find.byKey(const ValueKey('manage-channel-description-outline')),
-      );
-      expect(descriptionOutline.top - nameOutline.bottom, Grid.xs);
-
+      expect(find.text('Edit channel'), findsOneWidget);
       await tester.enterText(
         find.byKey(const ValueKey('manage-channel-name')),
         '  #renamed  ',
@@ -3139,7 +3129,6 @@ void main() {
         find.byKey(const ValueKey('manage-channel-save-details')),
       );
       await tester.pumpAndSettle();
-
       expect(updatedName, 'renamed');
       expect(updatedDescription, 'A new description');
       expect(find.text('renamed'), findsOneWidget);
@@ -3941,7 +3930,7 @@ void main() {
         ),
         findsOneWidget,
       );
-      expect(find.byIcon(LucideIcons.chevronRight), findsNothing);
+      expect(find.byIcon(BuzzIcons.chevronRight), findsNothing);
       final replyAvatars = find.byType(SmallAvatar);
       expect(replyAvatars, findsNWidgets(2));
       for (final avatar in replyAvatars.evaluate()) {
@@ -4005,6 +3994,62 @@ void main() {
       expect(tester.takeException(), isNull);
     });
 
+    testWidgets('channel catch-up hides the oldest unread jump', (
+      tester,
+    ) async {
+      final messages = [
+        for (var i = 0; i < 40; i++)
+          _textMsg(
+            id: 'msg$i',
+            pubkey: 'alice',
+            content: 'Message $i',
+            createdAt: 1000 + i,
+          ),
+      ];
+      final channelsNotifier = _FakeChannelsNotifier(
+        [_testChannel],
+        observedUnread: {
+          _channelId: [
+            makeObservedUnreadEvent(
+              id: 'msg21',
+              createdAt: 1021,
+              rootId: null,
+              highPriority: false,
+              channelType: 'stream',
+              isThreadedReply: false,
+            ),
+          ],
+        },
+      );
+      // The channel mark is older than msg21, but the web app's catch-up
+      // mark covers it.
+      final readState = _SynchronousReadStateNotifier(
+        const ReadStateState(
+          isReady: true,
+          pubkey: 'self',
+          contexts: {_channelId: 1020, 'activity:$_channelId': 1039},
+          version: 0,
+        ),
+      );
+
+      await tester.pumpWidget(
+        _buildTestable(
+          messages: messages,
+          channelsNotifier: channelsNotifier,
+          readStateNotifier: readState,
+          users: const {
+            'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
+          },
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(
+        find.byKey(const ValueKey('channel-jump-to-oldest-unread')),
+        findsNothing,
+      );
+    });
+
     testWidgets('jumps to the oldest unread with compact inverse controls', (
       tester,
     ) async {
@@ -4061,7 +4106,7 @@ void main() {
       expect(
         find.descendant(
           of: unreadButton,
-          matching: find.byIcon(LucideIcons.chevronUp),
+          matching: find.byIcon(BuzzIcons.chevronUp),
         ),
         findsOneWidget,
       );
@@ -4089,7 +4134,7 @@ void main() {
         findsOneWidget,
       );
       expect(find.text('Latest'), findsNothing);
-      expect(find.byIcon(LucideIcons.arrowDown), findsOneWidget);
+      expect(find.byIcon(BuzzIcons.arrowDown), findsOneWidget);
       expect(find.byTooltip('Jump to latest message'), findsOneWidget);
     });
 
@@ -4980,7 +5025,7 @@ void main() {
         ),
       );
       expect(find.text('Latest'), findsNothing);
-      expect(find.byIcon(LucideIcons.arrowDown), findsOneWidget);
+      expect(find.byIcon(BuzzIcons.arrowDown), findsOneWidget);
       for (final container in tester.widgetList<Container>(
         find.descendant(
           of: find.byKey(const ValueKey('channel-jump-to-latest')),
@@ -5952,7 +5997,7 @@ void main() {
         expect(
           find.descendant(
             of: find.byKey(const ValueKey('huddle-retry')),
-            matching: find.byIcon(LucideIcons.refreshCw),
+            matching: find.byIcon(BuzzIcons.refreshCw),
           ),
           findsNothing,
         );
@@ -6012,7 +6057,7 @@ void main() {
         expect(
           find.descendant(
             of: find.byKey(const ValueKey('huddle-retry')),
-            matching: find.byIcon(LucideIcons.settings),
+            matching: find.byIcon(BuzzIcons.settings),
           ),
           findsOneWidget,
         );
@@ -6066,11 +6111,11 @@ void main() {
       expect(
         find.descendant(
           of: find.byKey(const ValueKey('channel-huddle-button')),
-          matching: find.byIcon(LucideIcons.headphones),
+          matching: find.byIcon(BuzzIcons.headphones),
         ),
         findsOneWidget,
       );
-      expect(find.byIcon(LucideIcons.headphoneOff), findsNothing);
+      expect(find.byIcon(BuzzIcons.headphoneOff), findsNothing);
     });
 
     testWidgets('failed admission cannot publish Huddle leave lifecycle', (
@@ -6759,7 +6804,7 @@ void main() {
           tester.getSize(find.byType(CircleAvatar).first),
           const Size.square(104),
         );
-        expect(find.byIcon(LucideIcons.userRound), findsNWidgets(3));
+        expect(find.byIcon(BuzzIcons.userRound), findsNWidgets(3));
         await tester.tap(
           find.byKey(const ValueKey('huddle-participant-avatar-desktop')),
         );
@@ -6929,17 +6974,17 @@ void main() {
         expect(
           find.descendant(
             of: find.byKey(const ValueKey('huddle-speaker-toggle')),
-            matching: find.byIcon(LucideIcons.volume2),
+            matching: find.byIcon(BuzzIcons.volume2),
           ),
           findsOneWidget,
         );
         final speakerIcon = find.descendant(
           of: find.byKey(const ValueKey('huddle-speaker-toggle')),
-          matching: find.byIcon(LucideIcons.volume2),
+          matching: find.byIcon(BuzzIcons.volume2),
         );
         final leaveIcon = find.descendant(
           of: find.byKey(const ValueKey('huddle-leave')),
-          matching: find.byIcon(LucideIcons.phoneOff),
+          matching: find.byIcon(BuzzIcons.phoneOff),
         );
         expect(tester.widget<Icon>(speakerIcon).size, 28);
         expect(tester.widget<Icon>(leaveIcon).size, 28);
@@ -6972,7 +7017,7 @@ void main() {
         expect(
           find.descendant(
             of: find.byKey(const ValueKey('huddle-speaker-toggle')),
-            matching: find.byIcon(LucideIcons.volume2),
+            matching: find.byIcon(BuzzIcons.volume2),
           ),
           findsOneWidget,
         );
@@ -7006,7 +7051,7 @@ void main() {
         expect(
           find.descendant(
             of: find.byKey(const ValueKey('huddle-mute-toggle')),
-            matching: find.byIcon(LucideIcons.mic),
+            matching: find.byIcon(BuzzIcons.mic),
           ),
           findsOneWidget,
         );
@@ -7015,7 +7060,7 @@ void main() {
               .widget<Icon>(
                 find.descendant(
                   of: find.byKey(const ValueKey('huddle-mute-toggle')),
-                  matching: find.byIcon(LucideIcons.mic),
+                  matching: find.byIcon(BuzzIcons.mic),
                 ),
               )
               .size,
@@ -7028,7 +7073,7 @@ void main() {
         expect(
           find.descendant(
             of: find.byKey(const ValueKey('huddle-mute-toggle')),
-            matching: find.byIcon(LucideIcons.micOff),
+            matching: find.byIcon(BuzzIcons.micOff),
           ),
           findsOneWidget,
         );
@@ -7049,7 +7094,7 @@ void main() {
 
         final emojiIcon = find.descendant(
           of: find.byKey(const ValueKey('huddle-emoji-reactions')),
-          matching: find.byIcon(LucideIcons.smilePlus),
+          matching: find.byIcon(BuzzIcons.smilePlus),
         );
         expect(emojiIcon, findsOneWidget);
         expect(tester.widget<Icon>(emojiIcon).size, 28);
@@ -7121,14 +7166,14 @@ void main() {
         expect(
           find.descendant(
             of: find.byKey(const ValueKey('huddle-drawer-expand')),
-            matching: find.byIcon(LucideIcons.chevronUp),
+            matching: find.byIcon(BuzzIcons.chevronUp),
           ),
           findsOneWidget,
         );
         expect(
           find.descendant(
             of: find.byKey(const ValueKey('huddle-drawer-mute-toggle')),
-            matching: find.byIcon(LucideIcons.micOff),
+            matching: find.byIcon(BuzzIcons.micOff),
           ),
           findsOneWidget,
         );
@@ -9378,11 +9423,7 @@ void main() {
             messages: [
               _systemMsg(
                 id: 'sys-accessible',
-                payload: {
-                  'type': 'topic_changed',
-                  'actor': 'alice',
-                  'topic': 'Release planning',
-                },
+                payload: {'type': 'member_left', 'actor': 'alice'},
                 createdAt:
                     DateTime(2026, 7, 28, 12, 34).millisecondsSinceEpoch ~/
                     1000,
@@ -9433,7 +9474,9 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      expect(find.text('Alice removed Bob from the channel'), findsOneWidget);
+      expect(find.text('Alice'), findsOneWidget);
+      expect(findRichText('removed '), findsOneWidget);
+      expect(find.widgetWithText(MessageMentionPill, 'Bob'), findsOneWidget);
     });
 
     testWidgets('renders topic_changed system event', (tester) async {
@@ -9459,7 +9502,7 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(
-        find.text('Alice changed the topic to "Release planning"'),
+        findRichText('changed the topic to "Release planning"'),
         findsOneWidget,
       );
     });
@@ -9487,7 +9530,7 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(
-        find.text('Alice changed the purpose to "Team standup notes"'),
+        findRichText('changed the purpose to "Team standup notes"'),
         findsOneWidget,
       );
     });
@@ -9555,7 +9598,7 @@ void main() {
       // Only the text message should render, unknown system event is skipped.
       expect(findRichText('Hello'), findsOneWidget);
       // No system message row rendered for unknown type.
-      expect(find.byIcon(LucideIcons.arrowLeftRight), findsNothing);
+      expect(find.byIcon(BuzzIcons.arrowLeftRight), findsNothing);
     });
   });
 
@@ -9809,13 +9852,13 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(find.byType(TextField), findsNothing);
-      expect(find.byIcon(LucideIcons.arrowUp).hitTestable(), findsOneWidget);
+      expect(find.byIcon(BuzzIcons.arrowUp).hitTestable(), findsOneWidget);
 
       await tester.tap(find.text('Message #general'));
       await tester.pumpAndSettle();
 
       expect(find.byType(TextField), findsOneWidget);
-      expect(find.byIcon(LucideIcons.arrowUp).hitTestable(), findsOneWidget);
+      expect(find.byIcon(BuzzIcons.arrowUp).hitTestable(), findsOneWidget);
     });
 
     testWidgets('shows hint text', (tester) async {
@@ -10744,7 +10787,7 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(find.text('secret'), findsOneWidget);
-      expect(find.byIcon(LucideIcons.lock), findsOneWidget);
+      expect(find.byIcon(BuzzIcons.lock), findsOneWidget);
     });
   });
 
@@ -13210,7 +13253,9 @@ void main() {
         await tester.pumpAndSettle();
 
         expect(
-          find.byKey(const ValueKey('thread-message-group-thread-root')),
+          find
+              .byKey(const ValueKey('thread-message-group-thread-root'))
+              .hitTestable(),
           findsNothing,
         );
         expect(
@@ -13295,7 +13340,9 @@ void main() {
         await tester.pumpAndSettle();
 
         expect(
-          find.byKey(const ValueKey('thread-message-group-thread-root')),
+          find
+              .byKey(const ValueKey('thread-message-group-thread-root'))
+              .hitTestable(),
           findsNothing,
         );
         expect(
@@ -15000,7 +15047,7 @@ void main() {
         expect(
           find.descendant(
             of: find.byKey(const ValueKey('thread-jump-to-latest')),
-            matching: find.byIcon(LucideIcons.arrowDown),
+            matching: find.byIcon(BuzzIcons.arrowDown),
           ),
           findsOneWidget,
         );

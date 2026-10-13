@@ -229,7 +229,10 @@ async fn delivery_ledger_enforces_outcome_shape_and_immutability() {
     let hash = secret_hash(&RAW_SECRET);
     let created_by = pubkey_bytes(&admin);
 
-    let mut tx = db.begin_event_write_transaction().await.expect("begin");
+    let mut tx = db
+        .begin_event_write_transaction(community)
+        .await
+        .expect("begin");
     create_app(
         &mut tx,
         community,
@@ -329,7 +332,10 @@ async fn tenant_isolation_keeps_same_app_uuid_independent() {
     let creator_b = [0xb2u8; 32];
 
     for (community, created_by, name) in [(a, creator_a, "Alpha"), (b, creator_b, "Beta")] {
-        let mut tx = db.begin_event_write_transaction().await.expect("begin");
+        let mut tx = db
+            .begin_event_write_transaction(community)
+            .await
+            .expect("begin");
         create_app(
             &mut tx,
             community,
@@ -382,7 +388,7 @@ async fn create_update_clear_enable_disable_and_created_by_are_stable() {
     let created_by = pubkey_bytes(&admin);
 
     let mut tx = db
-        .begin_event_write_transaction()
+        .begin_event_write_transaction(community)
         .await
         .expect("begin create");
     assert!(
@@ -443,7 +449,7 @@ async fn create_update_clear_enable_disable_and_created_by_are_stable() {
         ),
     );
     let mut tx = db
-        .begin_event_write_transaction()
+        .begin_event_write_transaction(community)
         .await
         .expect("begin update");
     assert!(claim_app_command_event(&mut tx, community, &update_cmd)
@@ -485,7 +491,7 @@ async fn create_update_clear_enable_disable_and_created_by_are_stable() {
         &format!(r#"{{"action":"disable","app_id":"{app_id}"}}"#),
     );
     let mut tx = db
-        .begin_event_write_transaction()
+        .begin_event_write_transaction(community)
         .await
         .expect("begin disable");
     assert!(claim_app_command_event(&mut tx, community, &disable_cmd)
@@ -514,7 +520,7 @@ async fn create_update_clear_enable_disable_and_created_by_are_stable() {
         &format!(r#"{{"action":"enable","app_id":"{app_id}"}}"#),
     );
     let mut tx = db
-        .begin_event_write_transaction()
+        .begin_event_write_transaction(community)
         .await
         .expect("begin enable");
     assert!(claim_app_command_event(&mut tx, community, &enable_cmd)
@@ -553,7 +559,7 @@ async fn rotate_updates_hash_and_private_timestamp_without_metadata_replacement(
     let create_cmd = command_event(&admin, r#"{"action":"create","name":"RotateMe"}"#);
 
     let mut tx = db
-        .begin_event_write_transaction()
+        .begin_event_write_transaction(community)
         .await
         .expect("begin create");
     assert!(claim_app_command_event(&mut tx, community, &create_cmd)
@@ -599,7 +605,7 @@ async fn rotate_updates_hash_and_private_timestamp_without_metadata_replacement(
         &format!(r#"{{"action":"rotate_secret","app_id":"{app_id}"}}"#),
     );
     let mut tx = db
-        .begin_event_write_transaction()
+        .begin_event_write_transaction(community)
         .await
         .expect("begin rotate");
     assert!(claim_app_command_event(&mut tx, community, &rotate_cmd)
@@ -633,7 +639,10 @@ async fn secret_hash_only_storage_never_persists_raw_secret() {
     let app_id = Uuid::new_v4();
     let hash = secret_hash(&RAW_SECRET);
 
-    let mut tx = db.begin_event_write_transaction().await.expect("begin");
+    let mut tx = db
+        .begin_event_write_transaction(community)
+        .await
+        .expect("begin");
     create_app(
         &mut tx,
         community,
@@ -681,7 +690,10 @@ async fn missing_app_mutations_return_not_found() {
         .expect("get missing")
         .is_none());
 
-    let mut tx = db.begin_event_write_transaction().await.expect("begin");
+    let mut tx = db
+        .begin_event_write_transaction(community)
+        .await
+        .expect("begin");
     let err = update_app(
         &mut tx,
         community,
@@ -715,7 +727,7 @@ async fn duplicate_command_claim_is_a_no_op() {
     let hash = secret_hash(&RAW_SECRET);
 
     let mut tx = db
-        .begin_event_write_transaction()
+        .begin_event_write_transaction(community)
         .await
         .expect("begin first");
     assert!(claim_app_command_event(&mut tx, community, &command)
@@ -738,7 +750,7 @@ async fn duplicate_command_claim_is_a_no_op() {
     tx.commit().await.expect("commit first");
 
     let mut tx = db
-        .begin_event_write_transaction()
+        .begin_event_write_transaction(community)
         .await
         .expect("begin duplicate");
     assert!(
@@ -770,7 +782,10 @@ async fn metadata_changing_transaction_rolls_back_command_app_and_head() {
     let app_id = Uuid::new_v4();
     let hash = secret_hash(&RAW_SECRET);
 
-    let mut tx = db.begin_event_write_transaction().await.expect("begin");
+    let mut tx = db
+        .begin_event_write_transaction(community)
+        .await
+        .expect("begin");
     assert!(claim_app_command_event(&mut tx, community, &command)
         .await
         .expect("claim"));
@@ -820,7 +835,10 @@ async fn independent_app_metadata_heads_and_same_second_updates_are_monotonic() 
     let hash = secret_hash(&RAW_SECRET);
     let created_by = pubkey_bytes(&admin);
 
-    let mut tx = db.begin_event_write_transaction().await.expect("begin");
+    let mut tx = db
+        .begin_event_write_transaction(community)
+        .await
+        .expect("begin");
     for (id, name) in [(first_id, "One"), (second_id, "Two")] {
         create_app(
             &mut tx,
@@ -846,7 +864,7 @@ async fn independent_app_metadata_heads_and_same_second_updates_are_monotonic() 
     assert_eq!(live_metadata_count(&pool, community, second_id).await, 1);
 
     let mut tx = db
-        .begin_event_write_transaction()
+        .begin_event_write_transaction(community)
         .await
         .expect("begin rapid updates");
     let first_ts = next_app_metadata_created_at(
@@ -919,7 +937,10 @@ async fn same_second_nip33_tie_keeps_lexicographically_lower_event_id() {
     let hash = secret_hash(&RAW_SECRET);
     let created_at = Utc::now().timestamp().max(1) as u64;
 
-    let mut tx = db.begin_event_write_transaction().await.expect("begin");
+    let mut tx = db
+        .begin_event_write_transaction(community)
+        .await
+        .expect("begin");
     create_app(
         &mut tx,
         community,
