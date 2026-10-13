@@ -1,4 +1,4 @@
-import * as React from "react";
+import type * as React from "react";
 import { Glasses } from "lucide-react";
 
 import { cn } from "@/shared/lib/cn";
@@ -54,7 +54,6 @@ export function ProjectTabsList({ prsActive }: { prsActive?: boolean }) {
   );
 }
 
-
 /** Tabs for pull request detail view: Conversation, Commits, Files changed */
 export function PullRequestTabsList({
   conversationCount,
@@ -67,17 +66,40 @@ export function PullRequestTabsList({
   filesCount: number;
   githubHosted?: boolean;
   hideFiles?: boolean;
-  pullRequest: { updateCount?: number };
+  pullRequest: {
+    commentCount?: number;
+    comments?: readonly unknown[];
+    updateCount?: number;
+  };
 }) {
+  const commitCount = hideFiles
+    ? 1
+    : Math.max(1, (pullRequest.updateCount ?? 0) + 1);
+  const comments =
+    conversationCount ??
+    pullRequest.commentCount ??
+    pullRequest.comments?.length ??
+    0;
   return (
     <TabsList className="h-full min-w-0 max-w-full flex-none justify-start gap-1.5 overflow-x-auto bg-transparent p-0 scrollbar-none">
-      <TabsTrigger className={PROJECT_TAB_TRIGGER_CLASS} value="pr-conversation">
+      <TabsTrigger
+        className={PROJECT_TAB_TRIGGER_CLASS}
+        value="pr-conversation"
+      >
         <ProjectTabLabel>
-          Conversation{conversationCount !== undefined ? ` (${conversationCount})` : ""}
+          Conversation
+          <span className="rounded-full bg-muted px-1.5 py-0.5 text-2xs">
+            {comments}
+          </span>
         </ProjectTabLabel>
       </TabsTrigger>
       <TabsTrigger className={PROJECT_TAB_TRIGGER_CLASS} value="pr-commits">
-        <ProjectTabLabel>Commits ({pullRequest.updateCount ?? 1})</ProjectTabLabel>
+        <ProjectTabLabel>
+          Commits
+          <span className="rounded-full bg-muted px-1.5 py-0.5 text-2xs">
+            {commitCount}
+          </span>
+        </ProjectTabLabel>
       </TabsTrigger>
       {!hideFiles && (
         <TabsTrigger className={PROJECT_TAB_TRIGGER_CLASS} value="pr-files">

@@ -115,6 +115,7 @@ export function WorkspaceTabs({
   repoDiffLoading,
   selectedCommitHash,
   selectedIssueId,
+  selectedPullRequest: retainedSelectedPullRequest = null,
   selectedPullRequestId,
   sharedHeaderBackdrop,
   pullRequests,
@@ -164,6 +165,8 @@ export function WorkspaceTabs({
   repoDiffLoading: boolean;
   selectedCommitHash: string | null;
   selectedIssueId: string | null;
+  /** Review to keep visible when a refetch has not returned it yet. */
+  selectedPullRequest?: ProjectPullRequest | null;
   selectedPullRequestId: string | null;
   sharedHeaderBackdrop?: boolean;
   pullRequests: ProjectPullRequest[];
@@ -268,10 +271,15 @@ export function WorkspaceTabs({
     () => commitAuthorPubkeysFromPullRequests(pullRequests),
     [pullRequests],
   );
-  const selectedPullRequest =
+  const listedPullRequest =
     pullRequests.find(
       (pullRequest) => pullRequest.id === selectedPullRequestId,
     ) ?? null;
+  const selectedPullRequest =
+    listedPullRequest ??
+    (retainedSelectedPullRequest?.id === selectedPullRequestId
+      ? retainedSelectedPullRequest
+      : null);
   const selectedCommitPullRequest = React.useMemo(
     () =>
       pullRequests.find(
@@ -483,6 +491,8 @@ export function WorkspaceTabs({
                   onSelectedCommitHashChange(commit.hash)
                 }
                 profiles={profiles}
+                project={project}
+                projectId={projectId}
                 pullRequests={pullRequests}
                 repoContributors={displayedContributors}
                 snapshot={displayedSnapshot}
@@ -539,7 +549,7 @@ export function WorkspaceTabs({
             profiles={profiles}
             project={project}
             pullRequests={pullRequests}
-            selectedPullRequestId={selectedPullRequestId}
+            selectedPullRequest={selectedPullRequest}
           />
         </TabsContent>
 

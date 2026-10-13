@@ -4,8 +4,11 @@ use sqlx::{PgConnection, PgPool};
 
 use buzz_core::{CommunityId, StoredEvent};
 
+use buzz_datastore_tracing::datastore_span;
+
 use crate::error::Result;
 use crate::event::row_to_stored_event;
+use crate::Db;
 
 const LIST_LATEST_PARAMETERIZED_HEADS: &str = r#"
 SELECT DISTINCT ON (pubkey, d_tag)
@@ -96,6 +99,32 @@ pub(crate) async fn get_latest_parameterized_head_on(
         .fetch_optional(&mut *conn)
         .await?;
     Ok(row.map(row_to_stored_event).transpose()?.flatten())
+}
+
+impl Db {
+    /// List latest live global parameterized-replaceable heads of `kind`.
+    ///
+    /// Unbounded: does not apply [`crate::event::DEFAULT_MAX_PAGE_LIMIT`].
+    #[datastore_span(name = "list_latest_parameterized_heads", system = "postgresql")]
+    pub async fn list_latest_parameterized_heads(
+        &self,
+        community_id: CommunityId,
+        kind: i32,
+    ) -> Result<Vec<StoredEvent>> {
+        list_latest_parameterized_heads(&self.pool, community_id, kind).await
+    }
+
+    /// Fetch the latest live global head for `(kind, pubkey, d_tag)`.
+    #[datastore_span(name = "get_latest_parameterized_head", system = "postgresql")]
+    pub async fn get_latest_parameterized_head(
+        &self,
+        community_id: CommunityId,
+        kind: i32,
+        pubkey: &[u8],
+        d_tag: &str,
+    ) -> Result<Option<StoredEvent>> {
+        get_latest_parameterized_head(&self.pool, community_id, kind, pubkey, d_tag).await
+    }
 }
 
 #[cfg(test)]

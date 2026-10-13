@@ -119,8 +119,10 @@ test("Buzz create preserves all existing invalidations", () => {
 });
 
 test("a decimal GitHub id is rejected before a Nostr update reaches identity or signing", async () => {
-  await assert.rejects(
-    publishProjectPullRequestUpdate({
+  // A GitHub clone never reaches Nostr identity or signing. The push-sync
+  // caller treats false as "unchanged", so this must not throw.
+  assert.equal(
+    await publishProjectPullRequestUpdate({
       commit: "e".repeat(40),
       mergeBase: null,
       project: {
@@ -133,6 +135,6 @@ test("a decimal GitHub id is rejected before a Nostr update reaches identity or 
         commit: "d".repeat(40),
       },
     }),
-    /cannot be mutated through Nostr/,
+    false,
   );
 });

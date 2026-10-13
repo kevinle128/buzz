@@ -2,19 +2,19 @@ import * as React from "react";
 
 import type { AppMetadata } from "@/features/apps/types";
 import { resolveFeedActor } from "@/features/notifications/lib/feedActor";
+import { getThreadReference } from "@/features/messages/lib/threading";
 import { truncatePubkey } from "@/shared/lib/pubkey";
 import {
   resolveUserLabel,
   type UserProfileLookup,
 } from "@/features/profile/lib/identity";
-import { getThreadReference } from "@/features/messages/lib/threading";
 import type { FeedItem, HomeFeedResponse } from "@/shared/api/types";
 import {
   collectHomeAlertItems,
   eligibleFeedNotificationItems,
-  type NotificationChannel,
   notificationBody,
   notificationTitle,
+  type NotificationChannel,
 } from "./lib/feed";
 import {
   getDesktopNotificationPermissionState,

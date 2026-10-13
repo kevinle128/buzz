@@ -40,11 +40,14 @@ import {
 } from "@/shared/constants/kinds";
 import { resolveEventAuthorPubkey } from "@/shared/lib/authors";
 import { normalizePubkey } from "@/shared/lib/pubkey";
+import { channelRoleMap } from "@/shared/lib/rosterDerivations";
+
+const EMPTY_ROLE_MAP: ReadonlyMap<string, string> = new Map();
 import { formatTime } from "@/features/messages/lib/dateFormatters";
 // Pure overlay helper lives in a sibling .mjs so node:test (no TS loader)
 // can exercise the exact same source the renderer uses.
 import { applyEditTagOverlay } from "@/features/messages/lib/applyEditTagOverlay.mjs";
-import { truncatePubkey } from "@/shared/lib/pubkey";
+import { truncateNpub } from "@/shared/lib/pubkey";
 
 const HEX_RE = /^[0-9a-f]+$/i;
 const EMPTY_APPS = new Map<string, AppMetadata>();
@@ -226,12 +229,9 @@ export function formatTimelineMessages(
   apps?: ReadonlyMap<string, AppMetadata>,
 ): TimelineMessage[] {
   const currentPubkeyLower = currentPubkey?.toLowerCase();
-  const roleByPubkey = new Map<string, string>();
-  if (members) {
-    for (const member of members) {
-      roleByPubkey.set(member.pubkey.toLowerCase(), member.role);
-    }
-  }
+  // Identity-cached: rosters can be 10k+ members and this formatter re-runs
+  // on every live message; the map is computed once per distinct roster.
+  const roleByPubkey = members ? channelRoleMap(members) : EMPTY_ROLE_MAP;
   const deletedEventIds = new Set<string>();
   for (const event of events) {
     // Both kind:5 and kind:9005 are deletion markers; mirror the relay.
@@ -385,7 +385,7 @@ export function formatTimelineMessages(
         ? "You"
         : profile?.displayName?.trim() ||
           profile?.nip05Handle?.trim() ||
-          truncatePubkey(actorPubkey);
+          truncateNpub(actorPubkey);
     existing.users.push({
       pubkey: actorPubkey,
       displayName,

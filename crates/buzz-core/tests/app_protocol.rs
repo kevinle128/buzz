@@ -1,4 +1,4 @@
-//! Kind 9038 / 39007 App protocol contract.
+//! Kind 9038 / 39008 App protocol contract.
 
 use buzz_core::app::{
     parse_app_admin_command, parse_canonical_app_id, validate_app_icon_url, AppAdminCommand,
@@ -19,7 +19,7 @@ fn parse(json: &str) -> Result<AppAdminCommand, buzz_core::app::AppCommandError>
 #[test]
 fn app_kind_constants_have_stable_numeric_values() {
     assert_eq!(KIND_APP_ADMIN_COMMAND, 9038);
-    assert_eq!(KIND_APP_METADATA, 39007);
+    assert_eq!(KIND_APP_METADATA, 39008);
 }
 
 #[test]

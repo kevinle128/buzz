@@ -19,7 +19,7 @@ function flipHexNibble(hex) {
 
 function signMetadata({
   secret = RELAY_SECRET,
-  kind = 39007,
+  kind = 39008,
   appId = APP_ID,
   name = "Buildkite",
   status = "active",

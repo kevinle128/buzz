@@ -9,14 +9,15 @@ use super::{
     default_start_on_app_launch, validate_respond_to_allowlist, AgentDefinition, BackendKind,
     CatalogSource, RelayMeshConfig, RespondTo,
 };
+use crate::managed_agents::AcpSessionPolicy;
 
 /// The NIP-AP behavioral group as one grouped request field.
 ///
 /// Grouped (not flat) because `update_persona` has legacy callers that don't
 /// send behavioral fields at all — flat replace semantics would silently wipe
 /// a stored behavior group on every team-import edit. Absent group = don't touch the
-/// stored behavior group; present group = validate and replace the fields as a unit
-/// (mode and allowlist must travel together).
+/// stored behavior group; present group = validate and replace all four fields as a
+/// unit (mode and allowlist must travel together).
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PersonaBehaviorRequest {
@@ -26,6 +27,9 @@ pub struct PersonaBehaviorRequest {
     pub respond_to_allowlist: Vec<String>,
     #[serde(default)]
     pub parallelism: Option<u32>,
+    /// Absent inside a present behavior group selects the channel default.
+    #[serde(default)]
+    pub session_policy: Option<AcpSessionPolicy>,
 }
 
 /// Validate a behavior group and apply it onto a persona record.
@@ -68,6 +72,7 @@ pub fn apply_persona_behavior(
         Vec::new()
     };
     record.parallelism = behavior.parallelism;
+    record.session_policy = behavior.session_policy.unwrap_or_default();
     Ok(())
 }
 
@@ -76,7 +81,12 @@ pub fn apply_persona_behavior(
 pub struct CreatePersonaRequest {
     pub display_name: String,
     pub avatar_url: Option<String>,
+    /// Optional short, PUBLIC description (max 280 chars).
+    #[serde(default)]
+    pub description: Option<String>,
     pub system_prompt: String,
+    #[serde(default)]
+    pub acp_command: Option<String>,
     #[serde(default)]
     pub runtime: Option<String>,
     #[serde(default)]
@@ -103,7 +113,13 @@ pub struct UpdatePersonaRequest {
     pub id: String,
     pub display_name: String,
     pub avatar_url: Option<String>,
+    /// Optional short, PUBLIC description (max 280 chars). The dialog always
+    /// sends the current value, so absent and empty both clear it.
+    #[serde(default)]
+    pub description: Option<String>,
     pub system_prompt: String,
+    #[serde(default)]
+    pub acp_command: Option<String>,
     #[serde(default)]
     pub runtime: Option<String>,
     #[serde(default)]
@@ -131,6 +147,9 @@ pub struct UpdatePersonaRequest {
 #[serde(rename_all = "camelCase")]
 pub struct CreateManagedAgentRequest {
     pub name: String,
+    /// An explicit agent override; absence inherits the global or built-in policy.
+    #[serde(default)]
+    pub permission_policy: Option<crate::managed_agents::permission_policy::PermissionPolicy>,
     #[serde(default)]
     pub persona_id: Option<String>,
     /// Optional deployment-time team binding for runtime instruction layering.
@@ -188,6 +207,9 @@ pub struct CreateManagedAgentRequest {
     pub respond_to_allowlist: Vec<String>,
     #[serde(default)]
     pub relay_mesh: Option<RelayMeshConfig>,
+    /// Local-only thinking effort saved before the first spawn.
+    #[serde(default)]
+    pub effort_level: Option<String>,
 }
 
 /// Patch request for updating a managed agent's mutable fields.
@@ -200,6 +222,10 @@ pub struct CreateManagedAgentRequest {
 #[serde(rename_all = "camelCase")]
 pub struct UpdateManagedAgentRequest {
     pub pubkey: String,
+    /// Absent = unchanged. Null = inherit. Present = set an agent override.
+    #[serde(default, deserialize_with = "crate::util::double_option")]
+    pub permission_policy:
+        Option<Option<crate::managed_agents::permission_policy::PermissionPolicy>>,
     /// Absent = don't touch. Present = rename the agent.
     #[serde(default)]
     pub name: Option<String>,
@@ -253,17 +279,73 @@ pub struct UpdateManagedAgentRequest {
     /// normalized server-side).
     #[serde(default)]
     pub respond_to_allowlist: Option<Vec<String>>,
-    /// Absent = don't touch. `null` = clear per-agent override (revert to
-    /// global/built-in). Present string = set per-agent override.
-    /// Remote deployed agents: rejected server-side (displayed read-only in UI).
+    /// Absent = don't touch. `null` = clear the canonical effort column
+    /// (revert to inherited default). `"value"` = set the column.
+    ///
+    /// When present, persisted inside the locked update/restart transaction
+    /// so that an access-policy-change restart snapshots and launches the new
+    /// effort value rather than the old one. Uses the same
+    /// `apply_picker_effort_level` logic (via `apply_effort_update`) so
+    /// the record-scope alias sweep runs atomically with the column write.
     #[serde(default, deserialize_with = "crate::util::double_option")]
-    pub permission_policy:
-        Option<Option<crate::managed_agents::permission_policy::PermissionPolicy>>,
+    pub effort_level: Option<Option<String>>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permission_policy_create_preserves_explicit_override_and_inheritance() {
+        let request: CreateManagedAgentRequest = serde_json::from_value(serde_json::json!({
+            "name": "agent", "permissionPolicy": "reject"
+        }))
+        .unwrap();
+        assert_eq!(
+            request.permission_policy,
+            Some(crate::managed_agents::permission_policy::PermissionPolicy::Reject)
+        );
+        let legacy: CreateManagedAgentRequest = serde_json::from_value(serde_json::json!({
+            "name": "agent"
+        }))
+        .unwrap();
+        assert_eq!(legacy.permission_policy, None);
+    }
+
+    #[test]
+    fn permission_policy_update_preserves_absent_null_and_explicit_values() {
+        use crate::managed_agents::permission_policy::PermissionPolicy;
+        for (extra, expected) in [
+            (serde_json::json!({}), None),
+            (serde_json::json!({"permissionPolicy": null}), Some(None)),
+            (
+                serde_json::json!({"permissionPolicy": "ask"}),
+                Some(Some(PermissionPolicy::Ask)),
+            ),
+            (
+                serde_json::json!({"permissionPolicy": "allow"}),
+                Some(Some(PermissionPolicy::Allow)),
+            ),
+            (
+                serde_json::json!({"permissionPolicy": "reject"}),
+                Some(Some(PermissionPolicy::Reject)),
+            ),
+        ] {
+            let mut value = serde_json::json!({"pubkey": "agent"});
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let request: UpdateManagedAgentRequest = serde_json::from_value(value).unwrap();
+            assert_eq!(request.permission_policy, expected);
+        }
+        assert!(
+            serde_json::from_value::<UpdateManagedAgentRequest>(serde_json::json!({
+                "pubkey": "agent", "permissionPolicy": "invalid"
+            }))
+            .is_err()
+        );
+    }
 
     fn record_with_quad() -> AgentDefinition {
         let mut record = record_without_quad();
@@ -275,10 +357,13 @@ mod tests {
 
     fn record_without_quad() -> AgentDefinition {
         AgentDefinition {
+            session_policy: Default::default(),
+            description: None,
             id: "p-1".to_string(),
             display_name: "Test".to_string(),
             avatar_url: None,
             system_prompt: "prompt".to_string(),
+            acp_command: None,
             runtime: None,
             model: None,
             provider: None,
@@ -289,6 +374,7 @@ mod tests {
             source_team: None,
             source_team_persona_slug: None,
             catalog_source: None,
+            team_catalog_source: None,
             env_vars: BTreeMap::new(),
             respond_to: None,
             respond_to_allowlist: Vec::new(),
@@ -313,18 +399,21 @@ mod tests {
     #[test]
     fn present_behavior_replaces_all_four_as_a_unit() {
         let mut record = record_with_quad();
+        record.session_policy = AcpSessionPolicy::Thread;
         apply_persona_behavior(
             &mut record,
             Some(PersonaBehaviorRequest {
                 respond_to: Some(RespondTo::Anyone),
                 respond_to_allowlist: Vec::new(),
                 parallelism: None,
+                session_policy: None,
             }),
         )
         .unwrap();
         assert_eq!(record.respond_to.as_deref(), Some("anyone"));
         assert!(record.respond_to_allowlist.is_empty());
         assert_eq!(record.parallelism, None);
+        assert_eq!(record.session_policy, AcpSessionPolicy::Channel);
     }
 
     #[test]
@@ -406,6 +495,7 @@ mod tests {
                 respond_to: Some(RespondTo::Allowlist),
                 respond_to_allowlist: vec!["c".repeat(64)],
                 parallelism: Some(3),
+                session_policy: Some(AcpSessionPolicy::Thread),
             }),
         )
         .unwrap();
@@ -413,6 +503,7 @@ mod tests {
         assert_eq!(content.respond_to.as_deref(), Some("allowlist"));
         assert_eq!(content.respond_to_allowlist, vec!["c".repeat(64)]);
         assert_eq!(content.parallelism, Some(3));
+        assert_eq!(content.session_policy, AcpSessionPolicy::Thread);
     }
 
     #[test]

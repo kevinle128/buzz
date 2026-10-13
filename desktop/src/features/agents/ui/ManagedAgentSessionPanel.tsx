@@ -7,7 +7,6 @@ import {
   XCircle,
 } from "lucide-react";
 
-import { isManagedAgentActive } from "@/features/agents/lib/managedAgentControlActions";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import type { ManagedAgent } from "@/shared/api/types";
 import { cn } from "@/shared/lib/cn";
@@ -40,7 +39,8 @@ import {
 import { buildTranscriptState } from "./agentSessionTranscript";
 
 type ManagedAgentSessionPanelProps = {
-  agent: Pick<ManagedAgent, "pubkey" | "name" | "status"> & {
+  agent: Pick<ManagedAgent, "pubkey" | "name"> & {
+    status: ManagedAgent["status"] | "unknown";
     avatarUrl?: string | null;
   };
   autoTail?: boolean;
@@ -76,7 +76,7 @@ export function ManagedAgentSessionPanel({
   rawEventsOverride,
   transcriptOverride,
 }: ManagedAgentSessionPanelProps) {
-  const hasObserver = isManagedAgentActive(agent);
+  const hasObserver = agent.status === "running" || agent.status === "deployed";
   // Always read from the store — archived frames are ingested regardless of
   // live status and must be renderable for idle agents with channel history.
   // The `hasObserver` flag still gates the relay subscription (via the
@@ -369,9 +369,9 @@ function EmptyObserverState() {
   return (
     <div className="mt-4 flex min-h-48 flex-col items-center justify-center px-6 py-8 text-center">
       <TerminalSquare className="mx-auto h-4 w-4 text-muted-foreground" />
-      <p className="mt-3 text-sm font-medium">Observer not attached</p>
+      <p className="mt-3 text-sm font-medium">No activity yet</p>
       <p className="mt-1 text-sm text-muted-foreground">
-        The live feed is available for local agents started after this update.
+        Activity will appear when this agent publishes an update.
       </p>
     </div>
   );

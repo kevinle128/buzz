@@ -233,8 +233,9 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
       ? selectedBranchPullRequest
       : null;
   const activeRepoPullRequest =
-    pullRequestsQuery.data?.pullRequests.find((item) => item.id === selectedPullRequestId) ??
-    selectedBranchPullRequest;
+    pullRequestsQuery.data?.pullRequests.find(
+      (item) => item.id === selectedPullRequestId,
+    ) ?? selectedBranchPullRequest;
   const [repoSource, setRepoSource] = React.useState<"remote" | "local">(
     "remote",
   );
@@ -243,7 +244,9 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
     buzzHost: repoRemote.host.kind === "buzz",
     githubStateReady: repoStateQuery.isSuccess,
   });
-  const repositoryPanel = useProjectRepositoryPanel();
+  const repositoryPanel = useProjectRepositoryPanel(
+    `${repository?.id ?? ""}:${activeTab}:${selectedPullRequestId ?? ""}:${selectedIssueId ?? ""}:${selectedCommitHash ?? ""}`,
+  );
   const repoSnapshotQuery = useProjectRepoSnapshotQuery(
     repository,
     activeBranch,
@@ -706,8 +709,9 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
     displayedRepositorySnapshot?.contributors ?? repoContributors;
   const displayedRepositoryFiles = displayedRepositorySnapshot?.files ?? [];
   const selectedPullRequest =
-    pullRequestsQuery.data?.pullRequests.find((item) => item.id === selectedPullRequestId) ??
-    null;
+    pullRequestsQuery.data?.pullRequests.find(
+      (item) => item.id === selectedPullRequestId,
+    ) ?? null;
   const selectedIssue =
     issuesQuery.data?.issues.find((item) => item.id === selectedIssueId) ??
     null;
@@ -741,6 +745,7 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
     source: repoSource,
     workItems: [selectedCommit, selectedIssue, selectedPullRequest],
   });
+  const selectionChat = repositoryPanel.openSelectionChatFor(agentPageContext);
   const repositoryPanelAction = (
     <ProjectRightPanelControls
       collapsed={repositoryPanel.collapsed}
@@ -785,19 +790,24 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
           canResetWidth={threadPanelWidth.canReset}
           closeWhen={Boolean(profilePanelPubkey)}
           detachFallbackPanel={detachedRepositoryPanel}
+          fallbackPanelOpen={!profilePanelPubkey && !repositoryPanel.collapsed}
+          fallbackPanelResizing={activeRightPanelWidth.isResizing}
+          fallbackPanelWidthPx={activeRightPanelWidth.widthPx}
           fallbackPanel={
             profilePanelPubkey || repositoryPanel.collapsed ? null : (
               <ProjectDetailRightPanel
                 activeTab={activeTab}
                 canResetWidth={activeRightPanelWidth.canReset}
                 contributors={displayedRepositoryContributors}
-                context={agentPageContext}
+                context={repositoryPanel.agentContext(agentPageContext)}
                 createIssuePending={createIssueMutation.isPending}
                 detachedRepository={detachedRepositoryPanel}
                 files={displayedRepositoryFiles}
                 identityPubkey={identityPubkey}
                 issues={issuesQuery.data?.issues ?? []}
                 mode={repositoryPanel.mode}
+                onChatWithAgent={selectionChat}
+                onClose={repositoryPanel.collapse}
                 onCreateTask={() => {
                   setCreateIssueRequestKey((key) => key + 1);
                 }}
@@ -815,7 +825,6 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
                 project={project}
                 projects={projectsQuery.data ?? []}
                 repository={repository}
-                sharedHeaderBackdrop={sharedHeaderBackdrop}
                 snapshot={displayedRepositorySnapshot}
                 sourceControls={filesSourceControls}
                 terminalTitle={projectTerminalLabel(hasLocalCheckout)}

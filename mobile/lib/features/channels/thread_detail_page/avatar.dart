@@ -2,25 +2,25 @@ part of '../thread_detail_page.dart';
 
 class _Avatar extends StatelessWidget {
   final UserProfile? profile;
-  final String pubkey;
-  final String? imageUrl;
-  final String? fallbackLabel;
+  final TimelineMessage message;
+  final bool isAgent;
 
   const _Avatar({
     required this.profile,
-    required this.pubkey,
-    this.imageUrl,
-    this.fallbackLabel,
+    required this.message,
+    required this.isAgent,
   });
 
   @override
   Widget build(BuildContext context) {
-    final label = fallbackLabel?.trim();
-    final initial = label != null && label.isNotEmpty
-        ? label[0].toUpperCase()
+    final appName = message.appDisplayName ?? 'App';
+    final initial = message.isApp
+        ? appName[0].toUpperCase()
         : profile?.initial ??
-              (pubkey.isNotEmpty ? pubkey[0].toUpperCase() : '?');
-    final avatarUrl = imageUrl ?? profile?.avatarUrl;
+              (message.pubkey.isNotEmpty
+                  ? message.pubkey[0].toUpperCase()
+                  : '?');
+    final avatarUrl = message.isApp ? message.appPicture : profile?.avatarUrl;
 
     return AvatarImage(
       imageUrl: avatarUrl,
@@ -33,6 +33,7 @@ class _Avatar extends StatelessWidget {
           fontWeight: FontWeight.w600,
         ),
       ),
+      isAgent: isAgent,
     );
   }
 }

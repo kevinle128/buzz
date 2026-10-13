@@ -142,67 +142,77 @@ export function toSearchHit(
   };
 }
 
-/** Navigation action resolved from a desktop notification click target. */
-export type DesktopNotificationAction =
-  | { type: "agent-activity"; agentPubkey: string; channelId: string | null }
-  | { type: "home" }
-  | { type: "channel"; channelId: string }
-  | { type: "search-hit"; hit: SearchHit };
+export function createDesktopNotificationActivationQueue(
+  activate: (
+    target: DesktopNotificationTarget,
+    signal: AbortSignal,
+  ) => Promise<void>,
+  onError?: (error: unknown) => void,
+): {
+  cancel: () => void;
+  enqueue: (target: DesktopNotificationTarget) => void;
+} {
+  const controller = new AbortController();
+  let pending = Promise.resolve();
 
-/** Dependencies required to execute one desktop notification click. */
-export type DesktopNotificationActionDependencies = {
-  revealDesktopAppWindow: () => Promise<void>;
-  openAgentActivity: (
-    pubkey: string,
-    options: { channelId: string | null },
-  ) => unknown;
-  goHome: () => Promise<unknown>;
-  goChannel: (channelId: string) => Promise<unknown>;
-  openSearchHit: (hit: SearchHit) => Promise<unknown>;
-};
-
-/** Resolve a desktop notification target to one navigation action. */
-export function resolveDesktopNotificationAction(
-  target: DesktopNotificationTarget,
-): DesktopNotificationAction {
-  if (target.agentPubkey) {
-    return {
-      type: "agent-activity",
-      agentPubkey: target.agentPubkey,
-      channelId: target.channelId,
-    };
-  }
-  if (!target.channelId) {
-    return { type: "home" };
-  }
-  const hit = toSearchHit(target);
-  return hit
-    ? { type: "search-hit", hit }
-    : { type: "channel", channelId: target.channelId };
+  return {
+    cancel: () => {
+      controller.abort();
+    },
+    enqueue: (target) => {
+      // Preserve native click order when macOS drains multiple queued targets.
+      // Contain failures so one rejected navigation cannot poison later clicks.
+      pending = pending
+        .then(() => {
+          if (!controller.signal.aborted) {
+            return activate(target, controller.signal);
+          }
+        })
+        .catch((error) => {
+          try {
+            onError?.(error);
+          } catch {
+            // Reporting must not poison the activation queue either.
+          }
+        });
+    },
+  };
 }
 
-/** Reveal Buzz and execute exactly one resolved notification action. */
-export async function executeDesktopNotificationAction(
+export async function activateDesktopNotificationTarget(
   target: DesktopNotificationTarget,
-  dependencies: DesktopNotificationActionDependencies,
+  actions: {
+    goChannel: (
+      channelId: string,
+      options?: { force?: boolean },
+    ) => Promise<unknown>;
+    goHome: () => Promise<unknown>;
+    openSearchHit: (
+      hit: SearchHit,
+      behavior?: { force?: boolean; signal?: AbortSignal },
+    ) => Promise<unknown>;
+    revealWindow: () => Promise<void>;
+  },
+  signal?: AbortSignal,
 ): Promise<void> {
-  await dependencies.revealDesktopAppWindow();
-  const action = resolveDesktopNotificationAction(target);
-  if (action.type === "agent-activity") {
-    dependencies.openAgentActivity(action.agentPubkey, {
-      channelId: action.channelId,
-    });
+  if (signal?.aborted) {
     return;
   }
-  if (action.type === "home") {
-    await dependencies.goHome();
-    return;
+
+  let navigation: Promise<unknown>;
+  if (!target.channelId) {
+    navigation = actions.goHome();
+  } else {
+    const anchor = toSearchHit(target);
+    navigation = anchor
+      ? actions.openSearchHit(anchor, { force: true, signal })
+      : actions.goChannel(target.channelId, { force: true });
   }
-  if (action.type === "channel") {
-    await dependencies.goChannel(action.channelId);
-    return;
-  }
-  await dependencies.openSearchHit(action.hit);
+
+  // Native activation already foregrounds the app on macOS. Other platforms
+  // still get a best-effort reveal, but it must never gate click-through.
+  void actions.revealWindow().catch(() => undefined);
+  await navigation;
 }
 
 export function deriveShellRoute(pathname: string): {

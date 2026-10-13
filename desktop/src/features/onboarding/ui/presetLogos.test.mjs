@@ -55,10 +55,18 @@ for (const id of presetIds) {
     if (RUNTIME_MARKS[id]) {
       return;
     }
-    const logoPath = PRESET_LOGOS[id];
+    // Compiled-in runtime assets (inline data or module URLs) are bundled
+    // without a file under desktop/public. Public paths still have to exist.
+    const runtimeLogo = RUNTIME_LOGOS[id];
+    if (typeof runtimeLogo === "string" && !runtimeLogo.startsWith("/")) {
+      return;
+    }
+    const logoPath =
+      PRESET_LOGOS[id] ??
+      (typeof runtimeLogo === "string" ? runtimeLogo : undefined);
     assert.ok(
       logoPath,
-      `preset "${id}" has no RUNTIME_MARKS or PRESET_LOGOS entry — it renders ` +
+      `preset "${id}" has no RUNTIME_MARKS, RUNTIME_LOGOS, or PRESET_LOGOS entry — it renders ` +
         `the generic TerminalSquare fallback. Add desktop/public${logoPath ?? `/harness-logos/${id}.png`} ` +
         `and map it in RuntimeIcon.tsx.`,
     );

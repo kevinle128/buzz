@@ -221,7 +221,7 @@ test("code -32603 bare 'Internal error' → cli-acp internal error hint (severit
   const result = friendlyAgentLastError("Internal error", -32603);
   assert.deepEqual(result, {
     severity: "generic",
-    copy: CLI_ACP_INTERNAL_ERROR_COPY,
+    copy: "The agent's harness reported an internal error. Check the agent log for the underlying cause and verify the selected harness configuration.",
   });
 });
 

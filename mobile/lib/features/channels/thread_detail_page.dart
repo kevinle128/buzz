@@ -1,12 +1,18 @@
 import 'dart:async';
 import 'dart:math' as math;
 
+import 'package:flutter/foundation.dart' show ValueListenable;
 import 'package:flutter/material.dart';
+import 'package:flutter/gestures.dart'
+    show Drag, GestureBinding, PointerScrollEvent;
+import 'package:flutter/semantics.dart' show OrdinalSortKey;
 import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
+import 'package:buzz/shared/theme/buzz_icons.dart';
 import 'package:scrollable_positioned_list/scrollable_positioned_list.dart';
 
 import '../../shared/community/relay_information_provider.dart';
+import '../../shared/identity_names/identity_names_provider.dart';
 import '../../shared/mentions/agent_identity_provider.dart';
 import '../../shared/relay/app_metadata_provider.dart';
 import '../../shared/relay/relay.dart';
@@ -15,11 +21,14 @@ import '../../shared/widgets/app_badge.dart';
 import '../../shared/widgets/avatar_image.dart';
 import '../../shared/widgets/frosted_app_bar.dart';
 import '../../shared/widgets/frosted_scaffold.dart';
+import '../../shared/widgets/ios_glass_navigation_button.dart';
 import '../../shared/widgets/keyboard_dismiss_on_drag.dart';
 import '../../shared/widgets/message_author_meta.dart';
 import '../../shared/profile/user_cache_provider.dart';
 import '../../shared/profile/user_profile.dart';
 import 'android_ime_lift.dart';
+import 'channel.dart';
+import 'channel_identity_names_provider.dart';
 import 'channel_link_navigation.dart';
 import 'channel_messages_provider.dart';
 import 'channel_typing_provider.dart';
@@ -29,14 +38,18 @@ import 'channels_provider.dart';
 import 'compose_bar.dart';
 import 'composer_dock_size_reporter.dart';
 import 'date_formatters.dart';
+import 'dm_channel_labels.dart';
 import 'day_divider.dart';
 import 'ime_metrics_settle_observer.dart';
 import 'initial_thread_tail_settle.dart';
 import 'laid_out_viewport.dart';
 import 'jump_to_latest_button.dart';
 import 'jump_to_latest_switcher.dart';
+import 'local_message_send_animation_provider.dart';
+import 'local_message_send_transition.dart';
 import '../profile/user_profile_sheet.dart';
 import 'message_actions.dart';
+import 'message_action_backdrop_state.dart';
 import 'message_long_press_region.dart';
 import 'message_content.dart';
 import 'reaction_row.dart';
@@ -49,20 +62,19 @@ import 'timeline_message.dart';
 
 part 'thread_detail_page/nested_thread_summary_row.dart';
 part 'thread_detail_page/message_list.dart';
+part 'thread_detail_page/head_layout.dart';
 part 'thread_detail_page/sticky_date.dart';
 part 'thread_detail_helpers.dart';
 part 'thread_detail_page/tail_alignment.dart';
 part 'thread_detail_page/thread_message.dart';
 part 'thread_detail_page/avatar.dart';
+part 'thread_detail_page/read_state.dart';
+part 'thread_detail_page/app_bar.dart';
 
 const _landingHighlightDuration = Duration(seconds: 3);
 const _landingHighlightDelay = Duration(milliseconds: 50);
 const _landingHighlightTransitionDuration = Duration(milliseconds: 300);
 const _landingHighlightOpacity = 0.12;
-
-// Keep the direct-position correction finite in case the viewport cannot
-// expose its tail (for example, continuously changing media dimensions).
-const _latestTailCorrectionLimit = 8;
 
 /// Full-screen thread detail page.
 ///
@@ -77,6 +89,10 @@ class ThreadDetailPage extends HookConsumerWidget {
   final bool isArchived;
   final String? initialMessageId;
 
+  /// Overrides the tail jump only in deterministic lazy-layout tests.
+  @visibleForTesting
+  final bool Function()? jumpThreadTailForTesting;
+
   const ThreadDetailPage({
     super.key,
     required this.threadHead,
@@ -86,6 +102,7 @@ class ThreadDetailPage extends HookConsumerWidget {
     required this.isMember,
     required this.isArchived,
     this.initialMessageId,
+    this.jumpThreadTailForTesting,
   });
 
   @override
@@ -104,6 +121,9 @@ class ThreadDetailPage extends HookConsumerWidget {
       return session.registerVisibleChannel(channelId);
     }, [channelId]);
     final sendMessage = ref.read(sendMessageProvider);
+    final localSendAnimations = ref.watch(
+      localMessageSendAnimationProvider(channelId),
+    );
     // Relay thread queries are keyed by the outermost root, even when this
     // page displays a nested branch. Query that root, then select this head's
     // direct children from the returned subtree below.
@@ -125,16 +145,17 @@ class ThreadDetailPage extends HookConsumerWidget {
         const <NostrEvent>[];
     final relaySelf = ref.watch(relaySelfProvider).value;
     final apps = ref.watch(appMetadataProvider).value ?? const {};
-    final replyMessages = repliesState.whenData((events) {
-      return formatTimeline(
-        mergeThreadEvents(events, liveChannelEvents),
-        currentPubkey: currentPubkey,
-        relaySelfPubkey: relaySelf,
-        apps: apps,
-      );
-    });
-
-    final fetchedReplies = replyMessages.value;
+    // Loading/error states can still carry replies from the last query.
+    // whenData drops that retained value during retries.
+    final replyEvents = repliesState.value;
+    final fetchedReplies = replyEvents == null
+        ? null
+        : formatTimeline(
+            mergeThreadEvents(replyEvents, liveChannelEvents),
+            currentPubkey: currentPubkey,
+            relaySelfPubkey: relaySelf,
+            apps: apps,
+          );
     final hasFetchedReplies = fetchedReplies != null;
     // A terminal query error cannot produce a more authoritative list. Keep
     // loading states provisional, but let the hydrated route snapshot drive
@@ -146,8 +167,18 @@ class ThreadDetailPage extends HookConsumerWidget {
       liveChannelEvents,
       threadHead.id,
     );
-    final allMsgs = fetchedReplies == null
-        ? allMessages
+    final allMsgs = fetchedReplies == null || !relayRepliesAvailable
+        ? _provisionalThreadMessages(
+            allMessages,
+            fetchedReplies ??
+                formatTimeline(
+                  liveChannelEvents,
+                  currentPubkey: currentPubkey,
+                  relaySelfPubkey: relaySelf,
+                  apps: apps,
+                ),
+            liveChannelEvents,
+          )
         : [
             // Only fall back to the pushed-route snapshot when neither source
             // carries the head, and no live deletion has suppressed it. That
@@ -244,15 +275,23 @@ class ThreadDetailPage extends HookConsumerWidget {
     final didJumpToInitialMessage = useRef(false);
     final initialHighlightTargetIndex = useState<int?>(null);
     final initialViewportReady = useState(false);
+    final headHeight = useState<double?>(null);
     final followsThreadTail = useRef(false);
     final userOptedOutOfTailFollow = useRef(false);
     final userDragDetachedTailFollow = useRef(false);
     final tailIntent = useMemoized(_ThreadTailIntent.new);
     final initialTailSettle = useMemoized(InitialThreadTailSettle.new);
     final isAtThreadTail = useState(true);
+    final isNavigatingToThreadTail = useState(false);
+    // Ordinary thread entry owns a tail-follow intent before lazy item
+    // positions settle. Keep Latest suppressed through those initial layout
+    // frames; a deep-link entry must expose it for its older target instead.
+    final hidesLatestForInitialTailSettle = useState(initialMessageId == null);
+    final hidesLatestForComposerTailCorrection = useState(false);
     final tailCorrectionInProgress = useRef(false);
     final tailCorrectionGeneration = useRef(0);
     final activeThreadScrollPosition = useRef<ScrollPosition?>(null);
+    final composerHasFocus = useListenable(composerFocusNode).hasFocus;
     final viewportHeight = useListenable(listViewport.height).value;
     final previousViewportHeight = useRef(viewportHeight);
     final settledImeLift = usesFixedAndroidImeViewport
@@ -267,9 +306,9 @@ class ThreadDetailPage extends HookConsumerWidget {
             ? settledImeLift
             : 0);
     final navigationBottomInset = composerDockHeight.value + settledImeLift;
-    // Keep the route snapshot usable while the relay query is pending. Once
-    // authoritative replies arrive, suppress only the frame(s) used to place
-    // the hydrated target, then reveal the settled viewport.
+    // Keep the route snapshot usable during loading. While the hydrated list
+    // settles, the message-list view keeps the original message visible and
+    // reveals the positioned list in one frame, for empty and populated threads.
     final threadViewportVisible =
         !relayRepliesAvailable || initialViewportReady.value;
 
@@ -319,51 +358,34 @@ class ThreadDetailPage extends HookConsumerWidget {
       final trailingBoundary =
           1 - ((Grid.xs + timelineBottomInset) / viewportHeight) + 0.001;
       final lastMessageIndex = _threadTailIndex(replies.length);
-      return itemPositionsListener.itemPositions.value.any(
-        (position) =>
-            position.index == lastMessageIndex &&
-            position.itemTrailingEdge <= trailingBoundary,
-      );
-    }
-
-    Widget trackActiveScrollPosition(Widget child) {
-      return Builder(
-        builder: (itemContext) {
-          activeThreadScrollPosition.value = Scrollable.of(
-            itemContext,
-          ).position;
-          return child;
-        },
-      );
-    }
-
-    bool jumpActiveScrollPositionToTail() {
-      final position = activeThreadScrollPosition.value;
-      if (position == null || !position.hasContentDimensions) return false;
-      // Move the one active viewport to its exact end. Unlike indexed
-      // jumpTo/scrollTo, this does not reset or cross-fade through a second
-      // list, so iOS never exposes the intermediate top-of-thread frame.
-      position.jumpTo(position.maxScrollExtent);
-      return true;
-    }
-
-    Future<bool> animateActiveScrollPositionToTail() async {
-      final position = activeThreadScrollPosition.value;
-      if (position == null || !position.hasContentDimensions) return false;
-      if (MediaQuery.disableAnimationsOf(context)) {
-        position.jumpTo(position.maxScrollExtent);
-        return true;
+      var tailItemIsLaidOut = false;
+      var tailItemIsVisible = false;
+      for (final item in itemPositionsListener.itemPositions.value) {
+        if (item.index != lastMessageIndex) continue;
+        tailItemIsLaidOut = true;
+        tailItemIsVisible = item.itemTrailingEdge <= trailingBoundary;
+        break;
       }
-      // Match the channel's visible Latest glide while moving only the active
-      // thread viewport. The indexed-list animation path can create a temporary
-      // second list for distant targets, which caused the old top-frame bounce.
-      await position.animateTo(
-        position.maxScrollExtent,
-        duration: jumpToLatestScrollDuration,
-        curve: jumpToLatestScrollCurve,
+      final position = activeThreadScrollPosition.value;
+      return threadTailIsAtEffectiveEnd(
+        tailIsLaidOut: tailItemIsLaidOut,
+        tailIsVisible: tailItemIsVisible,
+        extentAfter: position != null && position.hasContentDimensions
+            ? position.extentAfter
+            : null,
       );
-      return true;
     }
+
+    Widget trackActiveScrollPosition(Widget child) =>
+        _trackActiveThreadScrollPosition(child, activeThreadScrollPosition);
+
+    bool jumpActiveScrollPositionToTail() => _jumpActiveThreadScrollToTail(
+      activeThreadScrollPosition,
+      jumpThreadTailForTesting,
+    );
+
+    Future<bool> animateActiveScrollPositionToTail() =>
+        _animateActiveThreadScrollToTail(context, activeThreadScrollPosition);
 
     void finishThreadTailCorrection({
       required bool revealViewport,
@@ -378,13 +400,14 @@ class ThreadDetailPage extends HookConsumerWidget {
           tailIntent.isDragging ||
           userOptedOutOfTailFollow.value) {
         tailCorrectionInProgress.value = false;
+        hidesLatestForComposerTailCorrection.value = false;
+        isNavigatingToThreadTail.value = false;
         isAtThreadTail.value = threadTailIsVisible();
         return;
       }
       final reachedTail = threadTailIsVisible();
       // Lazy children can revise maxScrollExtent for several frames. Keep
       // moving the same active position until the measured tail is visible;
-      // the cap only guards pathological layouts that never stabilize.
       if (!reachedTail && corrections < _latestTailCorrectionLimit) {
         jumpActiveScrollPositionToTail();
         WidgetsBinding.instance.addPostFrameCallback(
@@ -398,6 +421,8 @@ class ThreadDetailPage extends HookConsumerWidget {
         return;
       }
       tailCorrectionInProgress.value = false;
+      hidesLatestForComposerTailCorrection.value = false;
+      isNavigatingToThreadTail.value = false;
       if (revealViewport) initialViewportReady.value = true;
       isAtThreadTail.value = reachedTail;
     }
@@ -418,6 +443,7 @@ class ThreadDetailPage extends HookConsumerWidget {
 
     void followThreadTailFromComposer() {
       if (userDragDetachedTailFollow.value) return;
+      hidesLatestForComposerTailCorrection.value = true;
       initialTailSettle.abandon();
       initialViewportReady.value = true;
       tailIntent.endDrag();
@@ -426,8 +452,19 @@ class ThreadDetailPage extends HookConsumerWidget {
       followsThreadTail.value = true;
       final reachedTail = threadTailIsVisible();
       isAtThreadTail.value = reachedTail;
-      if (!reachedTail) correctThreadTailInstantly();
+      if (reachedTail) {
+        hidesLatestForComposerTailCorrection.value = false;
+      } else {
+        correctThreadTailInstantly();
+      }
     }
+
+    useEffect(() {
+      if (!composerHasFocus) {
+        hidesLatestForComposerTailCorrection.value = false;
+      }
+      return null;
+    }, [composerHasFocus]);
 
     useEffect(
       () {
@@ -477,6 +514,7 @@ class ThreadDetailPage extends HookConsumerWidget {
       userOptedOutOfTailFollow.value = false;
       userDragDetachedTailFollow.value = false;
       followsThreadTail.value = true;
+      isNavigatingToThreadTail.value = true;
       tailCorrectionInProgress.value = true;
       final generation = ++tailCorrectionGeneration.value;
 
@@ -484,6 +522,7 @@ class ThreadDetailPage extends HookConsumerWidget {
         if (!await animateActiveScrollPositionToTail()) {
           if (generation == tailCorrectionGeneration.value) {
             tailCorrectionInProgress.value = false;
+            isNavigatingToThreadTail.value = false;
           }
           return;
         }
@@ -503,7 +542,11 @@ class ThreadDetailPage extends HookConsumerWidget {
         // error before consuming the one-shot jump. During loading, the fallback
         // main-timeline list can contain only the linked reply; after an error,
         // that hydrated snapshot is the best available target list.
-        if (messageId == null || !canUseMessagesForInitialTarget) return null;
+        if (messageId == null ||
+            !canUseMessagesForInitialTarget ||
+            headHeight.value == null) {
+          return null;
+        }
         final chronologicalIndex = replies.indexWhere(
           (reply) => reply.id == messageId,
         );
@@ -543,6 +586,7 @@ class ThreadDetailPage extends HookConsumerWidget {
       },
       [
         initialMessageId,
+        headHeight.value,
         canUseMessagesForInitialTarget,
         fetchedReplies,
         replies.length,
@@ -596,7 +640,11 @@ class ThreadDetailPage extends HookConsumerWidget {
       viewportHeight,
     );
     useEffect(() {
-      if (!hasFetchedReplies || viewportHeight <= 0) return null;
+      if (!hasFetchedReplies ||
+          viewportHeight <= 0 ||
+          headHeight.value == null) {
+        return null;
+      }
       if (initialMessageId != null) {
         initialTailSettle.abandon();
         previousReplyCount.value = replies.length;
@@ -668,23 +716,8 @@ class ThreadDetailPage extends HookConsumerWidget {
         action: correctThreadTailInstantly,
       );
       return null;
-    }, [hasFetchedReplies, replies.length, settleGeometry]);
-    final readState = ref.watch(readStateProvider);
-    final visibleReplyReadKey = replies
-        .map((reply) => '${reply.id}:${reply.createdAt}')
-        .join(',');
-
-    useEffect(() {
-      if (!readState.isReady || replies.isEmpty) return null;
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        for (final reply in replies) {
-          ref
-              .read(readStateProvider.notifier)
-              .markContextRead(msgContextKey(reply.id), reply.createdAt);
-        }
-      });
-      return null;
-    }, [threadHead.id, readState.isReady, visibleReplyReadKey]);
+    }, [hasFetchedReplies, replies.length, settleGeometry, headHeight.value]);
+    _useThreadReplyReadState(ref, threadHead.id, replies);
 
     // Thread-scoped typing indicators (exclude self).
     final allTyping = ref.watch(channelTypingProvider(channelId));
@@ -812,10 +845,7 @@ class ThreadDetailPage extends HookConsumerWidget {
 
     return FrostedScaffold(
       resizeToAvoidBottomInset: !usesFixedAndroidImeViewport,
-      appBar: const FrostedAppBar(
-        title: Text('Thread'),
-        titleStyle: channelTitleTextStyle,
-      ),
+      appBar: _threadAppBar(context, ref, channel, currentPubkey),
       body: Stack(
         fit: StackFit.expand,
         children: [
@@ -823,11 +853,18 @@ class ThreadDetailPage extends HookConsumerWidget {
             children: [
               Expanded(
                 child: _ThreadMessageList(
+                  headHeight: headHeight.value ?? 0,
+                  onHeadHeightChanged: (height) {
+                    if (context.mounted) headHeight.value = height;
+                  },
                   viewport: listViewport,
                   onUserScrollStart: () {
+                    hidesLatestForInitialTailSettle.value = false;
+                    hidesLatestForComposerTailCorrection.value = false;
                     initialTailSettle.abandon();
                     initialViewportReady.value = true;
                     tailCorrectionInProgress.value = false;
+                    isNavigatingToThreadTail.value = false;
                     tailIntent.beginDrag();
                     userOptedOutOfTailFollow.value = true;
                     userDragDetachedTailFollow.value = true;
@@ -859,6 +896,10 @@ class ThreadDetailPage extends HookConsumerWidget {
                   itemPositionsListener: itemPositionsListener,
                   bottomInset: timelineBottomInset,
                   replies: replies,
+                  relayReplyState: relayReplyState,
+                  onRetryReplies: () =>
+                      ref.invalidate(threadRepliesProvider(repliesArgs)),
+                  localSendAnimations: localSendAnimations,
                   trackActiveScrollPosition: trackActiveScrollPosition,
                   headIsDeleted: liveDeletionHidesHead,
                   head: liveHead,
@@ -877,7 +918,11 @@ class ThreadDetailPage extends HookConsumerWidget {
                 ),
               ),
               if (!isMember || isArchived)
-                _ThreadTypingIndicator(entries: threadTyping, animated: false),
+                _ThreadTypingIndicator(
+                  channelId: channelId,
+                  entries: threadTyping,
+                  animated: false,
+                ),
             ],
           ),
           if (threadViewportVisible)
@@ -900,7 +945,10 @@ class ThreadDetailPage extends HookConsumerWidget {
                   child: Column(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      _ThreadTypingIndicator(entries: threadTyping),
+                      _ThreadTypingIndicator(
+                        channelId: channelId,
+                        entries: threadTyping,
+                      ),
                       ComposeBar(
                         channelId: channelId,
                         focusNode: composerFocusNode,
@@ -940,6 +988,10 @@ class ThreadDetailPage extends HookConsumerWidget {
                 visible:
                     threadViewportVisible &&
                     hasFetchedReplies &&
+                    !isNavigatingToThreadTail.value &&
+                    !hidesLatestForInitialTailSettle.value &&
+                    !hidesLatestForComposerTailCorrection.value &&
+                    !(composerHasFocus && !userDragDetachedTailFollow.value) &&
                     !isAtThreadTail.value,
                 onPressed: scrollToThreadLatest,
               ),

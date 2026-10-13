@@ -29,6 +29,7 @@ import { isGitHubCloneUrl } from "@/features/projects/lib/projectGitError";
 import type { GithubIssueListState } from "@/features/projects/lib/projectGithubIssues";
 import { selectedGithubIssueAfterListLoad } from "@/features/projects/lib/projectGithubIssueWrites";
 import { issueShareLink } from "@/features/projects/lib/projectShareLinks";
+import { selectionItemFromTask } from "@/features/projects/lib/projectSelection";
 import { relativeTime } from "@/features/projects/lib/projectsViewHelpers";
 import {
   projectTaskCategoryLabel,
@@ -534,35 +535,40 @@ export function ProjectIssuesPanel({
       </div>
     );
   } else {
-    body = (
-      <>
-        {groups.map(({ items, status }) => {
-          const visual = issueStatusVisual(status);
-          return (
-            <ProjectWorkItemGroup
-              count={items.length}
-              icon={
-                <ProjectStatusProgressIcon
-                  className={`h-4 w-4 ${visual.className}`}
-                  state={visual.progress}
-                />
-              }
-              key={status}
-              label={status}
-            >
-              {items.map((issue) => (
-                <IssueRow
-                  issue={issue}
-                  key={issue.id}
-                  onOpen={() => onSelectedIssueIdChange(issue.id)}
-                  profiles={profiles}
-                />
-              ))}
-            </ProjectWorkItemGroup>
-          );
-        })}
-      </>
-    );
+    body = groups.map(({ items, status }) => {
+      const visual = issueStatusVisual(status);
+      return (
+        <ProjectWorkItemGroup
+          count={items.length}
+          icon={
+            <ProjectStatusProgressIcon
+              className={`h-4 w-4 ${visual.className}`}
+              state={visual.progress}
+            />
+          }
+          key={status}
+          label={status}
+          items={items.map((issue) =>
+            selectionItemFromTask({
+              author: issue.author,
+              channelId: project.channelId,
+              id: issue.id,
+              shareLink: issueShareLink(issue),
+              title: issue.title,
+            }),
+          )}
+        >
+          {items.map((issue) => (
+            <IssueRow
+              issue={issue}
+              key={issue.id}
+              onOpen={() => onSelectedIssueIdChange(issue.id)}
+              profiles={profiles}
+            />
+          ))}
+        </ProjectWorkItemGroup>
+      );
+    });
   }
 
   return (

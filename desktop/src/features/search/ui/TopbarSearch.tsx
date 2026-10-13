@@ -1,9 +1,9 @@
 import { Search } from "lucide-react";
 import * as React from "react";
-
-import { useAppsQuery } from "@/features/apps/hooks/useAppsQuery";
-import { useRelaySelfQuery } from "@/features/moderation/hooks";
+import { resolveUserLabel } from "@/features/profile/lib/identity";
 import { getMinimumSearchQueryLength } from "@/features/search/hooks";
+import { parseSearchOperators } from "@/features/search/lib/parseSearchOperators";
+import { buildSearchResultPreview } from "@/features/search/lib/searchMatch";
 import { useSearchResults } from "@/features/search/useSearchResults";
 import {
   resultIcon,
@@ -12,23 +12,23 @@ import {
   type SearchResult,
 } from "@/features/search/ui/SearchResultItem";
 import {
-  formatRelativeTime,
-  MessageSearchResultRow,
-} from "@/features/search/ui/MessageSearchResultRow";
-import {
   CurrentChannelSearchAction,
   getChannelScopeLabel,
   SearchDialogInputRow,
 } from "@/features/search/ui/SearchScopeControls";
+import { HighlightedSearchText } from "@/features/search/ui/HighlightedSearchText";
 import { useSearchMenuKeyboardNavigation } from "@/features/search/ui/useSearchMenuKeyboardNavigation";
 import type { Channel, SearchHit, UserSearchResult } from "@/shared/api/types";
 import { cn } from "@/shared/lib/cn";
-import { normalizePubkey, truncatePubkey } from "@/shared/lib/pubkey";
+import { normalizePubkey, truncateNpub } from "@/shared/lib/pubkey";
 import { Dialog, DialogContent, DialogTitle } from "@/shared/ui/dialog";
 import { useDeferredModalOpen } from "@/shared/ui/deferredModalOpen";
+import {
+  MENTION_CHIP_BASE_CLASSES,
+  MESSAGE_MARKDOWN_CLASS,
+} from "@/shared/ui/mentionChip";
 import { Skeleton } from "@/shared/ui/skeleton";
 import { UserAvatar } from "@/shared/ui/UserAvatar";
-
 type TopbarSearchProps = {
   channelLabels?: Record<string, string>;
   channels: Channel[];
@@ -37,7 +37,7 @@ type TopbarSearchProps = {
   currentChannelId?: string | null;
   focusRequest?: number;
   onOpenChannel: (channelId: string) => void;
-  onOpenResult: (hit: SearchHit) => void;
+  onOpenResult: (hit: SearchHit, query: string) => void;
   onOpenUser?: (user: UserSearchResult) => void | Promise<void>;
   onBrowseChannels?: () => void | Promise<void>;
   onCreateAgent?: () => void | Promise<void>;
@@ -46,7 +46,6 @@ type TopbarSearchProps = {
   scopeFocusRequest?: number;
   variant?: "bar" | "icon";
 };
-
 const MAX_SEARCH_SUGGESTIONS = 4;
 const SEARCH_RESULT_LIMIT = 40;
 const SEARCH_SECTION_TITLE_CLASS =
@@ -59,14 +58,39 @@ const SEARCH_RESULT_SECTION_ORDER = [
   "messages",
   "actions",
 ] as const;
-
 type SearchResultSectionKey = (typeof SEARCH_RESULT_SECTION_ORDER)[number];
-
 type SearchResultSection = {
   key: SearchResultSectionKey;
   results: SearchResult[];
   title: string;
 };
+type SearchHitContextLabel = {
+  channelLabel: string | null;
+  text: string;
+};
+function formatRelativeTime(unixSeconds: number) {
+  const diff = Math.floor(Date.now() / 1_000) - unixSeconds;
+  if (diff < 60) {
+    return "just now";
+  }
+
+  if (diff < 60 * 60) {
+    return `${Math.floor(diff / 60)}m ago`;
+  }
+
+  if (diff < 60 * 60 * 24) {
+    return `${Math.floor(diff / (60 * 60))}h ago`;
+  }
+
+  if (diff < 60 * 60 * 24 * 7) {
+    return `${Math.floor(diff / (60 * 60 * 24))}d ago`;
+  }
+
+  return new Intl.DateTimeFormat("en-US", {
+    month: "short",
+    day: "numeric",
+  }).format(new Date(unixSeconds * 1_000));
+}
 
 function getChannelActivityTime(channel: Channel) {
   if (!channel.lastMessageAt) {
@@ -110,7 +134,7 @@ function getUserDisplayName(user: UserSearchResult) {
   return (
     user.displayName?.trim() ||
     user.nip05Handle?.trim() ||
-    truncatePubkey(user.pubkey)
+    truncateNpub(user.pubkey)
   );
 }
 
@@ -123,6 +147,56 @@ function getUserSecondaryLabel(user: UserSearchResult) {
   }
 
   return null;
+}
+
+function getSearchHitChannelName(
+  hit: SearchHit,
+  channelLookup: ReadonlyMap<string, Channel>,
+  channelLabels?: Record<string, string>,
+) {
+  const channel = hit.channelId ? channelLookup.get(hit.channelId) : null;
+  const channelName =
+    (hit.channelId ? channelLabels?.[hit.channelId]?.trim() : null) ||
+    hit.channelName?.trim() ||
+    channel?.name.trim() ||
+    null;
+
+  if (!channelName) {
+    return null;
+  }
+
+  return channelName;
+}
+
+function getSearchHitContextLabel(
+  hit: SearchHit,
+  channelLookup: ReadonlyMap<string, Channel>,
+  channelLabels?: Record<string, string>,
+): SearchHitContextLabel {
+  const channel = hit.channelId ? channelLookup.get(hit.channelId) : null;
+  const channelName = getSearchHitChannelName(
+    hit,
+    channelLookup,
+    channelLabels,
+  );
+
+  if (channel?.channelType === "dm") {
+    return {
+      channelLabel: null,
+      text: "Direct message",
+    };
+  }
+
+  const isThread = hit.kind === 45003 || Boolean(hit.threadRootId);
+
+  return {
+    channelLabel: channelName,
+    text: channelName
+      ? `${isThread ? "Thread" : "Message"} in`
+      : isThread
+        ? "Thread"
+        : "Message",
+  };
 }
 
 function getResultSectionKey(result: SearchResult): SearchResultSectionKey {
@@ -156,6 +230,30 @@ function getSectionTitle(sectionKey: SearchResultSectionKey) {
     case "actions":
       return "Actions";
   }
+}
+
+function SearchHitContextLine({ label }: { label: SearchHitContextLabel }) {
+  return (
+    <span
+      className={cn(
+        MESSAGE_MARKDOWN_CLASS,
+        "mt-0 flex min-w-0 items-center gap-1.5 text-2xs font-medium leading-3 text-muted-foreground/80",
+      )}
+    >
+      <span className="shrink-0">{label.text}</span>
+      {label.channelLabel ? (
+        <span
+          className={cn(
+            MENTION_CHIP_BASE_CLASSES,
+            "search-channel-chip min-w-0 max-w-full overflow-hidden",
+          )}
+          data-channel-link=""
+        >
+          <span className="truncate">#{label.channelLabel}</span>
+        </span>
+      ) : null}
+    </span>
+  );
 }
 
 function groupSearchResults(results: SearchResult[]): SearchResultSection[] {
@@ -292,8 +390,6 @@ export function TopbarSearch({
   suggestionChannels,
   variant = "bar",
 }: TopbarSearchProps) {
-  const apps = useAppsQuery().data;
-  const relaySelfPubkey = useRelaySelfQuery().data;
   const [isOpen, setIsOpen] = React.useState(false);
   const [scopeChannelId, setScopeChannelId] = React.useState<string | null>(
     null,
@@ -322,6 +418,10 @@ export function TopbarSearch({
     scopeChannelId,
   });
   const trimmedQuery = query.trim();
+  // Bind highlights to the debounced result source so stale results can never
+  // pair with newly typed text during the debounce window.
+  const resultQuery = parseSearchOperators(debouncedQuery).text;
+  const resultsAreCurrent = debouncedQuery === trimmedQuery;
   const isIconVariant = variant === "icon";
   const currentChannel = currentChannelId
     ? (channelLookup.get(currentChannelId) ?? null)
@@ -390,9 +490,10 @@ export function TopbarSearch({
       ),
     [currentPubkeyNormalized, results],
   );
+  const visibleSearchableResults = resultsAreCurrent ? searchableResults : [];
   const searchResultSections = React.useMemo(
-    () => groupSearchResults(searchableResults),
-    [searchableResults],
+    () => groupSearchResults(visibleSearchableResults),
+    [visibleSearchableResults],
   );
   const groupedSearchResults = React.useMemo(
     () => searchResultSections.flatMap((section) => section.results),
@@ -402,8 +503,11 @@ export function TopbarSearch({
     ? scopeChannel
       ? []
       : suggestionResults
-    : groupedSearchResults;
+    : resultsAreCurrent
+      ? groupedSearchResults
+      : [];
   const isSearchLoading =
+    (!isShowingSuggestions && !resultsAreCurrent) ||
     isWaitingOnFromResolution ||
     searchQuery.isLoading ||
     fuzzyUserCandidatesQuery.isLoading ||
@@ -467,7 +571,7 @@ export function TopbarSearch({
         return;
       }
 
-      onOpenResult(result.hit);
+      onOpenResult(result.hit, resultQuery);
     },
     [
       onBrowseChannels,
@@ -478,6 +582,7 @@ export function TopbarSearch({
       onOpenUser,
       openAfterExit,
       setQuery,
+      resultQuery,
     ],
   );
 
@@ -549,54 +654,55 @@ export function TopbarSearch({
 
   const renderSearchResultRow = (result: SearchResult, index: number) => {
     const menuIndex = index + (hasScopeAction ? 1 : 0);
-    if (result.kind === "message") {
-      return (
-        <MessageSearchResultRow
-          apps={apps}
-          channelLabels={channelLabels}
-          channelLookup={channelLookup}
-          currentPubkey={currentPubkey}
-          hit={result.hit}
-          key={resultKey(result)}
-          menuIndex={menuIndex}
-          onClick={() => openResult(result)}
-          onMouseEnter={() => setSelectedMenuIndex(menuIndex)}
-          relaySelfPubkey={relaySelfPubkey}
-          resultProfiles={resultProfiles}
-          selected={menuIndex === selectedMenuIndex}
-        />
-      );
-    }
     const channelDisplayName =
       result.kind === "channel"
         ? getChannelDisplayName(result.channel, channelLabels)
         : null;
     const userDisplayName =
       result.kind === "user" ? getUserDisplayName(result.user) : null;
+    const messageAuthorLabel =
+      result.kind === "message"
+        ? resolveUserLabel({
+            currentPubkey,
+            profiles: resultProfiles,
+            pubkey: result.hit.pubkey,
+            preferResolvedSelfLabel: true,
+          })
+        : null;
+    const messageContextLabel =
+      result.kind === "message"
+        ? getSearchHitContextLabel(result.hit, channelLookup, channelLabels)
+        : null;
     const title =
       result.kind === "channel"
         ? channelDisplayName
         : result.kind === "action"
           ? result.action.title
-          : userDisplayName;
+          : result.kind === "user"
+            ? userDisplayName
+            : messageAuthorLabel;
     const preview =
       result.kind === "channel"
         ? getChannelPreview(result.channel)
         : result.kind === "action"
           ? result.action.description
-          : getUserSecondaryLabel(result.user);
+          : result.kind === "user"
+            ? getUserSecondaryLabel(result.user)
+            : buildSearchResultPreview(result.hit.content, resultQuery);
     const trailingLabel =
       result.kind === "channel"
         ? getChannelSuggestionMeta(result.channel)
-        : null;
+        : result.kind === "message"
+          ? formatRelativeTime(result.hit.createdAt)
+          : null;
 
     return (
       <button
         aria-selected={menuIndex === selectedMenuIndex}
         className={cn(
           "search-result-row flex w-full gap-3 rounded-lg px-2.5 text-left transition-colors",
-          "items-center",
-          "py-2.5",
+          result.kind === "message" ? "items-start" : "items-center",
+          result.kind === "message" ? "py-3.5" : "py-2.5",
           menuIndex === selectedMenuIndex
             ? "bg-muted/45 text-foreground"
             : "hover:bg-muted/35",
@@ -609,11 +715,33 @@ export function TopbarSearch({
         data-testid={resultTestId(result)}
         data-search-result-index={menuIndex}
       >
-        {result.kind === "user" ? (
+        {result.kind === "message" ? (
+          <UserAvatar
+            avatarUrl={
+              resultProfiles?.[result.hit.pubkey.toLowerCase()]?.avatarUrl ??
+              null
+            }
+            className="h-8 w-8"
+            displayName={resolveUserLabel({
+              currentPubkey,
+              profiles: resultProfiles,
+              pubkey: result.hit.pubkey,
+              preferResolvedSelfLabel: true,
+            })}
+            shape={
+              resultProfiles?.[result.hit.pubkey.toLowerCase()]?.isAgent ===
+              true
+                ? "squircle"
+                : "circle"
+            }
+            size="md"
+          />
+        ) : result.kind === "user" ? (
           <UserAvatar
             avatarUrl={result.user.avatarUrl}
             className="h-7 w-7"
             displayName={userDisplayName ?? result.user.pubkey}
+            shape={result.user.isAgent ? "squircle" : "circle"}
             size="sm"
           />
         ) : (
@@ -624,18 +752,41 @@ export function TopbarSearch({
           </span>
         )}
         <span className="min-w-0 flex-1">
-          <span className="block space-y-0.5">
-            <span className="block truncate text-sm font-semibold">
-              {title}
-            </span>
-            {preview ? (
-              <span className="block truncate text-xs text-muted-foreground">
-                {preview}
+          {result.kind === "message" ? (
+            <span className="grid w-full min-w-0 grid-cols-[minmax(0,1fr)_auto] gap-x-3">
+              <span className="col-start-1 row-start-1 min-w-0 truncate text-sm font-semibold leading-4 text-foreground">
+                {title}
               </span>
-            ) : null}
-          </span>
+              {trailingLabel ? (
+                <span className="col-start-2 row-start-1 flex shrink-0 items-center justify-self-end text-xs font-medium leading-4 text-muted-foreground/70">
+                  {trailingLabel}
+                </span>
+              ) : null}
+              {messageContextLabel ? (
+                <span className="col-start-1 min-w-0">
+                  <SearchHitContextLine label={messageContextLabel} />
+                </span>
+              ) : null}
+              {preview ? (
+                <span className="col-start-1 mt-1.5 block min-w-0 truncate text-sm leading-5 text-muted-foreground">
+                  <HighlightedSearchText query={resultQuery} text={preview} />
+                </span>
+              ) : null}
+            </span>
+          ) : (
+            <span className="block space-y-0.5">
+              <span className="block truncate text-sm font-semibold">
+                {title}
+              </span>
+              {preview ? (
+                <span className="block truncate text-xs text-muted-foreground">
+                  {preview}
+                </span>
+              ) : null}
+            </span>
+          )}
         </span>
-        {trailingLabel ? (
+        {result.kind !== "message" && trailingLabel ? (
           <span className="shrink-0 text-2xs text-muted-foreground/75">
             {trailingLabel}
           </span>
@@ -720,12 +871,13 @@ export function TopbarSearch({
         </div>
       </div>
     )
-  ) : isSearchLoading && searchableResults.length === 0 ? (
+  ) : isSearchLoading && visibleSearchableResults.length === 0 ? (
     <div className="max-h-[min(60vh,32rem)] overflow-y-auto">
       {currentChannelSearchAction}
       <SearchResultsSkeleton />
     </div>
-  ) : searchQuery.error instanceof Error && searchableResults.length === 0 ? (
+  ) : searchQuery.error instanceof Error &&
+    visibleSearchableResults.length === 0 ? (
     <div className="max-h-[min(60vh,32rem)] overflow-y-auto">
       {currentChannelSearchAction}
       <p
@@ -737,7 +889,7 @@ export function TopbarSearch({
         {searchQuery.error.message}
       </p>
     </div>
-  ) : searchableResults.length === 0 ? (
+  ) : visibleSearchableResults.length === 0 ? (
     <div className="max-h-[min(60vh,32rem)] overflow-y-auto">
       {currentChannelSearchAction}
       <p
@@ -811,7 +963,7 @@ export function TopbarSearch({
           )}
         </button>
         <DialogContent
-          aria-busy={isSearchLoading && searchableResults.length === 0}
+          aria-busy={isSearchLoading && visibleSearchableResults.length === 0}
           className="mt-[18vh] max-w-2xl self-start gap-0 overflow-hidden rounded-2xl p-0 shadow-2xl"
           data-testid="search-results"
           onOpenAutoFocus={(event) => {

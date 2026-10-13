@@ -2,17 +2,16 @@
 mod app_menu;
 mod app_state;
 mod archive;
+mod build_identity;
 mod builderlab;
+mod channel_head_cache;
 mod commands;
-/// Re-export of the include!'d handler. Tauri command macros are crate-root
-/// `#[macro_export]`, so `desktop_invoke_handler` must expand in `lib.rs`.
-mod invoke {
-    pub(crate) use super::desktop_invoke_handler;
-}
 mod deep_link;
 mod egress_guard;
 mod event_sync;
 mod events;
+#[cfg_attr(not(test), allow(dead_code))]
+mod hpke_key_backup;
 mod huddle;
 mod identity_storage;
 mod initial_window;
@@ -37,6 +36,7 @@ mod native_websocket_batch;
 mod nostr_bind;
 pub mod nostr_convert;
 mod observed_unread;
+mod observer_admission;
 mod persona_catalog;
 mod prevent_sleep;
 mod ptt_shortcut;
@@ -45,6 +45,7 @@ mod relay_admission;
 mod reset;
 mod secret_store;
 mod shutdown;
+mod team_catalog;
 mod templates;
 mod terminal_runtime;
 #[cfg_attr(not(test), allow(dead_code))]
@@ -97,14 +98,9 @@ use tauri::{Emitter, Manager, RunEvent, WindowEvent};
 use tauri_plugin_window_state::StateFlags;
 #[cfg(target_os = "macos")]
 use tray_menu::show_main_window;
-include!("invoke.rs"); // crate-root expansion so `generate_handler!` resolves command macros
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // mesh-llm's async chains (model download, node start/join) overflow
-    // tokio's default 2 MiB worker stacks — a stack-guard SIGABRT, not a
-    // panic. Upstream mesh-llm and mesh-console both run on 8 MiB worker
-    // stacks for this reason; give Tauri's command runtime the same headroom
-    // before anything else touches tauri::async_runtime.
+    // mesh-llm async chains overflow tokio's default 2 MiB stacks; run on 8 MiB like upstream.
     #[cfg(feature = "mesh-llm")]
     match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -135,7 +131,7 @@ pub fn run() {
             }
             // Forward any deep link URLs from the duplicate launch.
             for arg in &argv {
-                if arg.starts_with("buzz://") {
+                if crate::build_identity::is_deep_link_for_build(arg) {
                     handle_deep_link_url(app, arg);
                 }
             }
@@ -240,6 +236,7 @@ pub fn run() {
         .manage(archive::sync::ArchiveSyncState::default())
         .manage(native_relay_client::NativeRelayClient::default())
         .manage(observed_unread::ObservedUnreadStore::default())
+        .manage(channel_head_cache::ChannelHeadCacheStore::default())
         .setup(move |app| {
             let app_handle = app.handle().clone();
             #[cfg(target_os = "macos")]
@@ -247,6 +244,10 @@ pub fn run() {
                 tray_menu::init(&app_handle)?;
                 macos_notifications::init(&app_handle)?;
             }
+
+            // Initialise the no-redirect admin HTTP client singleton before any
+            // admin command can be invoked. Must run before setup completes.
+            commands::admin::client::init_admin_client()?;
 
             // ── Phase 2: boot-time sentinel wipe ──────────────────────────────
             // Must run before migrations and identity resolution so the wipe
@@ -299,13 +300,12 @@ pub fn run() {
             // present), all owner-keyed side effects (event sync, agent restore,
             // relay publish) are skipped. The frontend shows a recovery screen;
             // the user must relaunch after restoring the identity.
-            let identity_lost = state
+            let recovery_mode = state
                 .identity_lost
-                .load(std::sync::atomic::Ordering::Acquire);
-            let keyring_locked = state
-                .keyring_locked
-                .load(std::sync::atomic::Ordering::Acquire);
-            let recovery_mode = identity_lost || keyring_locked;
+                .load(std::sync::atomic::Ordering::Acquire)
+                || state
+                    .keyring_locked
+                    .load(std::sync::atomic::Ordering::Acquire);
 
             // Backfill the pinned persona snapshot for any pre-existing agent
             // that predates the record-authoritative-spawn cutover (persona_id
@@ -321,16 +321,14 @@ pub fn run() {
             // agent spawns can resolve custom/preset runtime ids without
             // waiting for the frontend's discover_acp_providers call.  This is
             // a pure directory scan — no PATH probing, no async work.
-            {
-                let custom_dir = app_handle
-                    .path()
-                    .app_data_dir()
-                    .ok()
-                    .map(|d| d.join("custom_harnesses"));
-                managed_agents::custom_harnesses::warm_harness_registry_from_dir(
-                    custom_dir.as_deref(),
-                );
-            }
+            let custom_harness_dir = app_handle
+                .path()
+                .app_data_dir()
+                .ok()
+                .map(|d| d.join("custom_harnesses"));
+            managed_agents::custom_harnesses::warm_harness_registry_from_dir(
+                custom_harness_dir.as_deref(),
+            );
 
             // Store the AppHandle so huddle commands can emit `huddle-state-changed`
             // events via `huddle::emit_huddle_state` without threading the handle
@@ -360,10 +358,7 @@ pub fn run() {
                 // Route mesh-llm's download progress (model weights, runtime)
                 // onto Tauri events so the UI can render real progress.
                 crate::mesh_llm::install_progress_sink(&app_handle);
-                let mesh_app = app_handle.clone();
-                tauri::async_runtime::spawn(async move {
-                    crate::mesh_llm::start_coordinator(mesh_app).await;
-                });
+                tauri::async_runtime::spawn(crate::mesh_llm::start_coordinator(app_handle.clone()));
             }
 
             // Start the localhost media streaming proxy. Uses the shared HTTP
@@ -386,6 +381,7 @@ pub fn run() {
             if let Err(error) = ensure_nest() {
                 eprintln!("buzz-desktop: failed to create nest: {error}");
             }
+            archive::spawn_warm_init(app_handle.clone());
 
             // Resolve the REPOS symlink from the persisted repos_dir BEFORE
             // agents are restored below, and decide whether restore is safe.
@@ -409,7 +405,10 @@ pub fn run() {
             // the now-inert ~/.sprout; the frontend dedupes the toast.
             // Suppressed when a reset completed this boot: the nest was wiped and
             // a fresh ~/.sprout-less state is exactly what we want.
-            if !reset_outcome.completed && migration::migrate_legacy_nest() {
+            if !crate::build_identity::is_demo_build()
+                && !reset_outcome.completed
+                && migration::migrate_legacy_nest()
+            {
                 let _ = app_handle.emit("legacy-nest-migrated", ());
             }
 
@@ -528,12 +527,414 @@ pub fn run() {
             }
             Ok(())
         })
-        .invoke_handler(invoke::desktop_invoke_handler())
+        .invoke_handler(tauri::generate_handler![
+            terminal_runtime::terminal_attach,
+            terminal_runtime::terminal_detach,
+            terminal_runtime::terminal_close,
+            terminal_runtime::terminal_input,
+            terminal_runtime::terminal_resize,
+            terminal_runtime::terminal_scroll,
+            terminal_runtime::terminal_ack,
+            terminal_runtime::terminal_viewport_ready,
+            terminal_runtime::terminal_focus,
+            take_pending_community_deep_link,
+            acknowledge_pending_community_deep_link,
+            take_pending_navigation_deep_link,
+            acknowledge_pending_navigation_deep_link,
+            clear_pending_navigation_deep_links,
+            take_pending_entity_deep_link,
+            acknowledge_pending_entity_deep_link,
+            start_builderlab_login,
+            cancel_builderlab_login,
+            get_builderlab_auth,
+            clear_builderlab_auth,
+            get_builderlab_nostr_identity,
+            bind_builderlab_nostr_identity,
+            delete_builderlab_nostr_identity,
+            list_builderlab_communities,
+            check_builderlab_community_name,
+            create_builderlab_community,
+            archive_builderlab_community,
+            unarchive_builderlab_community,
+            transfer_builderlab_community,
+            title_bar_double_click,
+            get_identity,
+            get_nsec,
+            generate_backup_passphrase,
+            create_ncryptsec_backup,
+            verify_ncryptsec_backup,
+            save_ncryptsec_copy,
+            import_identity,
+            persist_current_identity,
+            get_profile,
+            update_profile,
+            update_profile_at_relay,
+            get_user_profile,
+            get_users_batch,
+            get_user_notes,
+            get_git_identity,
+            get_project_repo_snapshot,
+            get_project_repo_file_content,
+            get_github_repository_state,
+            list_github_pull_requests,
+            create_github_pull_request,
+            list_github_pull_request_comments,
+            list_github_issues,
+            create_github_issue,
+            list_github_issue_comments,
+            update_github_issue_state,
+            create_github_issue_comment,
+            list_github_repo_labels,
+            add_github_issue_labels,
+            remove_github_issue_label,
+            list_github_repo_assignees,
+            add_github_issue_assignees,
+            remove_github_issue_assignee,
+            get_github_authenticated_user,
+            get_github_repository_snapshot,
+            get_github_ahead_behind,
+            get_project_repo_diff,
+            get_project_local_repo_diff,
+            get_project_local_repo_snapshot,
+            get_project_local_repo_file_content,
+            get_project_repo_sync_status,
+            list_project_local_repositories,
+            open_project_repository_folder,
+            clone_project_repository,
+            create_project_remote_branch,
+            delete_project_remote_branch,
+            push_project_local_repository,
+            pull_project_local_repository,
+            publish_project_owner_announcement,
+            sign_project_pull_request_status,
+            sign_project_pull_request_review_request,
+            sign_project_issue_assignment,
+            sign_project_issue_unassignment,
+            publish_project_pull_request_merged_status,
+            merge_project_pull_request,
+            open_project_terminal,
+            open_project_merge_recovery_terminal,
+            search_users,
+            get_presence,
+            get_os_idle_seconds,
+            get_default_relay_url,
+            auto_connect_default_relay_enabled,
+            get_legacy_workspace_storage,
+            is_shared_identity,
+            get_relay_ws_url,
+            get_relay_http_url,
+            get_media_proxy_port,
+            fetch_link_preview_metadata,
+            cancel_link_preview_metadata,
+            release_link_preview_metadata,
+            discover_acp_auth_methods,
+            discover_acp_providers,
+            discover_git_bash_prerequisite,
+            install_acp_runtime,
+            save_custom_harness,
+            delete_custom_harness,
+            connect_acp_runtime,
+            discover_managed_agent_prereqs,
+            sign_event,
+            sign_nostr_identity_binding,
+            sign_out,
+            decrypt_observer_event,
+            build_observer_control_event,
+            create_auth_event,
+            nip44_encrypt_to_self,
+            nip44_decrypt_from_self,
+            get_channels,
+            get_open_channel_directory,
+            create_channel,
+            ensure_starter_channels,
+            open_dm,
+            get_bestie_assignment,
+            assign_bestie,
+            clear_bestie_assignment,
+            resolve_bestie_conversation,
+            hide_dm,
+            get_channel_details,
+            get_channel_members,
+            update_channel,
+            set_channel_topic,
+            set_channel_purpose,
+            archive_channel,
+            unarchive_channel,
+            delete_channel,
+            add_channel_members,
+            remove_channel_member,
+            change_channel_member_role,
+            join_channel,
+            leave_channel,
+            get_canvas,
+            get_canvas_history,
+            set_canvas,
+            get_feed,
+            search_messages,
+            send_channel_message,
+            send_managed_agent_channel_message,
+            has_managed_agent_channel_message_marker,
+            get_forum_posts,
+            get_forum_thread,
+            get_thread_replies,
+            get_channel_reconnect_repair,
+            get_channel_window,
+            get_channel_messages_before,
+            edit_message,
+            delete_message,
+            add_reaction,
+            remove_reaction,
+            get_event,
+            get_events,
+            show_native_notification,
+            #[cfg(target_os = "macos")]
+            macos_notifications::take_pending_activations,
+            #[cfg(target_os = "macos")]
+            macos_notifications::notification_permission_state,
+            #[cfg(target_os = "macos")]
+            macos_notifications::request_notification_access,
+            upload_media,
+            pick_and_upload_media,
+            pick_and_upload_image,
+            upload_media_bytes,
+            upload_media_bytes_raw,
+            cancel_media_upload,
+            release_media_upload,
+            download_image,
+            save_png_data_url,
+            download_file,
+            fetch_media_bytes,
+            cancel_media_fetch,
+            release_media_fetch,
+            copy_image_to_clipboard,
+            copy_text_to_clipboard,
+            read_clipboard_text,
+            fetch_snapshot_bytes,
+            relay_requires_membership,
+            list_relay_members,
+            get_my_relay_membership,
+            add_relay_member,
+            remove_relay_member,
+            change_relay_member_role,
+            archive_identity,
+            unarchive_identity,
+            list_archived_identities,
+            get_relay_self,
+            resolve_oa_owner,
+            list_relay_agents,
+            revalidate_relay_agents,
+            list_managed_agents,
+            list_managed_agent_runtimes,
+            start_managed_agent_runtime,
+            stop_managed_agent_runtime,
+            restart_managed_agent_runtime,
+            reconcile_managed_agent_runtimes,
+            put_managed_agent_runtime_lifecycle,
+            create_managed_agent,
+            start_managed_agent,
+            stop_managed_agent,
+            set_agent_managed_profiles,
+            set_managed_agent_start_on_app_launch,
+            set_managed_agent_auto_restart,
+            delete_managed_agent,
+            get_managed_agent_log,
+            get_agent_models,
+            discover_agent_models,
+            agent_access_owner_only,
+            get_agent_config_surface,
+            get_runtime_file_config,
+            get_baked_build_env_keys,
+            get_baked_build_env,
+            put_agent_session_config,
+            get_global_agent_config,
+            set_global_agent_config,
+            mesh_start_node,
+            mesh_stop_node,
+            mesh_node_status,
+            mesh_serving_usage,
+            mesh_installed_models,
+            mesh_model_catalog,
+            update_managed_agent,
+            discover_acp_commands,
+            discover_backend_providers,
+            probe_backend_provider,
+            persona_catalog::fetch_persona_catalog,
+            team_catalog::fetch_team_catalog,
+            unread_catch_up::unread_catch_up,
+            observed_unread::observed_unread_open_scope,
+            observed_unread::observed_unread_ingest,
+            channel_head_cache::channel_head_cache_load,
+            channel_head_cache::channel_head_cache_store,
+            channel_head_cache::channel_head_cache_clear,
+            list_personas,
+            create_persona,
+            update_persona,
+            update_persona_and_publish,
+            delete_persona,
+            set_persona_active,
+            set_persona_shared,
+            reconcile_inbound_persona_event,
+            list_channel_templates,
+            create_channel_template,
+            update_channel_template,
+            delete_channel_template,
+            duplicate_channel_template,
+            list_teams,
+            create_team,
+            update_team,
+            set_team_shared,
+            add_team_from_catalog,
+            delete_team,
+            export_agent_snapshot,
+            card_mint_key_status,
+            card_mint_save_openai_key,
+            mint_agent_card,
+            save_agent_card,
+            list_agent_cards,
+            load_agent_card,
+            preview_agent_snapshot_import,
+            confirm_agent_snapshot_import,
+            encode_agent_snapshot_for_send,
+            export_team_snapshot,
+            encode_team_snapshot_for_send,
+            preview_team_snapshot_import,
+            confirm_team_snapshot_import,
+            get_channel_workflows,
+            get_channels_workflows,
+            get_workflow,
+            create_workflow,
+            update_workflow,
+            delete_workflow,
+            get_workflow_runs,
+            get_run_approvals,
+            trigger_workflow,
+            grant_approval,
+            deny_approval,
+            publish_note,
+            get_contact_list,
+            set_contact_list,
+            get_notes_timeline,
+            get_global_notes,
+            get_note,
+            get_note_reactions,
+            get_liked_notes,
+            start_huddle,
+            join_huddle,
+            leave_huddle,
+            end_huddle,
+            get_huddle_state,
+            close_huddle_companion,
+            open_huddle_window,
+            push_audio_pcm,
+            reconnect_huddle_audio,
+            start_stt_pipeline,
+            set_huddle_transcription_enabled,
+            download_voice_models,
+            get_model_status,
+            set_tts_enabled,
+            huddle::tts_settings::get_tts_settings,
+            huddle::tts_settings::list_voice_registry,
+            huddle::tts_settings::set_pocket_voice,
+            huddle::tts_settings::preview_pocket_voice,
+            huddle::tts_settings::import_pocket_voice,
+            huddle::tts_settings::delete_pocket_voice,
+            huddle::agent_voice::ensure_huddle_agent_voice_settings,
+            huddle::agent_voice::set_huddle_agent_tts_enabled,
+            huddle::agent_voice::set_huddle_agent_voice,
+            speak_agent_message,
+            interrupt_huddle_speech,
+            add_agent_to_huddle,
+            remove_agent_from_huddle,
+            huddle::agents::sync_agents_to_active_huddle,
+            check_pipeline_hotstart,
+            confirm_huddle_active,
+            perform_sidebar_default_haptic,
+            get_huddle_agent_pubkeys,
+            set_voice_input_mode,
+            get_voice_input_mode,
+            set_huddle_manual_mic_unmuted,
+            list_audio_output_devices,
+            set_audio_output_device,
+            get_audio_output_device,
+            start_pairing,
+            start_identity_recovery_pairing,
+            confirm_pairing_sas,
+            cancel_pairing,
+            apply_workspace,
+            remove_community_relay,
+            readd_community_relay,
+            set_agent_avatar_communities,
+            validate_repos_dir,
+            get_active_workspace,
+            fetch_workspace_icon,
+            fetch_join_policy,
+            set_prevent_sleep_active,
+            get_agent_memory,
+            relay_reconnect_hook,
+            relay_reconnect_hook_configured,
+            observer_archive_default_enabled,
+            agent_metric_archive_default_enabled,
+            archive::archive_events,
+            archive::create_save_subscription,
+            archive::merge_save_subscription_kinds,
+            archive::remove_save_subscription_kind,
+            archive::list_save_subscriptions,
+            archive::delete_save_subscription,
+            archive::read_archived_events,
+            archive::read_archived_observer_events_for_channel,
+            archive::index_observer_channel_id,
+            archive::read_unindexed_observer_rows,
+            archive::get_agent_usage_series,
+            archive::get_observer_retention_days,
+            archive::set_observer_retention_days,
+            archive::archive_size_stats,
+            archive::sync::announce_archive_sync_epoch,
+            archive::sync::start_archive_sync,
+            archive::sync::stop_archive_sync,
+            is_auto_update_supported,
+            set_window_vibrancy,
+            #[cfg(target_os = "macos")]
+            tray_menu::clear_tray_agent_activity,
+            #[cfg(target_os = "macos")]
+            tray_menu::requeue_tray_actions,
+            #[cfg(target_os = "macos")]
+            tray_menu::take_tray_actions,
+            #[cfg(target_os = "macos")]
+            tray_menu::update_tray_agent_activity,
+            // ── Desktop admin surface ────────────────────────────────────────
+            admin_probe,
+            admin_list_reports,
+            admin_get_report,
+            admin_list_feedback,
+            admin_get_feedback,
+            admin_fetch_feedback_attachment,
+            admin_save_attachment,
+            admin_resolve_report,
+            admin_reopen_report,
+            admin_cancel_report,
+            admin_patch_feedback,
+            admin_list_operators,
+            admin_put_operator,
+            admin_delete_operator,
+            admin_list_restrictions,
+            admin_lift_restriction,
+            admin_list_communities,
+            admin_search_members,
+            admin_get_member,
+            admin_get_event,
+            admin_connected_community_host,
+            admin_direct_action,
+            get_admin_origin,
+            set_admin_origin,
+            admin_discover_origin,
+        ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
     let shutdown_done = Arc::new(AtomicBool::new(false));
+
     #[cfg(unix)]
     shutdown::install_signal_handler(app.handle().clone(), Arc::clone(&shutdown_done));
+
     let run_shutdown_done = Arc::clone(&shutdown_done);
     let restart_requested = Arc::new(AtomicBool::new(false));
     app.run(move |app_handle, event| match event {
@@ -589,6 +990,7 @@ pub fn run() {
             if restart_requested.load(Ordering::SeqCst) {
                 relaunch_after_mesh_shutdown(app_handle);
             }
+
             // AppKit terminates through libc exit(), which runs C++ static
             // destructors. The embedded ggml/Metal runtime currently aborts in
             // that destructor phase even after its node has stopped cleanly.

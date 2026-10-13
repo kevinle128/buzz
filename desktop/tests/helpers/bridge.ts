@@ -56,6 +56,7 @@ type MockSearchProfileSeed = {
 
 type MockRelayAgentSeed = {
   pubkey: string;
+  ownerPubkey?: string | null;
   name: string;
   agentType?: string;
   capabilities?: string[];
@@ -63,7 +64,7 @@ type MockRelayAgentSeed = {
   respondToAllowlist?: string[];
   channelNames?: string[];
   channelIds?: string[];
-  status?: "online" | "away" | "offline";
+  status?: "online" | "away" | "offline" | "unknown";
 };
 
 type MockHuddleSeed = {
@@ -158,19 +159,19 @@ type MockBridgeOptions = {
   projectHeadBranch?: string;
   /** Relay NIP-11 identity used to sign authoritative repository state. */
   relaySelf?: string | null;
-  /** Signed kind 39007 events served to `useAppsQuery`. */
+  /** Signed kind 39008 events served to `useAppsQuery`. */
   appMetadataEvents?: RelayEvent[];
-  /** Community-scoped kind 39007 events keyed by relay URL. */
+  /** Community-scoped kind 39008 events keyed by relay URL. */
   appMetadataEventsByRelay?: Record<string, RelayEvent[]>;
-  /** Hex-encoded relay secret used to sign kind 39007 after kind 9038 mutations. */
+  /** Hex-encoded relay secret used to sign kind 39008 after kind 9038 mutations. */
   appRelaySecret?: string;
   /** One-time secret returned by mocked App create. */
   appCreateSecret?: string;
   /** One-time secret returned by mocked App rotate. */
   appRotateSecret?: string;
-  /** Delay EOSE for kind 39007 App metadata queries. */
+  /** Delay EOSE for kind 39008 App metadata queries. */
   appMetadataEoseDelayMs?: number;
-  /** CLOSED the kind 39007 App metadata query. */
+  /** CLOSED the kind 39008 App metadata query. */
   appMetadataQueryError?: boolean;
   /** Delay kind 9038 OK so mutation-pending UI is observable. */
   appAdminDelayMs?: number;
@@ -199,6 +200,11 @@ type MockBridgeOptions = {
     normalized_host?: string;
     archived_at?: string | null;
   }>;
+  builderlabQuota?: {
+    quota_used?: number;
+    quota_limit?: number;
+    can_create?: boolean;
+  };
   acpRuntimesCatalog?: Record<string, unknown>[];
   /** Catalog returned after a successful mocked install. */
   acpRuntimesCatalogAfterInstall?: Record<string, unknown>[];
@@ -248,6 +254,10 @@ type MockBridgeOptions = {
   };
   /** Delay an invocation-time huddle snapshot to exercise hydration ordering. */
   huddleStateReadDelayMs?: number;
+  /** Delay (ms) for `sync_agents_to_active_huddle` so e2e tests can hold the
+   * send path open across a leg that writes nothing to the relay.
+   * Releasable early via `__BUZZ_E2E_RELEASE_HUDDLE_AGENT_SYNCS__()`. */
+  syncAgentsToActiveHuddleDelayMs?: number;
   /** Delay companion creation to expose the newly-started huddle handoff state. */
   openHuddleWindowDelayMs?: number;
   /** Delay the native start result after membership arrives in the channel list. */
@@ -270,6 +280,10 @@ type MockBridgeOptions = {
   /** Outcomes for successive explicit persona share publications. */
   personaSharePublicationStatuses?: Array<"published" | "queued">;
   teams?: MockTeamSeed[];
+  /** Community team-catalog (kind:30178) heads returned by relay queries. */
+  teamCatalogEvents?: RelayEvent[];
+  /** Outcomes for successive explicit team share publications. */
+  teamSharePublicationStatuses?: Array<"published" | "queued">;
   relayAgents?: MockRelayAgentSeed[];
   /** Reject successive relay-agent directory reads, then resume. */
   relayAgentListErrors?: (string | null)[];
@@ -299,6 +313,13 @@ type MockBridgeOptions = {
   deepHistoryMessageCount?: number;
   feedReadError?: string;
   canvasReadError?: string;
+  /** Seed canvas revisions (oldest first); see e2eBridge mock config. */
+  canvasRevisions?: Array<{
+    content: string;
+    createdAt?: number;
+    eventId?: string;
+    author?: string;
+  }>;
   /** Delay (ms) for `apply_workspace`; see e2eBridge mock config. */
   applyCommunityDelayMs?: number;
   /** Reject `clear_pending_navigation_deep_links` with this message. */
@@ -316,15 +337,32 @@ type MockBridgeOptions = {
   closeChannelLiveSubscriptionOnce?: boolean;
   /** Reject successive kind-9 sends with these messages, then resume. */
   sendMessageErrors?: string[];
+  /** Test-only observer control results emitted after mock control publishes. */
+  observerControlResults?: Array<{
+    type: "cancel_turn" | "switch_model";
+    status: string;
+    channelId?: string | null;
+    requestId?: string;
+    modelId?: string;
+  }>;
   /** Reject successive managed-agent starts, then resume. */
   startManagedAgentErrors?: string[];
   /** Delay (ms) after snapshotting a thread-replies page so E2E tests can
    * deliver live reply/aux events while an older response is in flight. */
   threadRepliesDelayMs?: number;
+  /** Hold every `get_thread_replies` response until
+   * `__BUZZ_E2E_RELEASE_THREAD_REPLIES__()` is called — a manual gate the test
+   * releases explicitly, so the thread-aux backfill provably cannot land (and
+   * heal a stale head) before assertions run. See e2eBridge mock config. */
+  deferThreadReplies?: boolean;
   usersBatchDelayMs?: number;
   /** Delay (ms) for older-history fetches; see e2eBridge mock config. */
   channelWindowDelayMs?: number;
+  /** Delay (ms) for newest-page fetches; see e2eBridge mock config. */
+  channelHeadDelayMs?: number;
   profileReadDelayMs?: number;
+  /** Hold `get_profile` responses until `__BUZZ_E2E_RELEASE_PROFILE_READS__()`. */
+  deferProfileReads?: boolean;
   profileReadError?: string;
   /** Override whether get_profile reports a real kind:0 event. */
   profileHasEvent?: boolean;
@@ -469,6 +507,8 @@ type MockBridgeOptions = {
    * can exercise the "Thread deleted" label / disabled-send path.
    */
   deletedEventIds?: string[];
+  /** Reject one identity read after the configured number of successful reads. */
+  identityReadErrorAfter?: { message: string; successfulReads: number };
   /**
    * When true, `get_identity` returns `lost: true` until `persist_current_identity`
    * or `import_identity` is invoked. Drives the identity-lost recovery UX in tests.
@@ -596,6 +636,12 @@ type MockBridgeOptions = {
    * returning a catalog. Exercises the discovery-failure UI path.
    */
   discoverAgentModelsError?: string;
+  /** Delay (ms) before `discover_agent_models` settles. */
+  discoverAgentModelsDelayMs?: number;
+  /** Config surface returned for every agent instead of the per-runtime mocks. */
+  agentConfigSurface?: Record<string, unknown>;
+  /** ACP commands returned by `discover_acp_commands`. Defaults to `[]`. */
+  acpCommands?: Array<{ command: string; binaryPath: string }>;
   /**
    * Providers returned by `discover_backend_providers`. Defaults to `[]`
    * (the "Run on" section stays hidden). Setting this renders the remote

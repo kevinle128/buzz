@@ -5,15 +5,18 @@
 
 use chrono::{DateTime, Utc};
 use nostr::Event;
-use sqlx::{PgPool, Postgres, Row, Transaction};
+use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use buzz_core::app::AppStatus;
 use buzz_core::kind::KIND_APP_METADATA;
 use buzz_core::{CommunityId, StoredEvent};
 
+use buzz_datastore_tracing::datastore_span;
+
 use crate::error::{DbError, Result};
 use crate::event::insert_event_with_thread_metadata_tx;
+use crate::Db;
 
 const GET_APP: &str = "SELECT community_id, id, name, description, icon_url, status, \
      secret_hash, created_by, created_at, updated_at \
@@ -126,24 +129,46 @@ pub async fn list_apps(pool: &PgPool, community_id: CommunityId) -> Result<Vec<A
     rows.into_iter().map(row_to_app).collect()
 }
 
+impl Db {
+    /// Load one App in `community_id`, or `None` if it does not exist there.
+    #[datastore_span(name = "get_app", system = "postgresql")]
+    pub async fn get_app(
+        &self,
+        community_id: CommunityId,
+        app_id: Uuid,
+    ) -> Result<Option<AppRecord>> {
+        get_app(&self.pool, community_id, app_id).await
+    }
+
+    /// List Apps in `community_id` ordered by creation time.
+    #[datastore_span(name = "list_apps", system = "postgresql")]
+    pub async fn list_apps(&self, community_id: CommunityId) -> Result<Vec<AppRecord>> {
+        list_apps(&self.pool, community_id).await
+    }
+}
+
 /// Insert the kind `9038` command event with `ON CONFLICT DO NOTHING`.
 ///
 /// Returns `true` when this transaction claimed the event and `false` when it
 /// already existed. The caller must generate create/rotate credentials only
 /// after a successful claim.
 pub async fn claim_app_command_event(
-    tx: &mut Transaction<'_, Postgres>,
+    tx: &mut crate::AdmittedTx,
     community_id: CommunityId,
     event: &Event,
 ) -> Result<bool> {
-    let (_, was_inserted) =
-        insert_event_with_thread_metadata_tx(tx, community_id, event, None, None).await?;
+    if tx.community() != community_id {
+        return Err(DbError::InvalidData(
+            "app command community mismatch".into(),
+        ));
+    }
+    let (_, was_inserted) = insert_event_with_thread_metadata_tx(tx, event, None, None).await?;
     Ok(was_inserted)
 }
 
 /// Insert a new App row on the caller's transaction.
 pub async fn create_app(
-    tx: &mut Transaction<'_, Postgres>,
+    tx: &mut crate::AdmittedTx,
     community_id: CommunityId,
     params: CreateAppParams<'_>,
 ) -> Result<AppRecord> {
@@ -159,14 +184,14 @@ pub async fn create_app(
         .bind(icon_url)
         .bind(secret_hash.as_slice())
         .bind(created_by.as_slice())
-        .fetch_one(&mut **tx)
+        .fetch_one(tx.conn())
         .await?;
     row_to_app(row)
 }
 
 /// Update public metadata of an existing App. `created_by` is not writable.
 pub async fn update_app(
-    tx: &mut Transaction<'_, Postgres>,
+    tx: &mut crate::AdmittedTx,
     community_id: CommunityId,
     app_id: Uuid,
     params: UpdateAppParams<'_>,
@@ -179,16 +204,16 @@ pub async fn update_app(
         .bind(params.description)
         .bind(params.icon_url.is_some())
         .bind(params.icon_url)
-        .fetch_optional(&mut **tx)
+        .fetch_optional(tx.conn())
         .await?;
     require_app_row(app_id, row)
 }
 
 /// Replace the stored secret digest and bump private `updated_at`.
 ///
-/// Does not write kind `39007` metadata.
+/// Does not write kind `39008` metadata.
 pub async fn rotate_app_secret(
-    tx: &mut Transaction<'_, Postgres>,
+    tx: &mut crate::AdmittedTx,
     community_id: CommunityId,
     app_id: Uuid,
     secret_hash: &[u8],
@@ -198,14 +223,14 @@ pub async fn rotate_app_secret(
         .bind(community_id.as_uuid())
         .bind(app_id)
         .bind(secret_hash.as_slice())
-        .fetch_optional(&mut **tx)
+        .fetch_optional(tx.conn())
         .await?;
     require_app_row(app_id, row)
 }
 
 /// Set App status to `active` or `disabled`.
 pub async fn set_app_status(
-    tx: &mut Transaction<'_, Postgres>,
+    tx: &mut crate::AdmittedTx,
     community_id: CommunityId,
     app_id: Uuid,
     status: AppStatus,
@@ -218,14 +243,14 @@ pub async fn set_app_status(
         .bind(community_id.as_uuid())
         .bind(app_id)
         .bind(status)
-        .fetch_optional(&mut **tx)
+        .fetch_optional(tx.conn())
         .await?;
     require_app_row(app_id, row)
 }
 
-/// Next kind `39007` `created_at` for `app_id`: `max(now_seconds, head + 1)`.
+/// Next kind `39008` `created_at` for `app_id`: `max(now_seconds, head + 1)`.
 pub async fn next_app_metadata_created_at(
-    tx: &mut Transaction<'_, Postgres>,
+    tx: &mut crate::AdmittedTx,
     community_id: CommunityId,
     relay_pubkey: &[u8],
     app_id: Uuid,
@@ -240,7 +265,7 @@ pub async fn next_app_metadata_created_at(
     .bind(KIND_APP_METADATA as i32)
     .bind(relay_pubkey)
     .bind(app_id.to_string())
-    .fetch_optional(&mut **tx)
+    .fetch_optional(tx.conn())
     .await?;
     let now = Utc::now().timestamp();
     Ok(match head {
@@ -249,13 +274,13 @@ pub async fn next_app_metadata_created_at(
     })
 }
 
-/// Replace kind `39007` by `(community, kind, relay pubkey, d)` with NIP-33
+/// Replace kind `39008` by `(community, kind, relay pubkey, d)` with NIP-33
 /// ordering (`created_at` desc, then lexicographically lower event ID).
 ///
 /// Does not call [`crate::Db::replace_parameterized_event`] or
 /// `replace_addressable_event`.
 pub async fn replace_app_metadata(
-    tx: &mut Transaction<'_, Postgres>,
+    tx: &mut crate::AdmittedTx,
     community_id: CommunityId,
     event: &Event,
 ) -> Result<(StoredEvent, bool)> {
@@ -267,7 +292,7 @@ pub async fn replace_app_metadata(
     }
     let d_tag = crate::event::extract_d_tag(event)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| DbError::InvalidData("kind 39007 requires a d tag".into()))?;
+        .ok_or_else(|| DbError::InvalidData("kind 39008 requires a d tag".into()))?;
     let pubkey_bytes = event.pubkey.to_bytes();
     let created_at_secs = event.created_at.as_secs() as i64;
     let created_at = DateTime::from_timestamp(created_at_secs, 0)
@@ -280,7 +305,7 @@ pub async fn replace_app_metadata(
             pubkey_bytes.as_slice(),
             d_tag.as_bytes(),
         ))
-        .execute(&mut **tx)
+        .execute(tx.conn())
         .await?;
 
     let existing: Option<(DateTime<Utc>, Vec<u8>)> = sqlx::query_as(
@@ -293,7 +318,7 @@ pub async fn replace_app_metadata(
     .bind(kind_i32)
     .bind(pubkey_bytes.as_slice())
     .bind(&d_tag)
-    .fetch_optional(&mut **tx)
+    .fetch_optional(tx.conn())
     .await?;
 
     let incoming_id = event.id.as_bytes().as_slice();
@@ -318,18 +343,18 @@ pub async fn replace_app_metadata(
         .bind(kind_i32)
         .bind(pubkey_bytes.as_slice())
         .bind(&d_tag)
-        .execute(&mut **tx)
+        .execute(tx.conn())
         .await?;
     }
 
     let (stored, was_inserted) =
-        insert_event_with_thread_metadata_tx(tx, community_id, event, None, None).await?;
+        insert_event_with_thread_metadata_tx(tx, event, None, None).await?;
     if !was_inserted {
         return Err(DbError::InvalidData(
             "app metadata event id already exists".into(),
         ));
     }
-    crate::insert_mentions_in_transaction(tx, community_id, event, None).await?;
+    crate::insert_mentions_in_transaction(tx, event, None).await?;
     Ok((stored, true))
 }
 

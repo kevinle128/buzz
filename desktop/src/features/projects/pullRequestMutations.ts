@@ -235,7 +235,6 @@ export async function publishProjectPullRequestMerged(
   });
 }
 
-
 export function useCreateProjectPullRequestMutation(
   project: Project | null | undefined,
 ) {

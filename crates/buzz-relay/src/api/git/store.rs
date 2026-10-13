@@ -169,6 +169,7 @@ impl From<ProbeFailure> for StoreError {
 #[derive(Clone)]
 pub struct GitStore {
     bucket: Arc<Bucket>,
+    prefix: String,
 }
 
 impl GitStore {
@@ -219,7 +220,28 @@ impl GitStore {
         };
         Ok(Self {
             bucket: Arc::from(bucket),
+            prefix: String::new(),
         })
+    }
+
+    /// Build the Git client with the same bucket namespace as media storage.
+    pub fn from_config(config: &buzz_media::MediaConfig) -> Result<Self, StoreError> {
+        let prefix = buzz_media::config::normalize_s3_prefix(&config.s3_prefix)
+            .map_err(StoreError::Config)?;
+        let mut store = Self::new(
+            &config.s3_endpoint,
+            &config.s3_access_key,
+            &config.s3_secret_key,
+            &config.s3_bucket,
+            &config.s3_region,
+            config.s3_addressing_style,
+        )?;
+        store.prefix = prefix;
+        Ok(store)
+    }
+
+    fn physical_key(&self, key: &str) -> String {
+        format!("{}{key}", self.prefix)
     }
 
     /// Compute the hex SHA-256 of `bytes`. The content-addressed key.
@@ -267,7 +289,12 @@ impl GitStore {
         headers.insert(axum::http::header::IF_NONE_MATCH, "*".parse().unwrap());
         match self
             .bucket
-            .put_object_with_content_type_and_headers(&key, bytes, content_type, Some(headers))
+            .put_object_with_content_type_and_headers(
+                &self.physical_key(&key),
+                bytes,
+                content_type,
+                Some(headers),
+            )
             .await
         {
             Ok(resp) if (200..300).contains(&resp.status_code()) => Ok(key),
@@ -303,7 +330,7 @@ impl GitStore {
         match self
             .bucket
             .put_object_with_content_type_and_headers(
-                &key,
+                &self.physical_key(&key),
                 idx_bytes,
                 "application/x-git-index",
                 Some(headers),
@@ -350,7 +377,7 @@ impl GitStore {
     /// detectability. This raw `get` exists for the pointer (whose key is not a
     /// digest).
     pub async fn get(&self, key: &str) -> Result<Bytes, StoreError> {
-        match self.bucket.get_object(key).await {
+        match self.bucket.get_object(&self.physical_key(key)).await {
             Ok(resp) => Ok(Bytes::from(resp.to_vec())),
             Err(S3Error::HttpFailWithBody(404, _)) => Err(StoreError::NotFound(key.into())),
             Err(e) => Err(StoreError::Backend(e)),
@@ -409,10 +436,14 @@ impl GitStore {
 
     /// GET an object after rejecting bodies larger than `max_bytes`.
     pub async fn get_limited(&self, key: &str, max_bytes: u64) -> Result<Bytes, StoreError> {
-        let (head, status) = self.bucket.head_object(key).await.map_err(|e| match e {
-            S3Error::HttpFailWithBody(404, _) => StoreError::NotFound(key.into()),
-            other => StoreError::Backend(other),
-        })?;
+        let (head, status) = self
+            .bucket
+            .head_object(&self.physical_key(key))
+            .await
+            .map_err(|e| match e {
+                S3Error::HttpFailWithBody(404, _) => StoreError::NotFound(key.into()),
+                other => StoreError::Backend(other),
+            })?;
         if status == 404 {
             return Err(StoreError::NotFound(key.into()));
         }
@@ -458,7 +489,7 @@ impl GitStore {
     /// the snapshot consistent (A2: a single GET observes a single committed
     /// object). Verified empirically in `probe::probe_get_exposes_etag`.
     pub async fn get_pointer(&self, key: &str) -> Result<Option<(ETag, Bytes)>, StoreError> {
-        match self.bucket.get_object(key).await {
+        match self.bucket.get_object(&self.physical_key(key)).await {
             Ok(resp) => {
                 let headers = resp.headers();
                 let etag = headers
@@ -508,7 +539,12 @@ impl GitStore {
         }
         let result = self
             .bucket
-            .put_object_with_content_type_and_headers(key, body, "application/json", Some(headers))
+            .put_object_with_content_type_and_headers(
+                &self.physical_key(key),
+                body,
+                "application/json",
+                Some(headers),
+            )
             .await;
         Self::classify_cas(result)
     }
@@ -620,7 +656,10 @@ impl GitStore {
         // -- Phase 2: if_match_race -----------------------------------------------
         // Seed the pointer with a known value, then race N IfMatch updates.
         let seed = b"probe-pointer-seed".to_vec();
-        let _ = self.bucket.delete_object(&pointer_key).await; // ignore 404
+        let _ = self
+            .bucket
+            .delete_object(&self.physical_key(&pointer_key))
+            .await; // ignore 404
         let seed_outcome = self
             .put_pointer(&pointer_key, &seed, Precond::IfNoneMatchStar)
             .await?;
@@ -730,7 +769,7 @@ impl GitStore {
             let body = format!("probe-inm-race-{nonce}-{round}").into_bytes();
             let key = Self::content_key("probe/inm-race", &body);
             // Clean slate.
-            let _ = self.bucket.delete_object(&key).await;
+            let _ = self.bucket.delete_object(&self.physical_key(&key)).await;
             let arc_self: Arc<&Self> = Arc::new(self);
             let mut tasks = Vec::with_capacity(cfg.race_width);
             for _ in 0..cfg.race_width {
@@ -873,7 +912,10 @@ impl GitStore {
 
         // Cleanup pointer (immutable probe writes accumulate by design; the
         // bucket's retention policy handles them, not the probe).
-        let _ = self.bucket.delete_object(&pointer_key).await;
+        let _ = self
+            .bucket
+            .delete_object(&self.physical_key(&pointer_key))
+            .await;
 
         Ok(ProbeReport {
             race_width: cfg.race_width,
@@ -898,7 +940,7 @@ impl GitStore {
         match self
             .bucket
             .put_object_with_content_type_and_headers(
-                key,
+                &self.physical_key(key),
                 bytes,
                 "application/octet-stream",
                 Some(headers),

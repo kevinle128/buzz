@@ -10,7 +10,7 @@ import { subscribeToAgentObserverFrames } from "./observerRelay.ts";
 // network drop never re-delivers and the active-agents badge never appears.
 test("subscribeToAgentObserverFrames requests a replay-capable limit with a since window", () => {
   const calls = [];
-  mock.method(relayClient, "subscribeLive", (filter) => {
+  mock.method(relayClient, "subscribeInteractive", (filter) => {
     calls.push(filter);
     return () => {};
   });
@@ -44,7 +44,7 @@ test("subscribeToAgentObserverFrames since is at least 300s before now", () => {
   mock.method(Date, "now", () => FIXED_NOW_MS);
 
   const calls = [];
-  mock.method(relayClient, "subscribeLive", (filter) => {
+  mock.method(relayClient, "subscribeInteractive", (filter) => {
     calls.push(filter);
     return () => {};
   });
@@ -63,10 +63,14 @@ test("subscribeToAgentObserverFrames since is at least 300s before now", () => {
 
 test("subscribeToAgentObserverFrames forwards initial subscription readiness", () => {
   const readiness = [];
-  mock.method(relayClient, "subscribeLive", (_filter, _onEvent, onReady) => {
-    onReady?.("eose");
-    return async () => {};
-  });
+  mock.method(
+    relayClient,
+    "subscribeInteractive",
+    (_filter, _onEvent, onReady) => {
+      onReady?.("eose");
+      return async () => {};
+    },
+  );
 
   subscribeToAgentObserverFrames(
     "owner-pubkey",

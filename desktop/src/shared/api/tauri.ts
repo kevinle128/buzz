@@ -1,25 +1,18 @@
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
-import {
-  activateRateLimit,
-  parseRateLimitHint,
-} from "@/shared/api/relayRateLimitGate";
+import { beginChannelMembershipWrite } from "@/shared/api/channelMembershipWrites";
 import {
   fromRawInstallRuntimeResult,
   type RawInstallRuntimeResult,
 } from "@/shared/api/installTypes";
-import {
-  fromRawSearchHit,
-  type RawSearchResponse,
-} from "@/shared/api/searchWire";
 import type {
   AddChannelMembersInput,
   AddChannelMembersResult,
   BackendProviderCandidate,
   BackendProviderProbeResult,
-  CanvasResponse,
   GetHomeFeedInput,
   HomeFeedResponse,
   ManagedAgent,
+  ManagedAgentBackend,
   RelayAgent,
   RelayMember,
   RelayMemberRole,
@@ -28,8 +21,6 @@ import type {
   RelayEvent,
   SearchMessagesInput,
   SearchMessagesResponse,
-  SetCanvasInput,
-  SetCanvasResult,
   ThreadCursor,
   ThreadRepliesResponse,
   CreateManagedAgentInput,
@@ -43,12 +34,15 @@ import type {
   GitBashPrerequisite,
   RuntimeConfigSurface,
 } from "@/shared/api/types";
-import { fromRawManagedAgent, type RawManagedAgent } from "./managedAgentWire";
-
-export { fromRawManagedAgent, type RawManagedAgent };
 
 export * from "@/shared/api/tauriChannels";
+export {
+  getCanvas,
+  getCanvasHistory,
+  setCanvas,
+} from "@/shared/api/tauriCanvas";
 export { sendChannelMessage } from "@/shared/api/tauriMessages";
+export { getEventById, getEventsByIds } from "@/shared/api/tauriEvents";
 
 type RawPresenceLookup = Record<string, PresenceStatus>;
 
@@ -70,7 +64,7 @@ type RawFeedItem = {
   channel_name: string;
   channel_type: string | null;
   tags: string[][];
-  category: "mention" | "needs_action" | "activity" | "agent_activity";
+  category: HomeFeedResponse["feed"]["mentions"][number]["category"];
 };
 
 type RawHomeFeedResponse = {
@@ -87,6 +81,23 @@ type RawHomeFeedResponse = {
   };
 };
 
+type RawSearchHit = {
+  event_id: string;
+  content: string;
+  kind: number;
+  pubkey: string;
+  channel_id: string | null;
+  channel_name: string | null;
+  created_at: number;
+  score: number;
+  tags?: string[][];
+};
+
+type RawSearchResponse = {
+  hits: RawSearchHit[];
+  found: number;
+};
+
 type RawRelayAgent = {
   pubkey: string;
   owner_pubkey?: string | null;
@@ -98,6 +109,55 @@ type RawRelayAgent = {
   status: RelayAgent["status"];
   respond_to?: RelayAgent["respondTo"];
   respond_to_allowlist?: string[];
+};
+import type { RestartDiffEntry as RawRestartDiffEntry } from "./restartDiff";
+export type RawManagedAgent = {
+  pubkey: string;
+  name: string;
+  persona_id: string | null;
+  // Optional: pre-feature fixtures may omit it. The record's harness/runtime id.
+  runtime?: string | null;
+  team_id?: string | null;
+  relay_url: string;
+  acp_command: string;
+  agent_command: string;
+  agent_command_override?: string | null;
+  agent_args: string[];
+  mcp_command: string;
+  turn_timeout_seconds: number;
+  idle_timeout_seconds: number | null;
+  max_turn_duration_seconds: number | null;
+  parallelism: number;
+  session_policy?: ManagedAgent["sessionPolicy"];
+  system_prompt: string | null;
+  avatar_url?: string | null;
+  model: string | null;
+  model_source?: ManagedAgent["modelSource"];
+  provider: string | null;
+  persona_out_of_date: boolean;
+  persona_orphaned: boolean;
+  needs_restart: boolean;
+  restart_diff?: RawRestartDiffEntry[];
+  env_vars?: Record<string, string>;
+  status: ManagedAgent["status"];
+  pid: number | null;
+  created_at: string;
+  updated_at: string;
+  last_started_at: string | null;
+  last_stopped_at: string | null;
+  last_exit_code: number | null;
+  last_error: string | null;
+  last_error_code: number | null;
+  log_path: string;
+  start_on_app_launch: boolean;
+  auto_restart_on_config_change?: boolean;
+  backend: ManagedAgentBackend;
+  backend_agent_id: string | null;
+  // Pre-feature fixtures may omit these; mapped to "owner-only"/[] in fromRawManagedAgent.
+  respond_to?: ManagedAgent["respondTo"];
+  respond_to_allowlist?: string[];
+  permission_policy?: import("./types").PermissionPolicy;
+  permission_policy_source?: import("./types").PermissionPolicySource;
 };
 
 type RawCreateManagedAgentResponse = {
@@ -130,17 +190,16 @@ export type RawAcpRuntimeCatalogEntry = {
   install_hint: string;
   install_instructions_url: string;
   can_auto_install: boolean;
-  /** Optional only for older E2E fixtures; the Rust catalog always supplies it. */
   requires_external_cli?: boolean;
   underlying_cli_path: string | null;
   node_required: boolean;
-  /** Tagged union with snake_case status values — same shape as `AuthStatus`. */
   auth_status: AuthStatus;
   login_hint?: string;
   source: "builtin" | "preset" | "custom";
   /** Definition-level env vars for `source: custom` entries; absent for builtin/preset. */
   definition_env?: Record<string, string>;
   max_parallelism?: number;
+  effort_canonical_values?: string[] | null;
 };
 
 export type {
@@ -177,17 +236,6 @@ type RawListRelayMembersResponse = {
   members: RawRelayMember[];
 };
 
-type RawCanvasResponse = {
-  content: string | null;
-  updated_at: number | null;
-  author: string | null;
-};
-
-type RawSetCanvasResult = {
-  ok: boolean;
-  event_id: string;
-};
-
 /** Error normalized from a rejected Tauri invocation with its wire payload. */
 export class TauriInvokeError extends Error {
   readonly payload: unknown;
@@ -199,7 +247,7 @@ export class TauriInvokeError extends Error {
   }
 }
 
-function toTauriError(error: unknown): Error {
+export function toTauriError(error: unknown): Error {
   if (error instanceof Error) {
     return error;
   }
@@ -224,18 +272,6 @@ function toTauriError(error: unknown): Error {
   }
 }
 
-/**
- * Inspect a Tauri error message and activate the shared rate-limit gate when
- * the Rust relay layer emitted an HTTP 429 response (`relay rate-limited:` prefix).
- *
- * Extracted so it can be unit-tested without mocking the Tauri invoke bridge.
- */
-export function applyTauriRateLimitIfNeeded(message: string): void {
-  if (message.startsWith("relay rate-limited:")) {
-    activateRateLimit(parseRateLimitHint(message));
-  }
-}
-
 export async function invokeTauri<T>(
   command: string,
   args?: Record<string, unknown>,
@@ -243,11 +279,9 @@ export async function invokeTauri<T>(
   try {
     return await tauriInvoke<T>(command, args);
   } catch (error) {
-    const err = toTauriError(error);
-    // Rust emits `relay rate-limited:` for HTTP 429 responses. Activate the
-    // shared gate so the TS relay client backs off for the same window.
-    applyTauriRateLimitIfNeeded(err.message);
-    throw err;
+    // HTTP backoff lives in Rust. Do not apply its separate ApiCalls quota
+    // to the WebSocket gate, but preserve the failure for the caller.
+    throw toTauriError(error);
   }
 }
 
@@ -266,6 +300,20 @@ export function fromRawFeedItem(item: RawFeedItem) {
     channelType: item.channel_type ?? undefined,
     tags: item.tags,
     category: item.category,
+  };
+}
+
+function fromRawSearchHit(hit: RawSearchHit) {
+  return {
+    eventId: hit.event_id,
+    content: hit.content,
+    kind: hit.kind,
+    pubkey: hit.pubkey,
+    channelId: hit.channel_id,
+    channelName: hit.channel_name,
+    createdAt: hit.created_at,
+    score: hit.score,
+    tags: hit.tags ?? [],
   };
 }
 
@@ -305,14 +353,22 @@ export function getRelayHttpUrl(): Promise<string> {
 export async function addChannelMembers(
   input: AddChannelMembersInput,
 ): Promise<AddChannelMembersResult> {
-  return invokeTauri<RawAddChannelMembersResult>("add_channel_members", input);
+  const record = beginChannelMembershipWrite();
+  const result = await invokeTauri<RawAddChannelMembersResult>(
+    "add_channel_members",
+    input,
+  );
+  record(input.channelId);
+  return result;
 }
 
 export async function removeChannelMember(
   channelId: string,
   pubkey: string,
 ): Promise<void> {
+  const record = beginChannelMembershipWrite();
   await invokeTauri("remove_channel_member", { channelId, pubkey });
+  record(channelId);
 }
 
 export async function changeChannelMemberRole(
@@ -320,42 +376,21 @@ export async function changeChannelMemberRole(
   pubkey: string,
   role: string,
 ): Promise<void> {
+  const record = beginChannelMembershipWrite();
   await invokeTauri("change_channel_member_role", { channelId, pubkey, role });
+  record(channelId);
 }
 
 export async function joinChannel(channelId: string): Promise<void> {
+  const record = beginChannelMembershipWrite();
   await invokeTauri("join_channel", { channelId });
+  record(channelId);
 }
 
 export async function leaveChannel(channelId: string): Promise<void> {
+  const record = beginChannelMembershipWrite();
   await invokeTauri("leave_channel", { channelId });
-}
-
-export async function getCanvas(channelId: string): Promise<CanvasResponse> {
-  const response = await invokeTauri<RawCanvasResponse>("get_canvas", {
-    channelId,
-  });
-  return {
-    content: response.content,
-    // Normalize absent keys to null: ensureWelcomeCanvas treats null as
-    // "no canvas yet", and `undefined !== null` would make every fresh
-    // channel look already-seeded.
-    updatedAt: response.updated_at ?? null,
-    author: response.author ?? null,
-  };
-}
-
-export async function setCanvas(
-  input: SetCanvasInput,
-): Promise<SetCanvasResult> {
-  const response = await invokeTauri<RawSetCanvasResult>("set_canvas", {
-    channelId: input.channelId,
-    content: input.content,
-  });
-  return {
-    ok: response.ok,
-    eventId: response.event_id,
-  };
+  record(channelId);
 }
 
 export async function getHomeFeed(
@@ -394,11 +429,6 @@ export async function searchMessages(
     hits: response.hits.map(fromRawSearchHit),
     found: response.found,
   };
-}
-
-export async function getEventById(eventId: string): Promise<RelayEvent> {
-  const eventJson = await invokeTauri<string>("get_event", { eventId });
-  return JSON.parse(eventJson) as RelayEvent;
 }
 
 type RawThreadCursor = {
@@ -534,6 +564,19 @@ export async function signRelayEvent(input: {
   content: string;
   createdAt?: number;
   tags: string[][];
+  /**
+   * When true, the Rust signer calls `EventBuilder::allow_self_tagging()` so
+   * that `p` tags whose value equals the signing key are NOT stripped.
+   *
+   * nostr 0.44.x strips self-`p` tags by default (see `EventBuilder::
+   * build_with_ctx` in the vendored crate). Set this flag ONLY for report
+   * events (kind:1984) where the reporter and the reported author are the
+   * same person — otherwise the relay rejects with "must include a p tag".
+   *
+   * Default: false (matches the historical behaviour for all other event
+   * kinds where stripping self-tags is correct).
+   */
+  allowSelfTagging?: boolean;
 }): Promise<RelayEvent> {
   const eventJson = await invokeTauri<string>("sign_event", input);
   return JSON.parse(eventJson) as RelayEvent;
@@ -558,6 +601,55 @@ function fromRawRelayAgent(agent: RawRelayAgent): RelayAgent {
     status: agent.status,
     respondTo: agent.respond_to ?? null,
     respondToAllowlist: agent.respond_to_allowlist ?? [],
+  };
+}
+
+export function fromRawManagedAgent(agent: RawManagedAgent): ManagedAgent {
+  return {
+    pubkey: agent.pubkey,
+    name: agent.name,
+    personaId: agent.persona_id,
+    runtime: agent.runtime ?? null,
+    teamId: agent.team_id ?? null,
+    relayUrl: agent.relay_url,
+    acpCommand: agent.acp_command,
+    agentCommand: agent.agent_command,
+    agentCommandOverride: agent.agent_command_override ?? null,
+    agentArgs: agent.agent_args,
+    mcpCommand: agent.mcp_command,
+    turnTimeoutSeconds: agent.turn_timeout_seconds,
+    idleTimeoutSeconds: agent.idle_timeout_seconds,
+    maxTurnDurationSeconds: agent.max_turn_duration_seconds,
+    parallelism: agent.parallelism,
+    sessionPolicy: agent.session_policy ?? "channel",
+    systemPrompt: agent.system_prompt,
+    avatarUrl: agent.avatar_url ?? null,
+    model: agent.model,
+    modelSource: agent.model_source ?? null,
+    provider: agent.provider ?? null,
+    personaOutOfDate: agent.persona_out_of_date ?? false,
+    personaOrphaned: agent.persona_orphaned ?? false,
+    needsRestart: agent.needs_restart ?? false,
+    restartDiff: agent.restart_diff ?? [],
+    envVars: agent.env_vars ?? {},
+    status: agent.status,
+    pid: agent.pid,
+    createdAt: agent.created_at,
+    updatedAt: agent.updated_at,
+    lastStartedAt: agent.last_started_at,
+    lastStoppedAt: agent.last_stopped_at,
+    lastExitCode: agent.last_exit_code,
+    lastError: agent.last_error,
+    lastErrorCode: agent.last_error_code ?? null,
+    logPath: agent.log_path,
+    startOnAppLaunch: agent.start_on_app_launch,
+    autoRestartOnConfigChange: agent.auto_restart_on_config_change ?? true,
+    backend: agent.backend,
+    backendAgentId: agent.backend_agent_id,
+    respondTo: agent.respond_to ?? "owner-only",
+    respondToAllowlist: agent.respond_to_allowlist ?? [],
+    permissionPolicy: agent.permission_policy ?? "ask",
+    permissionPolicySource: agent.permission_policy_source ?? "built_in",
   };
 }
 
@@ -589,6 +681,7 @@ export function fromRawAcpRuntimeCatalogEntry(
     loginHint: entry.login_hint ?? null,
     source: entry.source,
     definitionEnv: entry.definition_env ?? {},
+    effortCanonicalValues: entry.effort_canonical_values ?? null,
     ...(entry.max_parallelism !== undefined && {
       maxParallelism: entry.max_parallelism,
     }),
@@ -695,9 +788,11 @@ export async function createManagedAgent(input: CreateManagedAgentInput) {
         spawnAfterCreate: input.spawnAfterCreate,
         startOnAppLaunch: input.startOnAppLaunch,
         backend: input.backend,
+        effortLevel: input.effortLevel,
         respondTo: input.respondTo,
         respondToAllowlist: input.respondToAllowlist,
         relayMesh: input.relayMesh,
+        permissionPolicy: input.permissionPolicy,
       },
     },
   );
@@ -746,12 +841,6 @@ export async function discoverGitBashPrerequisite(): Promise<GitBashPrerequisite
       installHint: prerequisite.install_hint,
     }
   );
-}
-
-export async function discoverAcpRuntimes(): Promise<AcpRuntimeCatalogEntry[]> {
-  return (
-    await invokeTauri<RawAcpRuntimeCatalogEntry[]>("discover_acp_providers")
-  ).map(fromRawAcpRuntimeCatalogEntry);
 }
 
 /** Input shape for creating or updating a custom harness. */
@@ -883,7 +972,7 @@ export async function getBakedBuildEnvKeys(): Promise<string[]> {
  *
  * The value is already masked in Rust for secret keys (keys not in the
  * explicit safe-to-reveal allowlist: `BUZZ_AGENT_PROVIDER`, `BUZZ_AGENT_MODEL`,
- * `DATABRICKS_HOST`, `DATABRICKS_MODEL`). Non-allowlisted keys have their
+ * `DATABRICKS_HOST`, `DATABRICKS_MODEL`, `DATABRICKS_MODEL_FILTER`). Non-allowlisted keys have their
  * values replaced with `••••••`. Non-secret values are shown as-is.
  * Empty-value keys are filtered out.
  */
@@ -966,32 +1055,14 @@ export async function cancelPairing(): Promise<void> {
   await invokeTauri("cancel_pairing");
 }
 
-export async function applyCommunity(
-  relayUrl: string,
-  nsec?: string,
-  token?: string,
-  reposDir?: string,
-  agentManagedProfiles?: boolean,
-): Promise<void> {
-  await invokeTauri("apply_workspace", {
-    relayUrl,
-    nsec: nsec ?? null,
-    token: token ?? null,
-    reposDir: reposDir ?? null,
-    agentManagedProfiles: agentManagedProfiles ?? false,
-  });
-}
-
-// Validate a candidate repos dir without mutation and reject it with a readable reason.
+// Validate a candidate repos dir without mutating the filesystem. Rejects
+// with a human-readable reason; resolves for a valid or empty path.
 export async function validateReposDir(dir: string): Promise<void> {
   await invokeTauri("validate_repos_dir", { dir });
 }
 
 export const setPreventSleepActive = (active: boolean) =>
   invokeTauri("set_prevent_sleep_active", { active });
-
-export const setAgentManagedProfiles = (enabled: boolean) =>
-  invokeTauri("set_agent_managed_profiles", { enabled });
 
 /** Returns true on macOS, Windows, and Linux AppImage installs.
  *  Returns false on Linux non-AppImage packages (e.g. .deb) where

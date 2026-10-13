@@ -8,27 +8,32 @@ import {
   Hash,
   Plus,
 } from "lucide-react";
-import type * as React from "react";
+import * as React from "react";
 
+import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import type {
   Project,
   ProjectActivitySummary,
   ProjectIssue,
   ProjectPullRequest,
 } from "@/features/projects/hooks";
-import type { ProjectsFilter } from "@/features/projects/lib/projectsViewHelpers";
-import type { UserProfileLookup } from "@/features/profile/lib/identity";
-import { Button } from "@/shared/ui/button";
-import { ProjectsCreateMenu } from "./ProjectsCreateMenu";
 import {
+  type ProjectSelectionItem,
+  projectSelectionPresentation,
+} from "@/features/projects/lib/projectSelection";
+import type { ProjectsFilter } from "@/features/projects/lib/projectsViewHelpers";
+import type { ProjectsActivityDigest } from "@/features/projects/lib/projectsActivityDigest";
+import { useProjectSelection } from "@/features/projects/lib/useProjectSelection";
+import { cn } from "@/shared/lib/cn";
+import { Button } from "@/shared/ui/button";
+import { ProjectsOverviewPeople } from "./ProjectsOverviewRail";
+import { ProjectsSelectionCountMenu } from "./ProjectsSelectionCountMenu";
+import {
+  type OverviewContextAction,
   type OverviewContextStatIcon,
   type ProjectsOverviewSection,
   projectsOverviewContext,
 } from "./projectsOverviewContext";
-import {
-  ProjectsOverviewActivityGraph,
-  ProjectsOverviewPeople,
-} from "./ProjectsOverviewRail";
 
 export type { ProjectsOverviewSection };
 
@@ -51,36 +56,65 @@ type ProjectsOverviewPanelProps = {
 
 type ProjectsOverviewContextPanelProps = {
   filter: ProjectsFilter;
+  canCreateTarget: boolean;
   issues: ProjectIssue[];
+  onAddChannel: () => void;
+  onAddRepository: () => void;
+  onChatWithAgent: (items: ProjectSelectionItem[]) => void;
   onCreateIssue: () => void;
   onCreateProject: () => void;
   onCreatePullRequest: () => void;
   onSelectSection: (section: ProjectsOverviewSection) => void;
   profiles?: UserProfileLookup;
+  projectReadModels: Project[];
   projects: Project[];
   pullRequests: ProjectPullRequest[];
+  repositorySummaries?: Record<string, ProjectActivitySummary>;
   summaries?: Record<string, ProjectActivitySummary>;
 };
 
-function OverviewActionButton({
-  children,
-  onClick,
-  testId,
+function OverviewCreateButton({
+  action,
+  canCreateTarget,
+  onAddChannel,
+  onAddRepository,
+  onCreateIssue,
+  onCreateProject,
+  onCreatePullRequest,
 }: {
-  children: React.ReactNode;
-  onClick: () => void;
-  testId?: string;
+  action: Exclude<OverviewContextAction, null>;
+  canCreateTarget: boolean;
+  onAddChannel: () => void;
+  onAddRepository: () => void;
+  onCreateIssue: () => void;
+  onCreateProject: () => void;
+  onCreatePullRequest: () => void;
 }) {
+  const actionHandler =
+    action.kind === "issue"
+      ? onCreateIssue
+      : action.kind === "pullRequest"
+        ? onCreatePullRequest
+        : action.kind === "project"
+          ? onCreateProject
+          : action.kind === "channel"
+            ? onAddChannel
+            : onAddRepository;
+  const requiresProject =
+    action.kind === "channel" || action.kind === "repository";
   return (
     <Button
-      className="-mx-2 h-7 w-[calc(100%+1rem)] justify-start gap-3 rounded-md px-2 text-left text-sm font-normal hover:bg-muted/70 [&_svg]:h-4 [&_svg]:w-4 [&_svg]:shrink-0 [&_svg]:text-muted-foreground"
-      data-testid={testId}
-      onClick={onClick}
-      size="sm"
+      aria-label={action.label}
+      className="h-6 w-6 shrink-0 rounded-md text-muted-foreground hover:bg-muted/70 hover:text-foreground"
+      data-testid={action.testId}
+      disabled={requiresProject && !canCreateTarget}
+      onClick={actionHandler}
+      size="icon"
+      title={action.label}
       type="button"
       variant="ghost"
     >
-      {children}
+      <Plus className="h-4 w-4" />
     </Button>
   );
 }
@@ -107,7 +141,9 @@ function OverviewStatRow({
         <Icon className="h-3.5 w-3.5 shrink-0" />
         {label}
       </span>
-      <span className="font-medium tabular-nums text-foreground">{count}</span>
+      <span className="font-medium tabular-nums text-muted-foreground/65">
+        {count}
+      </span>
     </button>
   );
 }
@@ -122,111 +158,155 @@ export function ProjectsOverviewPanel({
   );
 }
 
-export function ProjectsActivityIntro() {
+export function ProjectsActivityIntro({
+  digest,
+}: {
+  digest: ProjectsActivityDigest;
+}) {
   return (
     <section
-      className="pb-8 pt-5 text-center"
+      className="pb-6 pt-8 text-left"
       data-testid="projects-activity-intro"
     >
       <h2
         className="text-xl font-semibold tracking-tight text-foreground"
         data-testid="projects-page-header"
       >
-        Welcome to Activity
+        Projects Activity
       </h2>
-      <p className="mx-auto mt-2 max-w-md text-sm text-muted-foreground">
-        Keep up with commits, reviews, and tasks across your projects.
+      <p
+        className="mt-2 max-w-2xl text-sm text-muted-foreground"
+        data-testid="projects-activity-summary"
+      >
+        {digest.prefix}{" "}
+        {digest.highlights.map((highlight, index) => (
+          <span key={highlight}>
+            {index > 0
+              ? index === digest.highlights.length - 1
+                ? ", and "
+                : ", "
+              : null}
+            <strong className="font-medium text-foreground/90">
+              {highlight}
+            </strong>
+          </span>
+        ))}
+        {digest.suffix}
       </p>
     </section>
   );
 }
 
 export function ProjectsOverviewContextPanel({
+  canCreateTarget,
   filter,
   issues,
+  onAddChannel,
+  onAddRepository,
+  onChatWithAgent,
   onCreateIssue,
   onCreateProject,
   onCreatePullRequest,
   onSelectSection,
   profiles,
+  projectReadModels,
   projects,
   pullRequests,
+  repositorySummaries,
   summaries,
 }: ProjectsOverviewContextPanelProps) {
-  const context = projectsOverviewContext({
-    filter,
-    issues,
-    projects,
-    pullRequests,
-    summaries,
-  });
-  const actionHandler =
-    context.action?.kind === "issue"
-      ? onCreateIssue
-      : context.action?.kind === "pullRequest"
-        ? onCreatePullRequest
-        : onCreateProject;
-
+  const selection = useProjectSelection();
+  const selectionItems = selection?.items;
+  const selectionPresentation = React.useMemo(
+    () => projectSelectionPresentation(selectionItems ?? []),
+    [selectionItems],
+  );
+  // Memoized: the rail re-renders with every Projects-view state change, and
+  // the context stats walk every issue and pull request in the community.
+  const context = React.useMemo(
+    () =>
+      projectsOverviewContext({
+        filter,
+        issues,
+        projectReadModels,
+        projects,
+        pullRequests,
+        repositorySummaries,
+        summaries,
+      }),
+    [
+      filter,
+      issues,
+      projectReadModels,
+      projects,
+      pullRequests,
+      repositorySummaries,
+      summaries,
+    ],
+  );
   return (
     <div
-      className="min-w-0 overflow-hidden rounded-2xl bg-background"
+      className={cn(
+        "min-w-0 overflow-hidden",
+        selectionPresentation && "rounded-xl bg-background/90",
+      )}
       data-testid="projects-overview-context-panel"
     >
       <div className="px-4 pb-3 pt-3">
-        <div className="flex min-w-0 items-center justify-between gap-2">
-          <h2
-            className="min-w-0 truncate text-sm font-normal text-muted-foreground/70"
-            data-testid="projects-overview-context-title"
-          >
-            {context.title}
-          </h2>
-          <ProjectsCreateMenu
-            compact
-            onCreateIssue={onCreateIssue}
-            onCreateProject={onCreateProject}
+        {selectionPresentation && selection ? (
+          <ProjectsSelectionCountMenu
+            onChatWithAgent={onChatWithAgent}
             onCreatePullRequest={onCreatePullRequest}
+            presentation={selectionPresentation}
+            selectionItems={selection.items}
           />
-        </div>
-        <div className="space-y-0.5 pt-2">
-          {context.action ? (
-            <OverviewActionButton
-              onClick={actionHandler}
-              testId={context.action.testId}
+        ) : (
+          <div className="flex min-w-0 items-center justify-between gap-2">
+            <h2
+              className="min-w-0 truncate text-sm font-normal text-muted-foreground/70"
+              data-testid="projects-overview-context-title"
             >
-              <Plus className="h-3.5 w-3.5" />
-              {context.action.label}
-            </OverviewActionButton>
-          ) : null}
-          <section
-            className="text-sm"
-            data-testid="projects-overview-stats-pod"
-          >
-            {context.stats.map((stat) => (
-              <OverviewStatRow
-                count={stat.count}
-                icon={STAT_ICONS[stat.icon]}
-                key={`${stat.section}:${stat.label}`}
-                label={stat.label}
-                onClick={() => onSelectSection(stat.section)}
+              {context.title}
+            </h2>
+            {context.action ? (
+              <OverviewCreateButton
+                action={context.action}
+                canCreateTarget={canCreateTarget}
+                onAddChannel={onAddChannel}
+                onAddRepository={onAddRepository}
+                onCreateIssue={onCreateIssue}
+                onCreateProject={onCreateProject}
+                onCreatePullRequest={onCreatePullRequest}
               />
-            ))}
-          </section>
-        </div>
-        {context.people.length > 0 || context.activityByDay ? (
-          <div className="mt-3 space-y-3 border-border/50 border-t py-3">
-            <ProjectsOverviewPeople
-              people={context.people}
-              profiles={profiles}
-            />
-            {context.activityByDay ? (
-              <div data-testid="projects-overview-activity">
-                <ProjectsOverviewActivityGraph
-                  activityByDay={context.activityByDay}
+            ) : null}
+          </div>
+        )}
+        {selectionPresentation ? null : (
+          <div className="space-y-2.5 pt-2">
+            <section
+              className="space-y-2.5 text-sm"
+              data-testid="projects-overview-stats-pod"
+            >
+              {context.stats.map((stat) => (
+                <OverviewStatRow
+                  count={stat.count}
+                  icon={STAT_ICONS[stat.icon]}
+                  key={`${stat.section}:${stat.label}`}
+                  label={stat.label}
+                  onClick={() => onSelectSection(stat.section)}
+                />
+              ))}
+            </section>
+            {context.people.length > 0 ? (
+              <div className="mt-3 space-y-3 py-3">
+                <ProjectsOverviewPeople
+                  people={context.people}
+                  profiles={profiles}
                 />
               </div>
             ) : null}
           </div>
-        ) : null}
+        )}
       </div>
     </div>
   );

@@ -46,16 +46,9 @@ pub(crate) async fn handle_app_admin(
 
     let mut tx = state
         .db
-        .begin_transaction()
+        .begin_event_write_transaction(tenant.community())
         .await
         .map_err(|err| IngestError::Internal(format!("error: begin transaction: {err}")))?;
-    buzz_deletion::store(&state.db)
-        .guard_transaction(&mut tx, tenant.community())
-        .await
-        .map_err(|err| {
-            IngestError::Rejected(format!("restricted: community writes are fenced: {err}"))
-        })?;
-
     let claimed = claim_app_command_event(&mut tx, tenant.community(), event)
         .await
         .map_err(map_db_error)?;
@@ -161,7 +154,7 @@ async fn execute_claimed_command(
     state: &AppState,
     event: &Event,
     command: AppAdminCommand,
-    tx: &mut sqlx::Transaction<'static, sqlx::Postgres>,
+    tx: &mut buzz_db::AdmittedTx,
 ) -> Result<CommandOutcome, IngestError> {
     let community = tenant.community();
     match command {
@@ -278,7 +271,7 @@ async fn require_existing_app(
 }
 
 async fn publish_app_metadata(
-    tx: &mut sqlx::Transaction<'static, sqlx::Postgres>,
+    tx: &mut buzz_db::AdmittedTx,
     state: &AppState,
     app: &AppRecord,
 ) -> Result<StoredEvent, IngestError> {
@@ -632,6 +625,9 @@ mod tests {
                     "unexpected rejection: {message}"
                 );
             }
+            IngestError::CanvasConflict(message) => {
+                panic!("canvas conflict: {message}")
+            }
             IngestError::Internal(message) => panic!("internal error: {message}"),
         }
         let apps = state
@@ -926,7 +922,7 @@ mod tests {
         assert_eq!(
             metadata.pubkey,
             state.relay_keypair.public_key(),
-            "kind 39007 must be relay-signed"
+            "kind 39008 must be relay-signed"
         );
         assert_eq!(metadata.kind.as_u16() as u32, KIND_APP_METADATA);
         assert_eq!(metadata.content, "CI notifications");

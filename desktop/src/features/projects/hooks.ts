@@ -44,6 +44,8 @@ import {
 import { fetchProjectRepoSnapshotWith } from "@/features/projects/lib/projectGithubSnapshot";
 import { fetchRepoState } from "@/features/projects/lib/projectRepoState";
 export type { RepoState } from "@/features/projects/lib/projectRepoState";
+export { fetchRepoState };
+import { fetchProjectHomeForChannel } from "./projectFetch";
 import type {
   ProjectLocalRepository,
   ProjectLocalRepoSnapshot,
@@ -608,12 +610,27 @@ async function deleteProject(project: Project): Promise<void> {
 }
 
 export const projectsQueryKey = ["projects"] as const;
+export const PROJECT_ACTIVITY_STALE_TIME_MS = 2 * 60_000;
 
-export function useProjectsQuery() {
+export function useProjectsQuery(enabled = true) {
   return useQuery({
     queryKey: projectsQueryKey,
     queryFn: () => fetchProjects(),
     staleTime: 60_000,
+    enabled,
+  });
+}
+
+/** Resolves the project bound to one channel without enumerating all projects. */
+export function useProjectHomeForChannelQuery(
+  channelId: string,
+  enabled = true,
+) {
+  return useQuery({
+    queryKey: ["projects", "home-channel", channelId],
+    queryFn: () => fetchProjectHomeForChannel(channelId),
+    staleTime: 60_000,
+    enabled: enabled && channelId.length > 0,
   });
 }
 

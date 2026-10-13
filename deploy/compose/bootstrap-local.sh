@@ -127,7 +127,6 @@ cat <<MSG
 Created ${ENV_FILE}.
 
 Next commands:
-  docker build -t buzz-local:current "${SCRIPT_DIR}/../.."
-  cd "${SCRIPT_DIR}" && ./run.sh start
+  cd "${SCRIPT_DIR}" && ./redeploy.sh
   tailscale funnel --bg 3000
 MSG

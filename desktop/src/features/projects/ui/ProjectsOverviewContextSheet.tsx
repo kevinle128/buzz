@@ -1,6 +1,34 @@
-import type * as React from "react";
+import * as React from "react";
 
+import { Button } from "@/shared/ui/button";
+import { DrawerPanelIcon } from "@/shared/ui/DrawerPanelIcon";
 import { Sheet, SheetContent, SheetTitle } from "@/shared/ui/sheet";
+
+export const ProjectsOverviewNarrowContextToggle = React.forwardRef<
+  HTMLButtonElement,
+  { onToggle: () => void; open: boolean }
+>(({ onToggle, open }, ref) => (
+  <Button
+    aria-label={open ? "Hide project context" : "Show project context"}
+    aria-pressed={open}
+    className="h-7 w-7 text-sidebar-foreground/65 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
+    data-testid="projects-overview-context-toggle"
+    onClick={onToggle}
+    ref={ref}
+    size="icon"
+    title={open ? "Hide project context" : "Show project context"}
+    type="button"
+    variant="ghost"
+  >
+    <DrawerPanelIcon
+      className="-scale-x-100"
+      side={open ? "left" : "right"}
+      testId="projects-overview-context-icon"
+    />
+  </Button>
+));
+ProjectsOverviewNarrowContextToggle.displayName =
+  "ProjectsOverviewNarrowContextToggle";
 
 /**
  * Narrow-layout fallback for the Projects context rail: below the detached

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
@@ -7,6 +8,7 @@ import 'package:nostr/nostr.dart' as nostr;
 import '../../../shared/crypto/nip44.dart';
 import '../../../shared/relay/relay.dart';
 import 'observer_models.dart';
+import 'observer_admission.dart';
 import 'transcript_builder.dart';
 
 /// Maximum observer events to keep per agent.
@@ -190,6 +192,38 @@ class ObserverRelayNotifier extends Notifier<ObserverRelayState> {
       return;
     }
 
+    final channelTags = event.tags
+        .where((tag) => tag.isNotEmpty && tag.first == 'h')
+        .toList();
+    if (channelTags.isNotEmpty) {
+      if (event.kind != EventKind.agentObserverFrame ||
+          normalizedAgent == ownerPubkey.toLowerCase() ||
+          channelTags.length != 1 ||
+          channelTags.single.length != 2 ||
+          !RegExp(
+            r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$',
+          ).hasMatch(channelTags.single[1]) ||
+          !verifiedObserverEvent(event)) {
+        return;
+      }
+      for (final name in ['agent', 'p', 'frame']) {
+        final tags = event.tags.where(
+          (tag) => tag.isNotEmpty && tag.first == name,
+        );
+        if (tags.length != 1 || tags.single.length != 2) return;
+      }
+      unawaited(
+        _handleSharedEvent(
+          event,
+          normalizedAgent,
+          privHex,
+          ownerPubkey,
+          channelTags.single[1],
+          _subscriptionEpoch,
+        ),
+      );
+      return;
+    }
     final frames = _decryptFrames(event, normalizedAgent, privHex);
     if (frames == null) return;
 
@@ -201,6 +235,47 @@ class ObserverRelayNotifier extends Notifier<ObserverRelayState> {
     }
 
     if (storageChanged) {
+      _errorMessage = null;
+      _emit(connection: ObserverConnectionState.open);
+    }
+  }
+
+  Future<void> _handleSharedEvent(
+    NostrEvent event,
+    String agent,
+    String privateKey,
+    String recipient,
+    String channel,
+    int epoch,
+  ) async {
+    final frames = _decryptFrames(
+      event,
+      agent,
+      privateKey,
+      sharedChannel: channel,
+    );
+    if (frames == null) return;
+    final config = ref.read(relayConfigProvider);
+    final admitted = await authorizeObserverChannel(
+      ref.read(relaySessionProvider.notifier),
+      config,
+      agent,
+      recipient,
+      channel,
+    );
+    if (!admitted ||
+        _disposed ||
+        epoch != _subscriptionEpoch ||
+        _identityKey != '${config.baseUrl}|${config.nsec ?? ''}' ||
+        ref.read(relayConfigProvider).baseUrl != config.baseUrl ||
+        ref.read(relayConfigProvider).nsec != config.nsec) {
+      return;
+    }
+    var changed = false;
+    for (final frame in frames) {
+      if (_storeFrame(agent, frame)) changed = true;
+    }
+    if (changed) {
       _errorMessage = null;
       _emit(connection: ObserverConnectionState.open);
     }
@@ -237,8 +312,9 @@ class ObserverRelayNotifier extends Notifier<ObserverRelayState> {
   List<ObserverFrame>? _decryptFrames(
     NostrEvent event,
     String normalizedAgent,
-    String privHex,
-  ) {
+    String privHex, {
+    String? sharedChannel,
+  }) {
     try {
       final conversationKey = _conversationKeysByAgent.putIfAbsent(
         normalizedAgent,
@@ -246,6 +322,29 @@ class ObserverRelayNotifier extends Notifier<ObserverRelayState> {
       );
       final plaintext = nip44Decrypt(conversationKey, event.content);
       final json = jsonDecode(plaintext) as Map<String, dynamic>;
+      if (sharedChannel != null) {
+        if (json['channelId'] != sharedChannel ||
+            json['kind'] is! String ||
+            (json['kind'] as String).isEmpty) {
+          return null;
+        }
+        if (json['kind'] == _observerBatchKind) {
+          final payload = json['payload'];
+          final events = payload is Map ? payload['events'] : null;
+          if (events is! List ||
+              events.isEmpty ||
+              events.any(
+                (item) =>
+                    item is! Map ||
+                    item['channelId'] != sharedChannel ||
+                    item['kind'] is! String ||
+                    (item['kind'] as String).isEmpty ||
+                    item['kind'] == _observerBatchKind,
+              )) {
+            return null;
+          }
+        }
+      }
       final frame = ObserverFrame.fromJson(json);
       if (frame.kind != _observerBatchKind) {
         return [frame];

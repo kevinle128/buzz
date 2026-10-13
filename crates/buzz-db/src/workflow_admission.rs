@@ -8,8 +8,11 @@ use uuid::Uuid;
 
 use buzz_core::{CommunityId, StoredEvent};
 
+use buzz_datastore_tracing::datastore_span;
+
 use crate::error::{DbError, Result};
 use crate::workflow::{row_to_run_record, RunStatus, WorkflowRunFailure, WorkflowRunRecord};
+use crate::Db;
 
 const MATCHED_IDENTITY_TIERS: &[&str] = &["d_tag", "alias", "clone_basename", "display_name"];
 
@@ -249,6 +252,27 @@ pub async fn begin_workflow_admission(
             idempotency_key_hash: *idempotency_key_hash,
             payload_hash: *payload_hash,
         })),
+    }
+}
+
+impl Db {
+    /// Begin serialized idempotent admission for a dynamically routed workflow run.
+    #[datastore_span(name = "begin_workflow_admission", system = "postgresql")]
+    pub async fn begin_workflow_admission(
+        &self,
+        community_id: CommunityId,
+        workflow_id: Uuid,
+        idempotency_key_hash: &[u8; 32],
+        payload_hash: &[u8; 32],
+    ) -> Result<BeginWorkflowAdmission> {
+        begin_workflow_admission(
+            &self.pool,
+            community_id,
+            workflow_id,
+            idempotency_key_hash,
+            payload_hash,
+        )
+        .await
     }
 }
 

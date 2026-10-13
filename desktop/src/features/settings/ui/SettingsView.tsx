@@ -7,11 +7,11 @@ import {
   canManageCommunityMembers,
   shouldWarnMissingMembershipSnapshot,
 } from "@/shared/api/relayMembers";
-import { getFeature } from "@/shared/features/manifest";
 import {
+  getFeature,
   resolveEnabled,
   useFeatureSnapshot,
-} from "@/shared/features/useFeatureEnabled";
+} from "@/shared/features";
 import { topChromeBackdrop } from "@/shared/layout/chromeLayout";
 import { cn } from "@/shared/lib/cn";
 import {
@@ -48,7 +48,7 @@ type SettingsViewProps = SettingsPanelProps & {
   section: SettingsSection;
 };
 
-const settingsNavGroups: Array<{
+export const settingsNavGroups: Array<{
   label: string;
   sections: SettingsSection[];
 }> = [
@@ -67,7 +67,12 @@ const settingsNavGroups: Array<{
   },
   {
     label: "Communities",
-    sections: ["hosted-communities", "community-members", "apps"],
+    sections: [
+      "hosted-communities",
+      "community-members",
+      "relay-admin",
+      "apps",
+    ],
   },
   {
     label: "App",
@@ -137,7 +142,10 @@ export function SettingsView({
       // stable and renders unconditionally (fail-open).
       if (s.featureGate) {
         const feature = getFeature(s.featureGate);
-        if (feature && !resolveEnabled(s.featureGate, featureState)) {
+        if (
+          feature &&
+          !resolveEnabled(s.featureGate, featureState, feature.defaultEnabled)
+        ) {
           return false;
         }
       }
@@ -145,6 +153,13 @@ export function SettingsView({
       // role. Open relays have no membership snapshot or these controls.
       if (s.value === "community-members" || s.value === "apps") {
         return canManageCommunityMembers(myMembershipQuery.data);
+      }
+      // Relay admin surfaces the relay admin console. Always reachable so an
+      // operator can enter a manual origin even when NIP-11 discovery is
+      // absent, invalid, or pending — hiding the entry would lock them out of
+      // the only place to configure one. Auth still gates the panel itself.
+      if (s.value === "relay-admin") {
+        return true;
       }
       return true;
     });

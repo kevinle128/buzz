@@ -40,6 +40,7 @@ export function ProjectAuthorIdentity({
                 accent={profile?.isAgent === true}
                 avatarUrl={profile?.avatarUrl ?? null}
                 displayName={label}
+                shape={profile?.isAgent ? "squircle" : "circle"}
                 fallbackDelayMs={0}
                 size="xs"
                 testId={testId ? `${testId}-avatar` : undefined}
@@ -61,12 +62,13 @@ export function ProjectAuthorIdentity({
               accent={profile?.isAgent === true}
               avatarUrl={profile?.avatarUrl ?? null}
               displayName={label}
+              shape={profile?.isAgent ? "squircle" : "circle"}
               fallbackDelayMs={0}
               size="sm"
             />
             <span className="min-w-0">
               <span className="block truncate font-medium">{label}</span>
-              <span className="block text-primary-foreground/70">
+              <span className="block text-secondary-foreground/70">
                 {roleLabel}
               </span>
             </span>

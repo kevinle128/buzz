@@ -37,7 +37,7 @@ nostr.Event _signMetadata({
 
 void main() {
   test(
-    'queries kind 39007 from the active relay self and folds heads',
+    'queries kind 39008 from the active relay self and folds heads',
     () async {
       final metadata = _fromNostr(
         _signMetadata(keys: _communityOne, name: 'Archon'),

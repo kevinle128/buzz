@@ -106,6 +106,8 @@ Commands:
   start         Start Buzz with docker compose up -d --wait
   stop          Stop containers without deleting volumes
   restart       Recreate the relay after env/image changes
+  redeploy [opts]
+                Rebuild (or pull) the relay image and recreate the relay
   pull          Pull configured images
   upgrade       Pull and restart, then print backup reminders
   logs [svc]    Follow logs (default: relay)
@@ -131,6 +133,10 @@ MSG
   bootstrap-local)
     shift
     exec "${SCRIPT_DIR}/bootstrap-local.sh" "$@"
+    ;;
+  redeploy)
+    shift || true
+    exec "${SCRIPT_DIR}/redeploy.sh" "$@"
     ;;
   *)
     echo "Unknown command: $1" >&2

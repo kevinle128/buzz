@@ -39,14 +39,15 @@ class _ThreadMessage extends HookConsumerWidget {
     final profile =
         ref.watch(userCacheProvider.select((cache) => cache[pk])) ??
         ref.read(userCacheProvider.notifier).get(pk);
-    final isApp = message.isApp;
-    final displayName = isApp
-        ? (message.appDisplayName?.trim().isNotEmpty == true
-              ? message.appDisplayName!.trim()
-              : 'App')
-        : (profile?.label ?? shortPubkey(message.pubkey));
+    final displayName = message.isApp
+        ? message.appDisplayName ?? 'App'
+        : watchChannelIdentityLabel(ref, channelId, pk);
+    final isAgent =
+        !message.isApp &&
+        (ref.watch(agentMentionPubkeysProvider(channelId)).contains(pk) ||
+            profile?.ownerPubkey != null);
     final canManageMessage =
-        !isApp &&
+        !message.isApp &&
         (currentPubkey?.toLowerCase() == pk ||
             (profile?.ownerPubkey != null &&
                 profile?.ownerPubkey == currentPubkey?.toLowerCase()));
@@ -76,6 +77,11 @@ class _ThreadMessage extends HookConsumerWidget {
       profileMentionNames: mentionNames,
       directoryDisplayNames: ref.watch(agentDirectoryDisplayNamesProvider),
       agentMentionPubkeys: agentMentionPubkeys,
+    );
+    final mentionLabels = watchChannelIdentityLabels(
+      ref,
+      channelId,
+      message.mentionPubkeys,
     );
 
     void openMessageActions(MessageLongPressDetails details) {
@@ -158,23 +164,22 @@ class _ThreadMessage extends HookConsumerWidget {
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         if (showAuthor)
-                          isApp
-                              ? _Avatar(
-                                  profile: null,
-                                  pubkey: message.pubkey,
-                                  imageUrl: message.appPicture,
-                                  fallbackLabel: displayName,
-                                )
-                              : GestureDetector(
-                                  onTap: () => showUserProfileSheet(
+                          GestureDetector(
+                            onTap: message.isApp
+                                ? null
+                                : () => showUserProfileSheet(
                                     context,
                                     message.pubkey,
+                                    names: channelIdentityNamesProvider(
+                                      channelId,
+                                    ),
                                   ),
-                                  child: _Avatar(
-                                    profile: profile,
-                                    pubkey: message.pubkey,
-                                  ),
-                                )
+                            child: _Avatar(
+                              profile: profile,
+                              message: message,
+                              isAgent: isAgent,
+                            ),
+                          )
                         else
                           const SizedBox(width: messageAvatarSize),
                         const SizedBox(width: messageAvatarContentGap),
@@ -196,24 +201,28 @@ class _ThreadMessage extends HookConsumerWidget {
                                         Expanded(
                                           child: MessageAuthorMeta(
                                             displayName: displayName,
-                                            username: isApp
+                                            username: message.isApp
                                                 ? null
                                                 : messageUsernameLabel(profile),
+                                            badge: message.isApp
+                                                ? const AppBadge()
+                                                : null,
                                             timestamp: formatMessageTime(
                                               message.createdAt,
                                             ),
                                             nameColor: context.colors.onSurface,
                                             metadataColor:
                                                 context.colors.onSurfaceVariant,
-                                            onAuthorTap: isApp
+                                            onAuthorTap: message.isApp
                                                 ? null
                                                 : () => showUserProfileSheet(
                                                     context,
                                                     message.pubkey,
+                                                    names:
+                                                        channelIdentityNamesProvider(
+                                                          channelId,
+                                                        ),
                                                   ),
-                                            badge: isApp
-                                                ? const AppBadge()
-                                                : null,
                                             displayNameKey: ValueKey(
                                               'thread-message-author-${message.id}',
                                             ),
@@ -244,6 +253,7 @@ class _ThreadMessage extends HookConsumerWidget {
                                 MessageContent(
                                   content: message.content,
                                   mentionNames: resolvedMentionNames,
+                                  mentionLabels: mentionLabels,
                                   agentMentionPubkeys: agentMentionPubkeys,
                                   channelNames: channelNames,
                                   tags: message.tags,
@@ -294,7 +304,13 @@ class _ThreadMessage extends HookConsumerWidget {
                                     );
                                   },
                                   onMentionTap: (pubkey) =>
-                                      showUserProfileSheet(context, pubkey),
+                                      showUserProfileSheet(
+                                        context,
+                                        pubkey,
+                                        names: channelIdentityNamesProvider(
+                                          channelId,
+                                        ),
+                                      ),
                                 ),
                               ],
                             ),
@@ -310,6 +326,7 @@ class _ThreadMessage extends HookConsumerWidget {
                       ),
                       child: ReactionRow(
                         messageId: message.id,
+                        channelId: channelId,
                         reactions: message.reactions,
                         onToggle: (emoji) =>
                             toggleReaction(ref, message, emoji),

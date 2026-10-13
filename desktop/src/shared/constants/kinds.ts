@@ -21,7 +21,7 @@ export const KIND_STREAM_MESSAGE_EDIT = 40003;
 export const KIND_CHANNEL_THREAD_SUMMARY = 39005;
 export const KIND_CHANNEL_WINDOW_BOUNDS = 39006;
 export const KIND_APP_ADMIN_COMMAND = 9038;
-export const KIND_APP_METADATA = 39007;
+export const KIND_APP_METADATA = 39008;
 export const KIND_STREAM_MESSAGE_DIFF = 40008;
 export const KIND_REMINDER = 40007;
 export const KIND_SYSTEM_MESSAGE = 40099;
@@ -43,6 +43,7 @@ export const KIND_HUDDLE_STARTED = 48100;
 export const KIND_HUDDLE_PARTICIPANT_JOINED = 48101;
 export const KIND_HUDDLE_PARTICIPANT_LEFT = 48102;
 export const KIND_HUDDLE_ENDED = 48103;
+export const KIND_HUDDLE_LIVENESS = 48104;
 // NIP-78 application-specific data. All use kind 30078; the relay
 // differentiates them by d-tag ("read-state:<slotId>", "channel-sections",
 // "channel-mutes", "channel-stars", "channel-sort", "project-sidebar-membership").
@@ -59,6 +60,11 @@ export const KIND_COMMUNITY_THEME = 30078;
 export const KIND_PERSONA = 30175;
 export const KIND_TEAM = 30176;
 export const KIND_MANAGED_AGENT = 30177;
+// Team catalog projection: a self-contained snapshot of a team plus every
+// member's safe definition, so a recipient can rebuild it without reading the
+// publisher's personas. Separate from KIND_TEAM (30176, the team's own wire
+// body) so an ordinary team edit cannot disturb catalog share state.
+export const KIND_TEAM_CATALOG = 30178;
 export const KIND_USER_STATUS = 30315;
 export const KIND_AGENT_OBSERVER_FRAME = 24200;
 export const KIND_AGENT_TURN_METRIC = 44200;

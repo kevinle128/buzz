@@ -4,7 +4,7 @@ import 'nostr_models.dart';
 
 final _relayPubkeyPattern = RegExp(r'^[0-9a-f]{64}$');
 
-/// Verified kind 39007 App metadata head.
+/// Verified kind 39008 App metadata head.
 final class AppMetadata {
   final String appId;
   final String name;
@@ -93,7 +93,7 @@ bool _hasValidEventIdAndSignature(NostrEvent event) {
   }
 }
 
-/// Parse one kind 39007 event. Returns null on any validation failure.
+/// Parse one kind 39008 event. Returns null on any validation failure.
 AppMetadata? parseAppMetadata(NostrEvent event, String? relaySelfPubkey) {
   final relayPubkey = _normalizeRelayPubkey(relaySelfPubkey);
   if (relayPubkey == null || event.kind != EventKind.appMetadata) {

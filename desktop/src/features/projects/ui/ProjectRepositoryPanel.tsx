@@ -46,6 +46,7 @@ import {
   PROJECT_DETAIL_PANEL_CLASS,
   PROJECT_DETAIL_PANEL_MESSAGE_CLASS,
 } from "./projectPanelStyles";
+import { ProjectRepositoryLatestCommitRow } from "./ProjectRepositoryLatestCommitRow";
 import { GitHubRepoStateRecovery } from "./GitHubRepoStateRecovery";
 import {
   type RepoSourceHeaderControls,
@@ -618,6 +619,7 @@ export function RepositoryFilesPanel({
   profiles,
   fallbackAuthorPubkey,
   onContextChange,
+  onOpenCommit,
   sourceControls,
   unavailableMessage,
 }: {
@@ -632,6 +634,7 @@ export function RepositoryFilesPanel({
     kind: "file" | "folder";
     path: string;
   }) => void;
+  onOpenCommit?: (commitHash: string) => void;
   /** Branch picker + remote/local toggle rendered in the panel header. */
   sourceControls?: RepoSourceHeaderControls;
   unavailableMessage?: string;
@@ -871,7 +874,14 @@ export function RepositoryFilesPanel({
       <div className="overflow-x-auto px-2 pb-2">
         <table className="w-full border-separate border-spacing-y-0.5 caption-bottom text-sm">
           <thead>
-            <tr className="border-border/50 border-b bg-muted/20">
+            <ProjectRepositoryLatestCommitRow
+              commitShortHash={latestCommit?.shortHash}
+              onOpen={
+                latestCommit && onOpenCommit
+                  ? () => onOpenCommit(latestCommit.hash)
+                  : undefined
+              }
+            >
               <th className="px-4 py-3 text-left font-normal" colSpan={3}>
                 {latestCommit ? (
                   <div className="flex min-w-0 items-center justify-between gap-3 text-sm">
@@ -920,7 +930,7 @@ export function RepositoryFilesPanel({
                   </p>
                 )}
               </th>
-            </tr>
+            </ProjectRepositoryLatestCommitRow>
           </thead>
           <tbody>
             {visibleEntries.map((entry, index) => {

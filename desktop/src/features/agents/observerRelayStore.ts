@@ -6,11 +6,18 @@ import type { ControlResultFrame } from "@/shared/api/types";
 import { putAgentSessionConfig } from "@/shared/api/tauri";
 import { putManagedAgentRuntimeLifecycle } from "@/shared/api/tauriManagedAgents";
 import { getIdentity } from "@/shared/api/tauriIdentity";
-import { decryptObserverEvent } from "@/shared/api/tauriObserver";
+import {
+  decryptObserverEvent,
+  decryptArchivedObserverEvent,
+} from "@/shared/api/tauriObserver";
 import {
   parseAgentManagementRequest,
   type AgentManagementRequest,
 } from "./agentManagement";
+import {
+  parseProjectChannelRequest,
+  type ProjectChannelRequest,
+} from "@/features/projects/projectChannelRequest";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import { useQueryClient } from "@tanstack/react-query";
 import { agentConfigSurfaceQueryKey } from "@/features/agents/hooks";
@@ -133,6 +140,9 @@ const controlResultListeners = new Map<
 
 const agentManagementListeners = new Set<
   (agentPubkey: string, request: AgentManagementRequest) => void
+>();
+const projectChannelRequestListeners = new Set<
+  (agentPubkey: string, request: ProjectChannelRequest) => void
 >();
 
 // Normalized pubkeys of agents we are actively managing. Only events whose
@@ -495,6 +505,7 @@ function unwrapObserverBatch(parsed: ObserverEvent): ObserverEvent[] {
 function processLiveObserverEvents(
   agentPubkey: string,
   events: readonly ObserverEvent[],
+  ownerCallbacks = true,
 ) {
   // Commit the full envelope before dispatching synchronous specialized
   // callbacks. Those callbacks historically observed their triggering frame
@@ -532,15 +543,24 @@ function processLiveObserverEvents(
         });
       }
     }
+    if (!ownerCallbacks) continue;
     const managementRequest = parseAgentManagementRequest(parsed.payload);
     if (managementRequest) {
       for (const listener of agentManagementListeners) {
         listener(agentPubkey, managementRequest);
       }
     }
+    const projectChannelRequest = parseProjectChannelRequest(parsed.payload);
+    if (projectChannelRequest) {
+      for (const listener of projectChannelRequestListeners) {
+        listener(agentPubkey, projectChannelRequest);
+      }
+    }
     if (parsed.kind === "session_config_captured") {
-      void putAgentSessionConfig(agentPubkey, parsed.payload);
-      onSessionConfigCaptured?.(agentPubkey);
+      // Refresh only after the store settles, so readers see the new options.
+      void putAgentSessionConfig(agentPubkey, parsed.payload)
+        .catch((error) => console.warn("Session config not stored:", error))
+        .then(() => onSessionConfigCaptured?.(agentPubkey));
     } else if (parsed.kind === "control_result") {
       // Thread the envelope's channelId into the frame so the ModelPicker can
       // count a terminal switch result once per distinct channel.
@@ -561,9 +581,35 @@ function processLiveObserverEvents(
   }
 }
 
+function validSharedObserverPayload(
+  parsed: ObserverEvent,
+  channel: string,
+): boolean {
+  if (
+    !parsed ||
+    parsed.channelId !== channel ||
+    typeof parsed.kind !== "string" ||
+    parsed.kind.length === 0
+  )
+    return false;
+  if (parsed.kind !== "batch") return true;
+  const inner = (parsed.payload as { events?: unknown } | null)?.events;
+  return (
+    Array.isArray(inner) &&
+    inner.length > 0 &&
+    inner.every(
+      (item) =>
+        item &&
+        item.kind !== "batch" &&
+        validSharedObserverPayload(item, channel),
+    )
+  );
+}
+
 async function handleRelayObserverEvent(
   event: RelayEvent,
   activeGeneration: number,
+  decrypt: (event: RelayEvent) => Promise<unknown> = decryptObserverEvent,
 ) {
   const agentPubkey = observerTag(event, "agent");
   const frame = observerTag(event, "frame");
@@ -571,10 +617,15 @@ async function handleRelayObserverEvent(
     return;
   }
 
+  const channels = event.tags.filter(([name]) => name === "h");
+  const sharedChannel =
+    channels.length === 1 && channels[0].length === 2 ? channels[0][1] : null;
+  if (channels.length > 0 && !sharedChannel) return;
+
   // Ownership data arrives asynchronously during startup. Buffer raw signed
   // frames until the first trusted-agent set is registered, then re-run this
   // same gate. Once initialized, unknown agents are rejected immediately.
-  if (!knownAgentPubkeys.has(normalizePubkey(agentPubkey))) {
+  if (!sharedChannel && !knownAgentPubkeys.has(normalizePubkey(agentPubkey))) {
     if (knownAgentsBySubscription.size === 0 || knownAgentPubkeys.size === 0) {
       pendingUnknownAgentFrames.push(event);
       if (pendingUnknownAgentFrames.length > MAX_PENDING_UNKNOWN_AGENT_FRAMES) {
@@ -591,11 +642,17 @@ async function handleRelayObserverEvent(
   }
 
   try {
-    const parsed = (await decryptObserverEvent(event)) as ObserverEvent;
+    const parsed = (await decrypt(event)) as ObserverEvent;
     if (activeGeneration !== generation) {
       return;
     }
-    processLiveObserverEvents(agentPubkey, unwrapObserverBatch(parsed));
+    if (sharedChannel && !validSharedObserverPayload(parsed, sharedChannel))
+      return;
+    processLiveObserverEvents(
+      agentPubkey,
+      unwrapObserverBatch(parsed),
+      !sharedChannel,
+    );
   } catch (error) {
     if (activeGeneration !== generation) {
       return;
@@ -724,6 +781,15 @@ export function subscribeAgentManagementRequests(
   };
 }
 
+export function subscribeProjectChannelRequests(
+  listener: (agentPubkey: string, request: ProjectChannelRequest) => void,
+) {
+  projectChannelRequestListeners.add(listener);
+  return () => {
+    projectChannelRequestListeners.delete(listener);
+  };
+}
+
 export function subscribeControlResults(
   agentPubkey: string,
   listener: (frame: ControlResultFrame) => void,
@@ -839,30 +905,19 @@ export function useManagedAgentObserverBridge(
 }
 
 /**
- * Ingest a batch of raw archived observer events from the local archive into
- * the store. Applies the same security guards as the live relay path:
- *
- * - Event must have an `agent` tag pointing to a known/trusted pubkey
- *   (registered via `useManagedAgentObserverBridge`).
- * - The event sender (`pubkey`) must match the `agent` tag value.
- * - Event must decrypt successfully via `decryptObserverEvent`.
- *
- * Routes through `appendAgentEvent` so dedup on `(seq, timestamp)` and
- * sort are reused — archived events that are already present (live-delivered)
- * are silently skipped. Failed decryptions are silently dropped (same as
- * live path error handling).
- *
- * Note: events for agents not currently registered in `knownAgentPubkeys`
- * (e.g. an agent that is stopped but has archived history) are dropped.
- * The caller should ensure the agent is registered before calling.
- *
- * `_decryptFn` is only used by tests to inject a mock decryption function.
- * Production callers must always omit it.
+ * Replay locally retained observer events, with signed route and payload binding
+ * checked by native decryption. Legacy frames require the owner-trusted agent set;
+ * channel frames retain the admission under which they were archived.
+ * This does not dispatch live owner management or control callbacks.
+ * `_decryptFn` is a test seam; production callers omit it.
  */
 export async function ingestArchivedObserverEvents(
   rawEvents: RelayEvent[],
-  _decryptFn: (event: RelayEvent) => Promise<unknown> = decryptObserverEvent,
+  _decryptFn: (
+    event: RelayEvent,
+  ) => Promise<unknown> = decryptArchivedObserverEvent,
 ): Promise<void> {
+  const activeGeneration = generation;
   let archiveChanged = false;
   for (const event of rawEvents) {
     const agentPubkey = observerTag(event, "agent");
@@ -870,7 +925,11 @@ export async function ingestArchivedObserverEvents(
     if (!agentPubkey || frame !== "telemetry") {
       continue;
     }
-    if (!knownAgentPubkeys.has(normalizePubkey(agentPubkey))) {
+    const channels = event.tags.filter(([name]) => name === "h");
+    const channel =
+      channels.length === 1 && channels[0].length === 2 ? channels[0][1] : null;
+    if (channels.length > 0 && !channel) continue;
+    if (!channel && !knownAgentPubkeys.has(normalizePubkey(agentPubkey))) {
       continue;
     }
     if (normalizePubkey(event.pubkey) !== normalizePubkey(agentPubkey)) {
@@ -878,6 +937,8 @@ export async function ingestArchivedObserverEvents(
     }
     try {
       const parsed = (await _decryptFn(event)) as ObserverEvent;
+      if (activeGeneration !== generation) return;
+      if (channel && !validSharedObserverPayload(parsed, channel)) continue;
       for (const inner of unwrapObserverBatch(parsed)) {
         // Route archived events to the channel-scoped archive window (no cap)
         // rather than the per-agent live-relay store (MAX_OBSERVER_EVENTS cap).
@@ -956,6 +1017,7 @@ export function resetAgentObserverStore() {
   pendingUnknownAgentFrames.length = 0;
   latestLiveSessionByAgentChannel.clear();
   agentManagementListeners.clear();
+  projectChannelRequestListeners.clear();
   onSessionConfigCaptured = null;
   connectionState = "idle";
   errorMessage = null;
@@ -996,4 +1058,12 @@ export function _testGetArchivedChannelEvents(
   return (
     archiveEventsByChannel.get(archiveChannelKey(agentPubkey, channelId)) ?? []
   );
+}
+
+/** Test-only entry to the live receiver; authorization stays in native decryption. */
+export function _testHandleRelayObserverEvent(
+  event: RelayEvent,
+  decrypt: (event: RelayEvent) => Promise<unknown>,
+) {
+  return handleRelayObserverEvent(event, generation, decrypt);
 }

@@ -1,4 +1,12 @@
-import { Bell, Clock, Ellipsis, ExternalLink, MailOpen } from "lucide-react";
+import {
+  AlertCircle,
+  Bell,
+  Clock,
+  Ellipsis,
+  ExternalLink,
+  LoaderCircle,
+  MailOpen,
+} from "lucide-react";
 import * as React from "react";
 
 import {
@@ -15,7 +23,6 @@ import {
   DraftsPanel,
   type DraftViewItem,
 } from "@/features/messages/ui/DraftsPanel";
-import { MessageAppBadge } from "@/features/messages/ui/MessageAuthorIdentity";
 import { UserProfilePopover } from "@/features/profile/ui/UserProfilePopover";
 import type { Reminder } from "@/features/reminders/lib/reminderTypes";
 import { isDue } from "@/features/reminders/lib/reminderFilters";
@@ -216,6 +223,8 @@ type InboxListPaneProps = {
   onMarkRead: (itemId: string) => void;
   onMarkUnread: (itemId: string) => void;
   onOpenDirect: (item: InboxItem) => void;
+  isReopenPending?: (channelId: string | null | undefined) => boolean;
+  isReopenErrored?: (channelId: string | null | undefined) => boolean;
   onRemindLater: (item: InboxItem) => void;
   onSelect: (itemId: string) => void;
   onSelectDraft: (draftKey: string) => void;
@@ -244,6 +253,8 @@ export function InboxListPane({
   onMarkRead,
   onMarkUnread,
   onOpenDirect,
+  isReopenPending,
+  isReopenErrored,
   onRemindLater,
   onSelect,
   onSelectDraft,
@@ -304,11 +315,18 @@ export function InboxListPane({
         (eventId) => activeReminderEventIds?.has(eventId) ?? false,
       );
     const hasChannelTarget = Boolean(item.item.channelId);
+    const isReopening = isReopenPending?.(item.item.channelId) ?? false;
+    const hasReopenError = isReopenErrored?.(item.item.channelId) ?? false;
+    const canOpen = hasChannelTarget && !isReopening;
+    const openLabel = !hasChannelTarget
+      ? "No channel link"
+      : isReopening
+        ? "Reopening…"
+        : "Open in channel";
     const typeLabel = getInboxTypeLabel(item);
     const videoReviewCommentRootId = getInboxVideoReviewCommentRootId(item);
-    const isApp = item.isApp === true;
     const isSenderAgent =
-      !isApp && agentPubkeys?.has(normalizePubkey(item.item.pubkey)) === true;
+      agentPubkeys?.has(normalizePubkey(item.item.pubkey)) === true;
     const profileRole = isSenderAgent ? "bot" : undefined;
     const rowHighlightColor = isSelected
       ? "color-mix(in srgb, hsl(var(--background)) 70%, hsl(var(--muted)) 30%)"
@@ -359,71 +377,47 @@ export function InboxListPane({
           <div className="flex min-w-0 items-start gap-2.5">
             <div
               className="relative shrink-0"
-              data-inbox-profile-trigger={isApp ? undefined : "true"}
+              data-inbox-profile-trigger="true"
             >
-              {isApp ? (
-                <span
-                  className="inline-flex shrink-0 rounded-full"
-                  data-testid={`home-inbox-avatar-${item.id}`}
-                >
+              <UserProfilePopover
+                botIdenticonValue={item.senderLabel}
+                pubkey={item.item.pubkey}
+                role={profileRole}
+                triggerClassName={cn(
+                  "shrink-0 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring",
+                  isSenderAgent ? "rounded-[30%]" : "rounded-full",
+                )}
+                triggerElement="span"
+                triggerTestId={`home-inbox-avatar-${item.id}`}
+              >
+                <span className="inline-flex shrink-0">
                   <UserAvatar
                     avatarUrl={item.avatarUrl}
                     className="h-9 w-9"
                     displayName={item.senderLabel}
+                    shape={isSenderAgent ? "squircle" : "circle"}
                     size="md"
                   />
                 </span>
-              ) : (
-                <UserProfilePopover
-                  botIdenticonValue={item.senderLabel}
-                  pubkey={item.item.pubkey}
-                  role={profileRole}
-                  triggerElement="span"
-                >
-                  <span
-                    className="inline-flex shrink-0 rounded-full focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
-                    data-testid={`home-inbox-avatar-${item.id}`}
-                  >
-                    <UserAvatar
-                      avatarUrl={item.avatarUrl}
-                      className="h-9 w-9"
-                      displayName={item.senderLabel}
-                      size="md"
-                    />
-                  </span>
-                </UserProfilePopover>
-              )}
+              </UserProfilePopover>
             </div>
 
             <div className="min-w-0 flex-1">
               <div className="flex min-w-0 items-start gap-2">
                 <span
-                  className="flex min-w-0 flex-1 items-center gap-1.5 leading-4"
-                  data-inbox-profile-trigger={isApp ? undefined : "true"}
+                  className="flex min-w-0 flex-1 items-start leading-4"
+                  data-inbox-profile-trigger="true"
                 >
-                  {isApp ? (
-                    <span
-                      className="block max-w-full truncate rounded text-sm font-semibold leading-4 text-foreground"
-                      data-testid="home-inbox-sender"
-                    >
+                  <UserProfilePopover
+                    botIdenticonValue={item.senderLabel}
+                    pubkey={item.item.pubkey}
+                    role={profileRole}
+                    triggerElement="span"
+                  >
+                    <span className="block max-w-full truncate rounded text-sm font-semibold leading-4 text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring">
                       {item.senderLabel}
                     </span>
-                  ) : (
-                    <UserProfilePopover
-                      botIdenticonValue={item.senderLabel}
-                      pubkey={item.item.pubkey}
-                      role={profileRole}
-                      triggerElement="span"
-                    >
-                      <span
-                        className="block max-w-full truncate rounded text-sm font-semibold leading-4 text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
-                        data-testid="home-inbox-sender"
-                      >
-                        {item.senderLabel}
-                      </span>
-                    </UserProfilePopover>
-                  )}
-                  {isApp ? <MessageAppBadge /> : null}
+                  </UserProfilePopover>
                 </span>
                 <span
                   className={cn(
@@ -457,6 +451,47 @@ export function InboxListPane({
                 >
                   <Bell className="h-3 w-3" />
                   Reminder due
+                </div>
+              ) : null}
+
+              {isReopening || hasReopenError ? (
+                <div
+                  aria-live="polite"
+                  className={cn(
+                    "mt-1 flex items-center gap-1 text-2xs font-medium",
+                    hasReopenError
+                      ? "text-destructive"
+                      : "text-muted-foreground",
+                  )}
+                  data-testid={`home-inbox-reopen-status-${item.id}`}
+                  role="status"
+                >
+                  {isReopening ? (
+                    <>
+                      <LoaderCircle className="h-3 w-3 shrink-0 animate-spin" />
+                      Reopening…
+                    </>
+                  ) : (
+                    <>
+                      <AlertCircle className="h-3 w-3 shrink-0" />
+                      Couldn’t reopen
+                      {canOpen ? (
+                        <button
+                          className="ml-0.5 rounded font-semibold underline underline-offset-2 hover:no-underline focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+                          data-testid={`home-inbox-reopen-retry-${item.id}`}
+                          onClick={(event) => {
+                            // The row wrapper selects on click; stop it so
+                            // Retry only re-issues the reopen for this row.
+                            event.stopPropagation();
+                            onOpenDirect(item);
+                          }}
+                          type="button"
+                        >
+                          Retry
+                        </button>
+                      ) : null}
+                    </>
+                  )}
                 </div>
               ) : null}
 
@@ -497,8 +532,8 @@ export function InboxListPane({
             </InboxRowActionButton>
           )}
           <InboxRowActionButton
-            disabled={!hasChannelTarget}
-            label={hasChannelTarget ? "Open in channel" : "No channel link"}
+            disabled={!canOpen}
+            label={openLabel}
             onClick={() => onOpenDirect(item)}
           >
             <ExternalLink className="!h-4 !w-4" />
@@ -538,15 +573,15 @@ export function InboxListPane({
           )}
           <ContextMenuSeparator />
           <ContextMenuItem
-            disabled={!hasChannelTarget}
+            disabled={!canOpen}
             onClick={() => {
-              if (hasChannelTarget) {
+              if (canOpen) {
                 onOpenDirect(item);
               }
             }}
           >
             <ExternalLink className="h-4 w-4" />
-            {hasChannelTarget ? "Open in channel" : "No channel link"}
+            {openLabel}
           </ContextMenuItem>
           <ContextMenuItem
             disabled={!hasChannelTarget}

@@ -125,6 +125,11 @@ export function ProjectIssueCommentTimeline({
                 avatarUrl={avatarUrl}
                 className="relative z-10 bg-background ring-1 ring-border/70"
                 displayName={authorLabel}
+                shape={
+                  profiles?.[normalizePubkey(comment.author)]?.isAgent
+                    ? "squircle"
+                    : "circle"
+                }
                 size="xs"
               />
             </div>

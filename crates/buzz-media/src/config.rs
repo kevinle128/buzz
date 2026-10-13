@@ -33,6 +33,25 @@ impl FromStr for S3AddressingStyle {
     }
 }
 
+/// Validate the root namespace and return it with one trailing slash.
+/// Empty selects the bucket root; absolute paths and ambiguous segments are invalid.
+pub fn normalize_s3_prefix(prefix: &str) -> Result<String, String> {
+    if prefix.is_empty() {
+        return Ok(String::new());
+    }
+    let root = prefix.strip_suffix('/').unwrap_or(prefix);
+    if root
+        .split('/')
+        .any(|part| part.is_empty() || part == "." || part == "..")
+        || !root
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/-_.".contains(&b))
+    {
+        return Err("BUZZ_S3_PREFIX must contain relative path segments with letters, digits, '-', '_', or '.'".to_string());
+    }
+    Ok(format!("{root}/"))
+}
+
 fn default_max_video_bytes() -> u64 {
     524_288_000 // 500 MB
 }
@@ -56,6 +75,9 @@ pub struct MediaConfig {
     pub s3_secret_key: String,
     /// S3 bucket name.
     pub s3_bucket: String,
+    /// Root namespace within the bucket. Empty keeps the historical bucket layout.
+    #[serde(default)]
+    pub s3_prefix: String,
     /// AWS region for SigV4 request signing (e.g. "us-west-2").
     ///
     /// Must match the region of `s3_endpoint` for real AWS S3, otherwise
@@ -100,6 +122,7 @@ pub struct MediaConfig {
 impl MediaConfig {
     /// Validate configuration at startup. Returns an error on invalid config.
     pub fn validate(&self) -> Result<(), String> {
+        normalize_s3_prefix(&self.s3_prefix)?;
         if !self.public_base_url.ends_with("/media") {
             return Err(format!(
                 "public_base_url must end with /media: got '{}'",
@@ -168,6 +191,7 @@ mod tests {
             s3_access_key: "k".to_string(),
             s3_secret_key: "s".to_string(),
             s3_bucket: "buzz-media".to_string(),
+            s3_prefix: String::new(),
             s3_region: "us-east-1".to_string(),
             s3_addressing_style: S3AddressingStyle::Path,
             max_image_bytes: 1,

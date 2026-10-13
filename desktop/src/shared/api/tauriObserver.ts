@@ -19,3 +19,13 @@ export async function buildObserverControlEvent(input: {
   });
   return JSON.parse(eventJson) as RelayEvent;
 }
+
+/** Decode previously admitted local history without a fresh access check. */
+export async function decryptArchivedObserverEvent(
+  event: RelayEvent,
+): Promise<unknown> {
+  return invokeTauri<unknown>("decrypt_observer_event", {
+    eventJson: JSON.stringify(event),
+    archiveReplay: true,
+  });
+}

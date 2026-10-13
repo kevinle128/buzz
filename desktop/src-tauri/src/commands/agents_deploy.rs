@@ -43,21 +43,17 @@ pub(crate) fn resolve_deploy_model_provider(
 
 /// Serialize the portable launch contract shared with provider-backed agents.
 ///
-/// `descriptor.env` is the authoritative six-layer environment. Policy values
-/// are deliberately separate because providers apply them below that layered
-/// environment, preserving the local spawn's power-user override semantics.
-///
-/// `effective_permission_policy` is the already-resolved per-agent → global →
-/// built-in policy. Pass it from the caller so that this function does not need
-/// the global config; tests can pass `None` to get the built-in default.
-pub(super) fn build_launch_block(
+/// `descriptor.env` is the authoritative six-layer environment for ordinary
+/// values. Desktop-owned settings are reserved, stripped from that layer, and
+/// emitted through `policy_env` so local and provider launches agree.
+fn build_launch_block_for_policy(
     record: &ManagedAgentRecord,
     descriptor: &crate::managed_agents::readiness::EffectiveHarnessDescriptor,
     teams: &[crate::managed_agents::TeamRecord],
     effective_prompt: Option<&str>,
     effective_model: Option<&str>,
     owner_pubkey: &str,
-    effective_permission_policy: Option<crate::managed_agents::permission_policy::PermissionPolicy>,
+    session_policy: crate::managed_agents::AcpSessionPolicy,
 ) -> serde_json::Value {
     use crate::managed_agents::{
         known_acp_runtime, resolve_session_title, DISPLAY_NAME_ENV_VAR, SESSION_TITLE_ENV_VAR,
@@ -83,6 +79,7 @@ pub(super) fn build_launch_block(
         "BUZZ_ACP_AGENTS".into(),
         crate::managed_agents::acp_agents_value(&descriptor.command, record.parallelism),
     );
+    crate::managed_agents::insert_acp_session_policy_env(&mut policy_env, session_policy);
 
     if let Some(value) = effective_prompt {
         policy_env.insert("BUZZ_ACP_SYSTEM_PROMPT".into(), value.to_string());
@@ -101,13 +98,13 @@ pub(super) fn build_launch_block(
         };
         policy_env.insert(model_key.into(), value.to_string());
     }
-    // I-4: remote parity for persisted startup effort. Mirrors the local spawn
-    // path in runtime.rs. The harness reads BUZZ_ACP_EFFORT_LEVEL into
-    // PoolStartup.startup_effort and applies it at first session creation via
-    // resolve_startup_effort().
-    if let Some(ref value) = record.effort_level {
-        policy_env.insert("BUZZ_ACP_EFFORT_LEVEL".into(), value.clone());
-    }
+    // Startup effort needs no remote-specific handling: the harness-agnostic
+    // effort projection already ran inside `resolve_effective_harness_descriptor`,
+    // so `descriptor.env` (→ `launch.env`, tier 2) carries exactly one effort key
+    // holding the effective value, with every foreign/legacy/transport effort key
+    // stripped. Tier 2 later-wins over `policy_env` (tier 1) and no authoritative
+    // tier-3 key collides with an effort key, so the projected value reaches the
+    // remote pod verbatim — identical authority to the local spawn.
     if let Some(value) = record.idle_timeout_seconds {
         policy_env.insert("BUZZ_ACP_IDLE_TIMEOUT".into(), value.to_string());
     }
@@ -124,28 +121,6 @@ pub(super) fn build_launch_block(
         policy_env.insert("BUZZ_ACP_TEAM_INSTRUCTIONS".into(), value);
     }
 
-    // Permission policy: use the caller-resolved value (per-agent → global →
-    // built-in), falling back to the built-in default if the caller did not
-    // provide one. Tests pass `None`; production callers pass the result of
-    // `resolve_effective_permission_policy(record, global_config)`.
-    {
-        let policy = effective_permission_policy.unwrap_or_else(
-            crate::managed_agents::permission_policy::PermissionPolicy::desktop_default,
-        );
-        policy_env.insert(
-            "BUZZ_ACP_PERMISSION_POLICY".into(),
-            policy.as_str().to_string(),
-        );
-    }
-
-    // B5 remote parity: when a canonical effort_level is persisted, strip
-    // BUZZ_ACP_EFFORT_LEVEL from launch.env so it cannot shadow the canonical
-    // value in policy_env (tier 1). In the k8s three-tier model tier 2
-    // (launch.env) overwrites tier 1 (policy_env) — later-wins — so the key
-    // must be absent from tier 2 whenever a canonical value is present.
-    // When effort_level is None there is no canonical to protect, so user
-    // env passthrough stands (env may legitimately seed startup effort).
-    //
     // B2 remote parity: mirror the local A1 model authority. For a Claude
     // launch, ALWAYS strip BOTH BUZZ_ACP_MODEL and ANTHROPIC_MODEL from
     // launch.env — the resolved canonical model rides policy_env.ANTHROPIC_MODEL
@@ -155,9 +130,13 @@ pub(super) fn build_launch_block(
     // canonical model. When no canonical model is present, neither key is in
     // policy_env, so stripping them keeps the remote process free of both —
     // matching local, where `apply_claude_model_env(None)` removes both.
+    //
+    // Effort keys need no stripping here: the projection already reduced
+    // `descriptor.env` to exactly one effort key holding the effective value,
+    // so launch.env carries the authority directly (see the effort note above).
     let is_claude = runtime.map(|r| r.id == "claude").unwrap_or(false);
     let strip_key = |k: &str| {
-        (record.effort_level.is_some() && k.eq_ignore_ascii_case("BUZZ_ACP_EFFORT_LEVEL"))
+        k.eq_ignore_ascii_case(crate::managed_agents::ACP_SESSION_POLICY_ENV_VAR)
             || (is_claude
                 && (k.eq_ignore_ascii_case("BUZZ_ACP_MODEL")
                     || k.eq_ignore_ascii_case("ANTHROPIC_MODEL")))
@@ -178,6 +157,26 @@ pub(super) fn build_launch_block(
     })
 }
 
+#[cfg(test)]
+pub(super) fn build_launch_block(
+    record: &ManagedAgentRecord,
+    descriptor: &crate::managed_agents::readiness::EffectiveHarnessDescriptor,
+    teams: &[crate::managed_agents::TeamRecord],
+    effective_prompt: Option<&str>,
+    effective_model: Option<&str>,
+    owner_pubkey: &str,
+) -> serde_json::Value {
+    build_launch_block_for_policy(
+        record,
+        descriptor,
+        teams,
+        effective_prompt,
+        effective_model,
+        owner_pubkey,
+        crate::managed_agents::AcpSessionPolicy::Channel,
+    )
+}
+
 pub(super) fn ensure_remote_provider_supported(provider: Option<&str>) -> Result<(), String> {
     if provider.map(str::trim) == Some(crate::managed_agents::RELAY_MESH_PROVIDER_ID) {
         return Err(
@@ -189,8 +188,8 @@ pub(super) fn ensure_remote_provider_supported(provider: Option<&str>) -> Result
 }
 
 /// Build the standard agent JSON payload for provider deploy calls.
-pub(crate) fn build_deploy_payload(
-    app: &AppHandle,
+pub(crate) fn build_deploy_payload<R: tauri::Runtime>(
+    app: &AppHandle<R>,
     state: &AppState,
     record: &ManagedAgentRecord,
 ) -> Result<serde_json::Value, String> {
@@ -217,18 +216,14 @@ pub(crate) fn build_deploy_payload(
         crate::managed_agents::resolve_effective_harness_descriptor(record, &personas, &global)
             .map_err(|error| crate::managed_agents::user_facing_harness_error(&error))?;
     let owner_pubkey = super::workspace_owner_hex(state)?;
-    let (effective_policy, _) =
-        crate::managed_agents::permission_policy::resolve_effective_permission_policy(
-            record, &global,
-        );
-    let launch = build_launch_block(
+    let launch = build_launch_block_for_policy(
         record,
         &descriptor,
         &teams,
         effective.system_prompt.value.as_deref(),
         effective.model.value.as_deref(),
         &owner_pubkey,
-        Some(effective_policy),
+        crate::managed_agents::effective_acp_session_policy(record, &personas),
     );
 
     let effective_parallelism =
@@ -340,7 +335,6 @@ mod tests {
             Some("prompt"),
             Some("model"),
             "owner-hex",
-            None,
         );
 
         assert_eq!(launch["command"], "goose");
@@ -367,7 +361,38 @@ mod tests {
         assert_eq!(launch["policy_env"]["BUZZ_ACP_IDLE_TIMEOUT"], "17");
         assert_eq!(launch["policy_env"]["BUZZ_ACP_MAX_TURN_DURATION"], "23");
         assert_eq!(launch["policy_env"]["BUZZ_ACP_AGENTS"], "4");
+        assert_eq!(launch["policy_env"]["BUZZ_ACP_SESSION_POLICY"], "channel");
         assert_eq!(launch["owner_pubkey"], "owner-hex");
+    }
+
+    #[test]
+    fn launch_block_thread_policy_is_authoritative_and_preserves_unrelated_env() {
+        let record = record();
+        let descriptor = EffectiveHarnessDescriptor {
+            command: "goose".into(),
+            args: vec![],
+            env: BTreeMap::from([
+                ("BUZZ_ACP_SESSION_POLICY".to_string(), "channel".to_string()),
+                ("KEEP_ME".to_string(), "yes".to_string()),
+            ]),
+        };
+
+        let launch = build_launch_block_for_policy(
+            &record,
+            &descriptor,
+            &[],
+            None,
+            None,
+            "owner-hex",
+            crate::managed_agents::AcpSessionPolicy::Thread,
+        );
+
+        assert_eq!(launch["policy_env"]["BUZZ_ACP_SESSION_POLICY"], "thread");
+        assert!(
+            launch["env"]["BUZZ_ACP_SESSION_POLICY"].is_null(),
+            "desktop policy must not be shadowed by descriptor env"
+        );
+        assert_eq!(launch["env"]["KEEP_ME"], "yes");
     }
 
     #[test]
@@ -388,7 +413,6 @@ mod tests {
             None,
             Some("claude-opus-4"),
             "owner-hex",
-            None,
         );
         assert_eq!(
             launch["policy_env"]["ANTHROPIC_MODEL"], "claude-opus-4",
@@ -425,7 +449,6 @@ mod tests {
             None,
             Some("claude-opus-4"),
             "owner-hex",
-            None,
         );
 
         // Canonical model rides policy_env alone.
@@ -459,7 +482,7 @@ mod tests {
                 ("ANTHROPIC_MODEL".to_string(), "user-opus".to_string()),
             ]),
         };
-        let launch = build_launch_block(&record, &descriptor, &[], None, None, "owner-hex", None);
+        let launch = build_launch_block(&record, &descriptor, &[], None, None, "owner-hex");
 
         assert!(launch["policy_env"]["ANTHROPIC_MODEL"].is_null());
         assert!(launch["policy_env"]["BUZZ_ACP_MODEL"].is_null());
@@ -484,15 +507,8 @@ mod tests {
             args: vec![],
             env: BTreeMap::from([("BUZZ_ACP_MODEL".to_string(), "user-model".to_string())]),
         };
-        let launch = build_launch_block(
-            &record,
-            &descriptor,
-            &[],
-            None,
-            Some("model"),
-            "owner-hex",
-            None,
-        );
+        let launch =
+            build_launch_block(&record, &descriptor, &[], None, Some("model"), "owner-hex");
 
         // goose puts canonical in policy_env, and the user launch.env value is
         // preserved (later-wins is the intended goose behavior).
@@ -501,19 +517,27 @@ mod tests {
     }
 
     #[test]
-    fn launch_block_claude_runtime_injects_effort_level_when_set() {
-        // I-4: remote parity — record.effort_level → BUZZ_ACP_EFFORT_LEVEL in policy_env.
-        let mut record = record();
-        record.effort_level = Some("high".to_string());
+    fn launch_block_claude_runtime_carries_projected_effort_in_launch_env() {
+        // Under the harness-agnostic projection, effort no longer rides
+        // policy_env: `resolve_effective_harness_descriptor` reduces
+        // `descriptor.env` to exactly one effort key (for a keyless claude
+        // runtime, the ACP sentinel) holding the effective value, and
+        // build_launch_block passes that env through to launch.env verbatim.
+        let record = record();
         let descriptor = EffectiveHarnessDescriptor {
             command: "claude".into(),
             args: vec![],
-            env: BTreeMap::new(),
+            // The single projected effort key the descriptor resolver emits.
+            env: BTreeMap::from([("BUZZ_ACP_EFFORT_LEVEL".to_string(), "high".to_string())]),
         };
-        let launch = build_launch_block(&record, &descriptor, &[], None, None, "owner-hex", None);
+        let launch = build_launch_block(&record, &descriptor, &[], None, None, "owner-hex");
         assert_eq!(
-            launch["policy_env"]["BUZZ_ACP_EFFORT_LEVEL"], "high",
-            "claude remote must receive BUZZ_ACP_EFFORT_LEVEL when effort_level is set"
+            launch["env"]["BUZZ_ACP_EFFORT_LEVEL"], "high",
+            "the projected effort key must survive into launch.env"
+        );
+        assert!(
+            launch["policy_env"]["BUZZ_ACP_EFFORT_LEVEL"].is_null(),
+            "effort is not a policy_env value under the projection design"
         );
     }
 
@@ -526,7 +550,7 @@ mod tests {
             args: vec![],
             env: BTreeMap::new(),
         };
-        let launch = build_launch_block(&record, &descriptor, &[], None, None, "owner-hex", None);
+        let launch = build_launch_block(&record, &descriptor, &[], None, None, "owner-hex");
         assert!(
             launch["policy_env"]["BUZZ_ACP_EFFORT_LEVEL"].is_null(),
             "policy_env must NOT contain BUZZ_ACP_EFFORT_LEVEL when effort_level is None"
@@ -540,26 +564,35 @@ mod tests {
     /// authoritative.
     #[test]
     fn launch_block_canonical_effort_strips_user_env_collision() {
+        // Remote parity for the authority collision: the canonical column and a
+        // conflicting user `BUZZ_ACP_EFFORT_LEVEL` both present. The projection
+        // (run inside `resolve_effective_harness_descriptor`) resolves it —
+        // canonical `high` wins over the user `low` transport sentinel — and
+        // build_launch_block carries exactly that one value into launch.env,
+        // identical to the local spawn path.
         let mut record = record();
+        record.runtime = Some("claude".into());
         record.effort_level = Some("high".to_string());
-        let descriptor = EffectiveHarnessDescriptor {
-            command: "claude".into(),
-            args: vec![],
-            // User-supplied conflicting value in descriptor.env.
-            env: BTreeMap::from([("BUZZ_ACP_EFFORT_LEVEL".to_string(), "low".to_string())]),
-        };
-        let launch = build_launch_block(&record, &descriptor, &[], None, None, "owner-hex", None);
+        record
+            .env_vars
+            .insert("BUZZ_ACP_EFFORT_LEVEL".into(), "low".into());
+        let descriptor = crate::managed_agents::resolve_effective_harness_descriptor(
+            &record,
+            &[],
+            &Default::default(),
+        )
+        .expect("claude descriptor resolves");
+        let launch = build_launch_block(&record, &descriptor, &[], None, None, "owner-hex");
 
-        // Canonical must be in policy_env (tier 1).
+        // The projected canonical authority is the single effort value carried.
         assert_eq!(
-            launch["policy_env"]["BUZZ_ACP_EFFORT_LEVEL"], "high",
-            "canonical effort must be in policy_env when record.effort_level is Some"
+            launch["env"]["BUZZ_ACP_EFFORT_LEVEL"], "high",
+            "canonical effort must win the collision and reach launch.env"
         );
-        // Conflicting user value must be absent from launch.env (tier 2) so it
-        // cannot shadow the canonical tier-1 value in build_env.
+        // Effort is not a policy_env value under the projection design.
         assert!(
-            launch["env"]["BUZZ_ACP_EFFORT_LEVEL"].is_null(),
-            "user BUZZ_ACP_EFFORT_LEVEL must be stripped from launch.env when canonical is present"
+            launch["policy_env"]["BUZZ_ACP_EFFORT_LEVEL"].is_null(),
+            "effort is carried in launch.env, never policy_env"
         );
     }
 
@@ -574,7 +607,7 @@ mod tests {
             args: vec![],
             env: BTreeMap::from([("BUZZ_ACP_EFFORT_LEVEL".to_string(), "low".to_string())]),
         };
-        let launch = build_launch_block(&record, &descriptor, &[], None, None, "owner-hex", None);
+        let launch = build_launch_block(&record, &descriptor, &[], None, None, "owner-hex");
 
         // No canonical — key must NOT appear in policy_env.
         assert!(
@@ -602,7 +635,7 @@ mod tests {
             env: BTreeMap::new(),
         };
 
-        let launch = build_launch_block(&record, &descriptor, &[], None, None, "owner-hex", None);
+        let launch = build_launch_block(&record, &descriptor, &[], None, None, "owner-hex");
 
         assert_eq!(
             launch["policy_env"]["BUZZ_ACP_AGENTS"],
@@ -624,7 +657,7 @@ mod tests {
             env: BTreeMap::new(),
         };
 
-        let launch = build_launch_block(&record, &descriptor, &[], None, None, "owner-hex", None);
+        let launch = build_launch_block(&record, &descriptor, &[], None, None, "owner-hex");
 
         assert_eq!(
             launch["policy_env"]["BUZZ_ACP_AGENTS"], "8",
@@ -654,7 +687,7 @@ mod tests {
         };
         let cap = crate::managed_agents::parallelism::OPENCLAW_MAX_PARALLELISM;
 
-        let launch = build_launch_block(&record, &descriptor, &[], None, None, "owner-hex", None);
+        let launch = build_launch_block(&record, &descriptor, &[], None, None, "owner-hex");
         let effective_parallelism =
             crate::managed_agents::effective_parallelism(&descriptor.command, record.parallelism);
         let payload = deploy_payload_json(
@@ -699,7 +732,7 @@ mod tests {
             env: BTreeMap::new(),
         };
 
-        let launch = build_launch_block(&record, &descriptor, &[], None, None, "owner-hex", None);
+        let launch = build_launch_block(&record, &descriptor, &[], None, None, "owner-hex");
         let effective_parallelism =
             crate::managed_agents::effective_parallelism(&descriptor.command, record.parallelism);
         let payload = deploy_payload_json(
@@ -745,7 +778,7 @@ mod tests {
         };
         let cap = crate::managed_agents::parallelism::OPENCLAW_MAX_PARALLELISM;
 
-        let launch = build_launch_block(&record, &descriptor, &[], None, None, "owner-hex", None);
+        let launch = build_launch_block(&record, &descriptor, &[], None, None, "owner-hex");
         let effective_parallelism =
             crate::managed_agents::effective_parallelism(&descriptor.command, record.parallelism);
         let payload = deploy_payload_json(
@@ -770,83 +803,6 @@ mod tests {
         assert_eq!(
             payload["parallelism"], cap,
             "legacy top-level parallelism must match launch.policy_env — both must be {cap}"
-        );
-    }
-
-    /// `build_launch_block` with an explicit `allow` policy injects `allow`.
-    #[test]
-    fn launch_block_explicit_allow_policy_injected() {
-        let record = record();
-        let descriptor = EffectiveHarnessDescriptor {
-            command: "goose".into(),
-            args: vec![],
-            env: BTreeMap::new(),
-        };
-        let launch = build_launch_block(
-            &record,
-            &descriptor,
-            &[],
-            None,
-            None,
-            "owner-hex",
-            Some(crate::managed_agents::permission_policy::PermissionPolicy::Allow),
-        );
-        assert_eq!(
-            launch["policy_env"]["BUZZ_ACP_PERMISSION_POLICY"], "allow",
-            "explicit allow policy must be injected into policy_env"
-        );
-    }
-
-    /// `build_launch_block` with `None` (test callers / no global) falls back to
-    /// the built-in desktop default (`ask`).
-    #[test]
-    fn launch_block_none_policy_falls_back_to_built_in_ask() {
-        let record = record();
-        let descriptor = EffectiveHarnessDescriptor {
-            command: "goose".into(),
-            args: vec![],
-            env: BTreeMap::new(),
-        };
-        let launch = build_launch_block(&record, &descriptor, &[], None, None, "owner-hex", None);
-        assert_eq!(
-            launch["policy_env"]["BUZZ_ACP_PERMISSION_POLICY"], "ask",
-            "None effective_permission_policy must fall back to built-in ask"
-        );
-    }
-
-    /// Production deploy path: global `allow` override is respected when the
-    /// record has no per-agent policy, matching the local-spawn resolver.
-    #[test]
-    fn launch_block_global_allow_policy_used_when_record_has_none() {
-        let mut record = record();
-        record.permission_policy = None;
-        let descriptor = EffectiveHarnessDescriptor {
-            command: "goose".into(),
-            args: vec![],
-            env: BTreeMap::new(),
-        };
-        let global = crate::managed_agents::global_config::GlobalAgentConfig {
-            permission_policy: Some(
-                crate::managed_agents::permission_policy::PermissionPolicy::Allow,
-            ),
-            ..Default::default()
-        };
-        let (effective_policy, _) =
-            crate::managed_agents::permission_policy::resolve_effective_permission_policy(
-                &record, &global,
-            );
-        let launch = build_launch_block(
-            &record,
-            &descriptor,
-            &[],
-            None,
-            None,
-            "owner-hex",
-            Some(effective_policy),
-        );
-        assert_eq!(
-            launch["policy_env"]["BUZZ_ACP_PERMISSION_POLICY"], "allow",
-            "global allow policy must be injected when record has no per-agent policy"
         );
     }
 }

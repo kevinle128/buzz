@@ -1,9 +1,9 @@
-import { Search } from "lucide-react";
 import * as React from "react";
-import { toast } from "sonner";
 
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
+import { useManagedAgentsQuery } from "@/features/agents/hooks";
 import { useUsersBatchQuery } from "@/features/profile/hooks";
+import { ownsAuthorAgent } from "@/features/profile/lib/identity";
 import {
   type Project,
   type ProjectIssue,
@@ -16,27 +16,32 @@ import {
   useProjectsWorkItemsQuery,
 } from "@/features/projects/hooks";
 import { useRepositoryActivitySummariesQuery } from "@/features/projects/repositoryActivityHooks";
-import { useCreateProjectMutation } from "@/features/projects/useCreateProject";
-import { selectProjectRepository } from "@/features/projects/projectModels";
+import { isExplicitProject } from "@/features/projects/projectModels";
+import { projectsWithWorkItemRepositories } from "@/features/projects/projectWorkItems";
 import { useProjectsRepoSnapshotsQuery } from "@/features/projects/useProjectsRepoSnapshots";
+import { buildProjectSelectionAgentContext } from "@/features/projects/lib/projectDetailAgentContext";
+import { buildProjectsActivityDigest } from "@/features/projects/lib/projectsActivityDigest";
+import { matchesProjectsSearch } from "@/features/projects/lib/projectsSearch";
+import type { ProjectSelectionItem } from "@/features/projects/lib/projectSelection";
 import {
   useMemberChannelIds,
   useRepositoryUnavailableReasonFor,
 } from "@/features/projects/useRepositoryAccess";
-import {
-  projectRepoHostForProject,
-  projectRepoHostForRepository,
-} from "@/features/projects/lib/projectRepoHost";
+import { projectRepoHostForProject } from "@/features/projects/lib/projectRepoHost";
 import { ProjectsActivityFeed } from "@/features/projects/ui/ProjectsActivityFeed";
 import { ProjectsChannelsList } from "@/features/projects/ui/ProjectsChannelsList";
-import { ProjectsOverviewContextSheet } from "@/features/projects/ui/ProjectsOverviewContextSheet";
+import {
+  ProjectsOverviewContextSheet,
+  ProjectsOverviewNarrowContextToggle,
+} from "@/features/projects/ui/ProjectsOverviewContextSheet";
 import {
   ProjectsActivityIntro,
   ProjectsOverviewContextPanel,
   ProjectsOverviewPanel,
 } from "@/features/projects/ui/ProjectsOverviewPanel";
+import { ProjectsOverviewChromeActions } from "@/features/projects/ui/ProjectsOverviewChromeActions";
+import { ProjectContextRail } from "@/features/projects/ui/ProjectContextRail";
 import {
-  openAppSearch,
   projectsSectionIcon,
   projectsSectionTitle,
 } from "@/features/projects/ui/projectsSectionMeta";
@@ -45,51 +50,44 @@ import {
   ProjectsOverviewProjectItems,
   ProjectsOverviewRepositoryItems,
 } from "@/features/projects/ui/ProjectsOverviewItems";
-import { CreateProjectDialog } from "@/features/projects/ui/CreateProjectDialog";
+import { ProjectCreationDialog } from "@/features/projects/ui/ProjectCreationDialog";
 import { CreateProjectIssueDialog } from "@/features/projects/ui/CreateProjectIssueDialog";
 import { CreatePullRequestDialog } from "@/features/projects/ui/CreatePullRequestDialog";
-import { ProjectsCreateMenu } from "@/features/projects/ui/ProjectsCreateMenu";
+import { ProjectAgentChatPanel } from "@/features/projects/ui/ProjectAgentChatPanel";
+import { ProjectsCategoryCreateDialogs } from "@/features/projects/ui/ProjectsCategoryCreateDialogs";
 import { ProjectsIssuesList } from "@/features/projects/ui/ProjectsIssuesList";
 import { ProjectsWorkspaceChrome } from "@/features/projects/ui/ProjectDetailChrome";
 import { ProjectsPullRequestsList } from "@/features/projects/ui/ProjectsPullRequestsList";
 import { ProjectsWorkItemsLoadNotice } from "@/features/projects/ui/ProjectsWorkItemsLoadNotice";
 import { ProjectsListHeaderBar } from "@/features/projects/ui/ProjectsListHeaderBar";
+import { ProjectsSectionSearch } from "@/features/projects/ui/ProjectsSectionSearch";
 import { ProjectSectionHeader } from "@/features/projects/ui/ProjectSectionHeader";
 import { PROJECT_COLUMN_HEADER_BACKDROP_CLASS } from "@/features/projects/ui/projectPanelStyles";
-import { ProjectsToolbar } from "@/features/projects/ui/ProjectsToolbar";
-import {
-  hasLocalCheckout,
-  hasLocalRepositoryCheckout,
-} from "@/features/projects/lib/projectLocalRepos";
+import { ProjectSelectionProvider } from "@/features/projects/lib/useProjectSelection";
+import { hasLocalRepositoryCheckout } from "@/features/projects/lib/projectLocalRepos";
 import {
   getProjectUpdatedAt,
-  isProjectAccessibleToViewer,
-  isProjectMine,
-  isRepositoryAccessibleToViewer,
   projectHasAgent,
   projectOwnerIsUser,
   projectPeople,
   type ProjectsFilter,
-  type ProjectsRepositoryScope,
   type ProjectsSort,
   type ProjectsViewMode,
-  type ProjectsWorkItemScope,
   readStoredFilter,
-  readStoredIssueScope,
-  readStoredPullRequestScope,
-  readStoredRepositoryScope,
   readStoredSort,
   readStoredViewMode,
   writeStoredFilter,
-  writeStoredIssueScope,
-  writeStoredPullRequestScope,
-  writeStoredRepositoryScope,
   writeStoredSort,
   writeStoredViewMode,
 } from "@/features/projects/lib/projectsViewHelpers";
 import { useOpenProjectTerminal } from "@/features/projects/ui/useOpenProjectTerminal";
-import { PROJECT_CONTEXT_PANEL_DEFAULT_WIDTH_PX } from "@/features/projects/ui/useProjectPanelWidths";
+import { useProjectsScrollIndicator } from "@/features/projects/ui/useProjectsScrollIndicator";
+import {
+  PROJECT_CONTEXT_PANEL_DEFAULT_WIDTH_PX,
+  useProjectPanelWidths,
+} from "@/features/projects/ui/useProjectPanelWidths";
 import { useMediaBreakpoint } from "@/shared/hooks/use-mobile";
+import { useNow } from "@/shared/lib/useNow";
 import { ViewLoadingFallback } from "@/shared/ui/ViewLoadingFallback";
 import { useCommunities } from "@/features/communities/useCommunities";
 import { useIdentityQuery } from "@/shared/api/hooks";
@@ -98,7 +96,14 @@ import { cn } from "@/shared/lib/cn";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import { useRelayOrigin } from "@/shared/lib/useRelayOrigin";
 import { Button } from "@/shared/ui/button";
-import { DrawerPanelIcon } from "@/shared/ui/DrawerPanelIcon";
+import { useOptionalSidebar } from "@/shared/ui/sidebar";
+import { useProjectsOverviewAgentContext } from "./useProjectsOverviewAgentContext";
+import {
+  EMPTY_ITEMS,
+  useContextWorkItems,
+  useDeleteProjectHandler,
+  useOpenProjectTerminalHandler,
+} from "./projectsViewWorkItems";
 
 const MANY_PROJECTS_THRESHOLD = 12;
 const PROJECTS_CONTEXT_POD_MIN_VIEWPORT_PX = 1024;
@@ -107,48 +112,17 @@ export function ProjectsView() {
   const { goProject } = useAppNavigation();
   const { activeCommunity } = useCommunities();
   const relayOrigin = useRelayOrigin();
-  const scrollIdleTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(
-    null,
-  );
-  const scrollIndicatorRef = React.useRef<HTMLDivElement | null>(null);
-  // The native scrollbar thumb is permanently transparent (WebKit won't
-  // re-resolve ::-webkit-scrollbar styles dynamically), so we paint our own
-  // indicator over the gutter and show it only while the area is scrolling.
-  const handleContentScroll = React.useCallback(
-    (event: React.UIEvent<HTMLDivElement>) => {
-      const element = event.currentTarget;
-      const indicator = scrollIndicatorRef.current;
-      if (!indicator) return;
-
-      const { clientHeight, scrollHeight, scrollTop } = element;
-      if (scrollHeight <= clientHeight) {
-        indicator.style.opacity = "0";
-        return;
-      }
-
-      const thumbHeight = Math.max(
-        24,
-        (clientHeight / scrollHeight) * clientHeight,
-      );
-      const maxOffset = clientHeight - thumbHeight;
-      const offset = (scrollTop / (scrollHeight - clientHeight)) * maxOffset;
-      indicator.style.height = `${thumbHeight}px`;
-      indicator.style.transform = `translateY(${offset}px)`;
-      indicator.style.opacity = "1";
-
-      if (scrollIdleTimerRef.current !== null) {
-        globalThis.clearTimeout(scrollIdleTimerRef.current);
-      }
-      scrollIdleTimerRef.current = globalThis.setTimeout(() => {
-        indicator.style.opacity = "0";
-        scrollIdleTimerRef.current = null;
-      }, 700);
-    },
-    [],
-  );
+  const sidebar = useOptionalSidebar();
+  const { handleContentScroll, scrollIndicatorRef } =
+    useProjectsScrollIndicator();
   const projectsQuery = useProjectsQuery();
   const identityQuery = useIdentityQuery();
-  const projects = projectsQuery.data ?? [];
+  const managedAgentsQuery = useManagedAgentsQuery();
+  const projectReadModels = projectsQuery.data ?? [];
+  const projects = React.useMemo(
+    () => projectReadModels.filter(isExplicitProject),
+    [projectReadModels],
+  );
   const localRepositoriesQuery = useProjectLocalRepositoriesQuery(
     activeCommunity?.reposDir,
   );
@@ -158,32 +132,28 @@ export function ProjectsView() {
       ? "repositories"
       : storedFilter;
   });
+  const [searchQuery, setSearchQuery] = React.useState("");
   const [overviewPanelOpen, setOverviewPanelOpen] = React.useState(true);
-  // Narrow layouts present the same context as a dismissible sheet instead of
-  // the docked rail; the sheet starts closed so resizing never pops a modal.
   const [narrowContextOpen, setNarrowContextOpen] = React.useState(false);
   const contextToggleRef = React.useRef<HTMLButtonElement | null>(null);
+  const selectionDrawerStateRef = React.useRef<{
+    narrow: boolean;
+    open: boolean;
+  } | null>(null);
   const isNarrowProjectsLayout = useMediaBreakpoint(
     PROJECTS_CONTEXT_POD_MIN_VIEWPORT_PX,
   );
+  const { activeRightPanelWidth: overviewAgentPanelWidth } =
+    useProjectPanelWidths("chat");
   const activitySummariesQuery = useProjectActivitySummariesQuery(projects);
   const repositoryActivitySummariesQuery = useRepositoryActivitySummariesQuery(
-    filter === "repositories" ? projects : [],
+    filter === "repositories" ? projectReadModels : [],
   );
-  const [repositoryScope, setRepositoryScope] =
-    React.useState<ProjectsRepositoryScope>(() => {
-      const storedScope = readStoredRepositoryScope();
-      return filter === "projects" &&
-        (storedScope === "buzz" || storedScope === "linked")
-        ? "all"
-        : storedScope;
-    });
-  const [pullRequestScope, setPullRequestScope] =
-    React.useState<ProjectsWorkItemScope>(() => readStoredPullRequestScope());
-  const [issueScope, setIssueScope] = React.useState<ProjectsWorkItemScope>(
-    () => readStoredIssueScope(),
+  const workItemProjects = React.useMemo(
+    () => projectsWithWorkItemRepositories(projectReadModels),
+    [projectReadModels],
   );
-  const projectsWorkItemsQuery = useProjectsWorkItemsQuery(projects);
+  const projectsWorkItemsQuery = useProjectsWorkItemsQuery(workItemProjects);
   // One blobless clone per primary Buzz repository, only while the overview
   // header is visible.
   const snapshotProjects = React.useMemo(
@@ -206,10 +176,11 @@ export function ProjectsView() {
     memberChannelIds,
   );
   const [createProjectOpen, setCreateProjectOpen] = React.useState(false);
+  const [createChannelOpen, setCreateChannelOpen] = React.useState(false);
+  const [createRepositoryOpen, setCreateRepositoryOpen] = React.useState(false);
   const [createIssueOpen, setCreateIssueOpen] = React.useState(false);
   const [createPullRequestOpen, setCreatePullRequestOpen] =
     React.useState(false);
-  const createProjectMutation = useCreateProjectMutation();
   const [storedViewMode, setStoredViewMode] =
     React.useState<ProjectsViewMode | null>(() => readStoredViewMode());
   const [sort, setSort] = React.useState<ProjectsSort>(() => readStoredSort());
@@ -249,52 +220,68 @@ export function ProjectsView() {
     enabled: projectPubkeys.length > 0,
   });
   const profiles = profilesQuery.data?.profiles;
+  const activityDigestNow = useNow(600_000);
+  const activityDigest = React.useMemo(
+    () =>
+      buildProjectsActivityDigest({
+        issues: projectsWorkItemsQuery.data?.issues.items ?? [],
+        nowSeconds: Math.floor(activityDigestNow / 1_000),
+        projects,
+        pullRequests: projectsWorkItemsQuery.data?.pullRequests.items ?? [],
+        snapshots: repoSnapshotsQuery.data?.snapshots,
+        summaries: activitySummariesQuery.data,
+      }),
+    [
+      activityDigestNow,
+      activitySummariesQuery.data,
+      projects,
+      projectsWorkItemsQuery.data,
+      repoSnapshotsQuery.data?.snapshots,
+    ],
+  );
   const deleteProjectMutation = useDeleteProjectMutation();
   const currentPubkey = identityQuery.data?.pubkey;
+  const managedAgentPubkeys = React.useMemo(
+    () =>
+      new Set(
+        (managedAgentsQuery.data ?? []).map((agent) =>
+          normalizePubkey(agent.pubkey),
+        ),
+      ),
+    [managedAgentsQuery.data],
+  );
+  const editableProjects = React.useMemo(() => {
+    if (!currentPubkey) return [];
+    const viewer = normalizePubkey(currentPubkey);
+    return projects.filter((project) => {
+      const owner = normalizePubkey(project.owner);
+      return (
+        owner === viewer ||
+        managedAgentPubkeys.has(owner) ||
+        ownsAuthorAgent(profiles?.[owner], currentPubkey)
+      );
+    });
+  }, [currentPubkey, managedAgentPubkeys, profiles, projects]);
+  const ownerControlAgentPubkeyFor = React.useCallback(
+    (project: Project) => {
+      const owner = normalizePubkey(project.owner);
+      if (
+        owner === normalizePubkey(currentPubkey ?? "") ||
+        managedAgentPubkeys.has(owner)
+      ) {
+        return undefined;
+      }
+      return ownsAuthorAgent(profiles?.[owner], currentPubkey)
+        ? project.owner
+        : undefined;
+    },
+    [currentPubkey, managedAgentPubkeys, profiles],
+  );
 
   const handleViewModeChange = React.useCallback(
     (nextViewMode: ProjectsViewMode) => {
       setStoredViewMode(nextViewMode);
       writeStoredViewMode(nextViewMode);
-    },
-    [],
-  );
-
-  const handleFilterChange = React.useCallback(
-    (nextFilter: ProjectsFilter) => {
-      if (
-        nextFilter === "projects" &&
-        (repositoryScope === "buzz" || repositoryScope === "linked")
-      ) {
-        setRepositoryScope("all");
-        writeStoredRepositoryScope("all");
-      }
-      setFilter(nextFilter);
-      writeStoredFilter(nextFilter);
-    },
-    [repositoryScope],
-  );
-
-  const handleRepositoryScopeChange = React.useCallback(
-    (scope: ProjectsRepositoryScope) => {
-      setRepositoryScope(scope);
-      writeStoredRepositoryScope(scope);
-    },
-    [],
-  );
-
-  const handlePullRequestScopeChange = React.useCallback(
-    (scope: ProjectsWorkItemScope) => {
-      setPullRequestScope(scope);
-      writeStoredPullRequestScope(scope);
-    },
-    [],
-  );
-
-  const handleIssueScopeChange = React.useCallback(
-    (scope: ProjectsWorkItemScope) => {
-      setIssueScope(scope);
-      writeStoredIssueScope(scope);
     },
     [],
   );
@@ -314,16 +301,6 @@ export function ProjectsView() {
     [localRepositoriesQuery.data],
   );
 
-  const repositoryAccessInput = React.useMemo(
-    () => ({
-      currentPubkey,
-      localRepoNames,
-      memberChannelIds,
-      relayOrigin,
-    }),
-    [currentPubkey, localRepoNames, memberChannelIds, relayOrigin],
-  );
-
   const visibleProjects = React.useMemo(() => {
     if (filter !== "projects" && filter !== "agents" && filter !== "users") {
       return [];
@@ -331,22 +308,20 @@ export function ProjectsView() {
 
     const sortedProjects = projects
       .filter((project) => {
+        if (
+          !matchesProjectsSearch(searchQuery, [
+            project.name,
+            project.description,
+            ...project.repositories.flatMap((repository) => [
+              repository.name,
+              repository.description,
+            ]),
+          ])
+        ) {
+          return false;
+        }
         const summary = activitySummariesQuery.data?.[project.id];
         const people = projectPeople(project, summary);
-        if (repositoryScope === "accessible")
-          return isProjectAccessibleToViewer(project, repositoryAccessInput);
-        if (repositoryScope === "mine")
-          return isProjectMine(project, currentPubkey);
-        if (repositoryScope === "local")
-          return hasLocalCheckout(project, localRepoNames);
-        if (repositoryScope === "buzz")
-          return (
-            projectRepoHostForProject(project, relayOrigin).kind === "buzz"
-          );
-        if (repositoryScope === "linked")
-          return (
-            projectRepoHostForProject(project, relayOrigin).kind === "external"
-          );
         if (filter === "agents") {
           return projectHasAgent(project, people, profiles);
         }
@@ -371,14 +346,10 @@ export function ProjectsView() {
     return sortedProjects;
   }, [
     activitySummariesQuery.data,
-    currentPubkey,
     filter,
-    localRepoNames,
     profiles,
     projects,
-    relayOrigin,
-    repositoryAccessInput,
-    repositoryScope,
+    searchQuery,
     sort,
   ]);
 
@@ -386,7 +357,7 @@ export function ProjectsView() {
     if (filter !== "repositories") return [];
     const repositories = [
       ...new Map(
-        projects
+        projectReadModels
           .flatMap((project) =>
             project.repositories.map((repository) => ({
               project,
@@ -397,40 +368,13 @@ export function ProjectsView() {
       ).values(),
     ];
     return repositories
-      .filter(({ repository }) => {
-        if (repositoryScope === "accessible") {
-          return isRepositoryAccessibleToViewer(
-            repository,
-            repositoryAccessInput,
-          );
-        }
-        if (repositoryScope === "mine") {
-          if (!currentPubkey) return false;
-          const normalizedCurrentPubkey = normalizePubkey(currentPubkey);
-          return (
-            normalizePubkey(repository.owner) === normalizedCurrentPubkey ||
-            repository.contributors.some(
-              (pubkey) => normalizePubkey(pubkey) === normalizedCurrentPubkey,
-            )
-          );
-        }
-        if (repositoryScope === "local") {
-          return hasLocalRepositoryCheckout(repository, localRepoNames);
-        }
-        if (repositoryScope === "buzz") {
-          return (
-            projectRepoHostForRepository(repository, relayOrigin).kind ===
-            "buzz"
-          );
-        }
-        if (repositoryScope === "linked") {
-          return (
-            projectRepoHostForRepository(repository, relayOrigin).kind ===
-            "external"
-          );
-        }
-        return true;
-      })
+      .filter(({ project, repository }) =>
+        matchesProjectsSearch(searchQuery, [
+          repository.name,
+          repository.description,
+          project.name,
+        ]),
+      )
       .sort((left, right) => {
         if (sort === "name") {
           return left.repository.name.localeCompare(right.repository.name);
@@ -447,61 +391,86 @@ export function ProjectsView() {
         return rightUpdatedAt - leftUpdatedAt;
       });
   }, [
-    currentPubkey,
     filter,
-    localRepoNames,
-    projects,
-    relayOrigin,
-    repositoryAccessInput,
+    projectReadModels,
     repositoryActivitySummariesQuery.data,
-    repositoryScope,
+    searchQuery,
     sort,
   ]);
 
   const visiblePullRequests = React.useMemo(() => {
     const pullRequests = projectsWorkItemsQuery.data?.pullRequests.items ?? [];
-    const scopedPullRequests =
-      pullRequestScope === "mine" && currentPubkey
-        ? pullRequests.filter(
-            ({ pullRequest }) =>
-              normalizePubkey(pullRequest.author) ===
-              normalizePubkey(currentPubkey),
-          )
-        : pullRequests;
-    return [...scopedPullRequests].sort((left, right) => {
-      if (sort === "name") {
-        return left.pullRequest.title.localeCompare(right.pullRequest.title);
-      }
-      if (sort === "created") {
-        return right.pullRequest.createdAt - left.pullRequest.createdAt;
-      }
-      return right.pullRequest.updatedAt - left.pullRequest.updatedAt;
-    });
-  }, [currentPubkey, projectsWorkItemsQuery.data, pullRequestScope, sort]);
+    return pullRequests
+      .filter(({ project, pullRequest, repository }) =>
+        matchesProjectsSearch(searchQuery, [
+          pullRequest.title,
+          pullRequest.content,
+          pullRequest.status,
+          project.name,
+          repository.name,
+        ]),
+      )
+      .sort((left, right) => {
+        if (sort === "name") {
+          return left.pullRequest.title.localeCompare(right.pullRequest.title);
+        }
+        if (sort === "created") {
+          return right.pullRequest.createdAt - left.pullRequest.createdAt;
+        }
+        return right.pullRequest.updatedAt - left.pullRequest.updatedAt;
+      });
+  }, [projectsWorkItemsQuery.data, searchQuery, sort]);
 
   const visibleIssues = React.useMemo(() => {
     const issues = projectsWorkItemsQuery.data?.issues.items ?? [];
-    const viewer = currentPubkey ? normalizePubkey(currentPubkey) : null;
-    const scopedIssues =
-      issueScope === "mine" && viewer
-        ? issues.filter(({ issue }) => normalizePubkey(issue.author) === viewer)
-        : issueScope === "assigned" && viewer
-          ? issues.filter(({ issue }) =>
-              issue.assignees.some(
-                (assignee) => normalizePubkey(assignee) === viewer,
-              ),
-            )
-          : issues;
-    return [...scopedIssues].sort((left, right) => {
-      if (sort === "name") {
-        return left.issue.title.localeCompare(right.issue.title);
-      }
-      if (sort === "created") {
-        return right.issue.createdAt - left.issue.createdAt;
-      }
-      return right.issue.updatedAt - left.issue.updatedAt;
-    });
-  }, [currentPubkey, issueScope, projectsWorkItemsQuery.data, sort]);
+    return issues
+      .filter(({ issue, project, repository }) =>
+        matchesProjectsSearch(searchQuery, [
+          issue.title,
+          issue.content,
+          issue.status,
+          project.name,
+          repository.name,
+        ]),
+      )
+      .sort((left, right) => {
+        if (sort === "name") {
+          return left.issue.title.localeCompare(right.issue.title);
+        }
+        if (sort === "created") {
+          return right.issue.createdAt - left.issue.createdAt;
+        }
+        return right.issue.updatedAt - left.issue.updatedAt;
+      });
+  }, [projectsWorkItemsQuery.data, searchQuery, sort]);
+  const {
+    agentContext: selectionAgentContext,
+    overviewContext: overviewAgentContext,
+    setAgentContext: setSelectionAgentContext,
+  } = useProjectsOverviewAgentContext({
+    filter,
+    issues: projectsWorkItemsQuery.data?.issues.items,
+    projects,
+    pullRequests: projectsWorkItemsQuery.data?.pullRequests.items,
+    snapshots: repoSnapshotsQuery.data?.snapshots,
+    visibleIssues,
+    visibleProjects,
+    visiblePullRequests,
+    visibleRepositories,
+  });
+  const handleFilterChange = React.useCallback(
+    (nextFilter: ProjectsFilter) => {
+      writeStoredFilter(nextFilter);
+      // Tab content swaps mount hundreds of rows/cards at once; a transition
+      // lets React keep the click responsive and paint the previous tab until
+      // the new tree is ready instead of blocking the main thread.
+      React.startTransition(() => {
+        setSelectionAgentContext(null);
+        setFilter(nextFilter);
+      });
+    },
+    [setSelectionAgentContext],
+  );
 
   // Route by the canonical `owner:dtag` project ID — a bare dtag is
   // ambiguous across owners (forks can share the same dtag).
@@ -551,20 +520,9 @@ export function ProjectsView() {
   );
 
   const openTerminal = useOpenProjectTerminal(activeCommunity?.reposDir);
-  const handleOpenTerminal = React.useCallback(
-    (project: Project) => {
-      const repository = selectProjectRepository(project, null);
-      if (!repository) return Promise.resolve();
-      return openTerminal(repository, {
-        // Check the selected repository only — not all members — so the
-        // terminal affordance reflects the repository the button will open.
-        hasLocalCheckout: hasLocalRepositoryCheckout(
-          repository,
-          localRepoNames,
-        ),
-      });
-    },
-    [localRepoNames, openTerminal],
+  const handleOpenTerminal = useOpenProjectTerminalHandler(
+    openTerminal,
+    localRepoNames,
   );
   const handleOpenRepositoryTerminal = React.useCallback(
     (repository: Repository) =>
@@ -577,18 +535,12 @@ export function ProjectsView() {
     [localRepoNames, openTerminal],
   );
 
-  const handleDeleteProject = React.useCallback(
-    async (project: Project) => {
-      try {
-        await deleteProjectMutation.mutateAsync(project);
-        toast.success("Project deleted");
-      } catch (error) {
-        toast.error(
-          error instanceof Error ? error.message : "Failed to delete project",
-        );
-      }
-    },
-    [deleteProjectMutation],
+  const handleDeleteProject = useDeleteProjectHandler(
+    deleteProjectMutation.mutateAsync,
+  );
+
+  const { contextIssues, contextPullRequests } = useContextWorkItems(
+    projectsWorkItemsQuery.data,
   );
 
   if (projectsQuery.isLoading) {
@@ -610,15 +562,22 @@ export function ProjectsView() {
     );
   }
 
-  if (projects.length === 0) {
-    return <EmptyState />;
+  if (projectReadModels.length === 0) {
+    return (
+      <>
+        <ProjectCreationDialog
+          onOpenChange={setCreateProjectOpen}
+          open={createProjectOpen}
+        />
+        <EmptyState onCreateProject={() => setCreateProjectOpen(true)} />
+      </>
+    );
   }
 
   const projectItems = (
     <ProjectsOverviewProjectItems
       currentPubkey={currentPubkey}
       deleteDisabled={deleteProjectMutation.isPending}
-      filter={filter}
       localRepoNames={localRepoNames}
       onDelete={handleDeleteProject}
       onOpen={handleOpenProject}
@@ -633,6 +592,7 @@ export function ProjectsView() {
 
   const repositoryItems = (
     <ProjectsOverviewRepositoryItems
+      currentPubkey={currentPubkey}
       localRepoNames={localRepoNames}
       onOpen={handleOpenRepository}
       onOpenTerminal={handleOpenRepositoryTerminal}
@@ -645,17 +605,7 @@ export function ProjectsView() {
 
   const listHeaderBar = (
     <ProjectsListHeaderBar
-      filter={filter}
-      variant="bar"
-      issueScope={issueScope}
-      onIssueScopeChange={handleIssueScopeChange}
-      onPullRequestScopeChange={handlePullRequestScopeChange}
-      onRepositoryScopeChange={handleRepositoryScopeChange}
-      onSortChange={handleSortChange}
       onViewModeChange={handleViewModeChange}
-      pullRequestScope={pullRequestScope}
-      repositoryScope={repositoryScope}
-      sort={sort}
       viewMode={viewMode}
     />
   );
@@ -681,302 +631,348 @@ export function ProjectsView() {
         isLoading={
           repoSnapshotsQuery.isLoading || projectsWorkItemsQuery.isLoading
         }
-        issues={projectsWorkItemsQuery.data?.issues.items ?? []}
+        issues={projectsWorkItemsQuery.data?.issues.items ?? EMPTY_ITEMS}
         onOpenCommit={handleOpenCommit}
         onOpenIssue={handleOpenIssue}
         onOpenProject={handleOpenProject}
         onOpenPullRequest={handleOpenPullRequest}
         profiles={profiles}
         projects={projects}
-        pullRequests={projectsWorkItemsQuery.data?.pullRequests.items ?? []}
+        pullRequests={
+          projectsWorkItemsQuery.data?.pullRequests.items ?? EMPTY_ITEMS
+        }
+        searchQuery={searchQuery}
         snapshots={repoSnapshotsQuery.data?.snapshots}
       />
     </>
   );
 
-  const createMenu = (
-    <ProjectsCreateMenu
-      onCreateIssue={() => setCreateIssueOpen(true)}
-      onCreateProject={() => setCreateProjectOpen(true)}
-      onCreatePullRequest={() => setCreatePullRequestOpen(true)}
-    />
-  );
-
   const contextPanelProps = {
+    canCreateTarget: editableProjects.length > 0,
     filter,
-    issues:
-      projectsWorkItemsQuery.data?.issues.items.map(({ issue }) => issue) ?? [],
+    issues: contextIssues,
+    onAddChannel: () => setCreateChannelOpen(true),
+    onAddRepository: () => setCreateRepositoryOpen(true),
+    onChatWithAgent: (items: ProjectSelectionItem[]) =>
+      setSelectionAgentContext(buildProjectSelectionAgentContext(items)),
     onCreateIssue: () => setCreateIssueOpen(true),
     onCreateProject: () => setCreateProjectOpen(true),
     onCreatePullRequest: () => setCreatePullRequestOpen(true),
     profiles,
+    projectReadModels,
     projects,
-    pullRequests:
-      projectsWorkItemsQuery.data?.pullRequests.items.map(
-        ({ pullRequest }) => pullRequest,
-      ) ?? [],
+    pullRequests: contextPullRequests,
+    repositorySummaries: repositoryActivitySummariesQuery.data,
     summaries: activitySummariesQuery.data,
   };
-
-  const overviewDetached = overviewPanelOpen && !isNarrowProjectsLayout;
   const contextOpen = isNarrowProjectsLayout
     ? narrowContextOpen
     : overviewPanelOpen;
-  const chromeActions = (
-    <>
-      <Button
-        aria-label={
-          contextOpen ? "Hide project context" : "Show project context"
-        }
-        aria-pressed={contextOpen}
-        className="h-7 w-7 text-sidebar-foreground/65 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
-        data-testid="projects-overview-context-toggle"
-        onClick={() =>
-          isNarrowProjectsLayout
-            ? setNarrowContextOpen((open) => !open)
-            : setOverviewPanelOpen((open) => !open)
-        }
-        ref={contextToggleRef}
-        size="icon"
-        title={contextOpen ? "Hide project context" : "Show project context"}
-        type="button"
-        variant="ghost"
-      >
-        <DrawerPanelIcon
-          className="-scale-x-100"
-          side={contextOpen ? "left" : "right"}
-        />
-      </Button>
-      {overviewDetached ? null : createMenu}
-    </>
+  const overviewChatOpen =
+    selectionAgentContext !== null && !isNarrowProjectsLayout;
+  const overviewContextOpen = overviewPanelOpen && !isNarrowProjectsLayout;
+  const overviewDetached = overviewContextOpen || overviewChatOpen;
+  const chromeActions = isNarrowProjectsLayout ? (
+    <ProjectsOverviewNarrowContextToggle
+      onToggle={() => setNarrowContextOpen((open) => !open)}
+      open={contextOpen}
+      ref={contextToggleRef}
+    />
+  ) : (
+    <ProjectsOverviewChromeActions
+      chatOpen={overviewChatOpen}
+      contextOpen={overviewPanelOpen}
+      onToggleChat={() =>
+        setSelectionAgentContext((context) =>
+          context ? null : overviewAgentContext,
+        )
+      }
+      onToggleContext={() => setOverviewPanelOpen((open) => !open)}
+      sectionTitle={projectsSectionTitle(filter)}
+    />
   );
 
   return (
-    <div
-      className={cn(
-        "relative flex min-h-0 min-w-0 flex-1 flex-row overflow-hidden",
-        overviewDetached && "gap-2 bg-sidebar pb-2 pr-2 pt-px",
-      )}
-      data-project-context-detached={overviewDetached ? "true" : undefined}
-      data-testid="projects-overview-layout"
+    <ProjectSelectionProvider
+      onClear={() => {
+        const previous = selectionDrawerStateRef.current;
+        selectionDrawerStateRef.current = null;
+        if (!previous) return;
+        if (previous.narrow) {
+          setNarrowContextOpen(previous.open);
+        } else {
+          setOverviewPanelOpen(previous.open);
+        }
+      }}
+      onSelect={() => {
+        if (selectionDrawerStateRef.current) return;
+        selectionDrawerStateRef.current = {
+          narrow: isNarrowProjectsLayout,
+          open: isNarrowProjectsLayout ? narrowContextOpen : overviewPanelOpen,
+        };
+        if (isNarrowProjectsLayout) {
+          setNarrowContextOpen(true);
+        } else {
+          setOverviewPanelOpen(true);
+        }
+      }}
+      resetKey={filter}
     >
-      <ProjectsWorkspaceChrome
-        actions={chromeActions}
-        onGoActivity={() => handleFilterChange("all")}
-        section={projectsSectionTitle(filter)}
-      />
       <div
         className={cn(
-          "relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden",
-          overviewDetached
-            ? "ml-px rounded-2xl bg-background"
-            : cn("rounded-tl-xl", topChromeInset.divider),
+          "relative flex min-h-0 min-w-0 flex-1 flex-row overflow-hidden",
+          !isNarrowProjectsLayout && "bg-sidebar pb-2 pr-2 pt-px",
+          !isNarrowProjectsLayout && sidebar?.open === false && "pl-2",
         )}
-        data-testid={
-          overviewDetached ? "projects-overview-content-pod" : undefined
+        data-project-context-detached={
+          isNarrowProjectsLayout ? undefined : "true"
         }
+        data-testid="projects-overview-layout"
       >
-        <CreateProjectDialog
-          isCreating={createProjectMutation.isPending}
-          onCreate={async (input) => {
-            const result = await createProjectMutation.mutateAsync(input);
-            if (result.compatibilityWarning) {
-              toast.warning("Created as a standalone project", {
-                description: result.compatibilityWarning,
-              });
-            } else {
-              toast.success(`Project "${result.project.name}" created.`);
-            }
-            handleRepositoryScopeChange("all");
-            handleFilterChange("projects");
-          }}
-          onOpenChange={setCreateProjectOpen}
-          open={createProjectOpen}
+        <ProjectsWorkspaceChrome
+          actions={chromeActions}
+          onGoActivity={() => handleFilterChange("all")}
+          section={projectsSectionTitle(filter)}
         />
-        {createPullRequestOpen ? (
-          <CreatePullRequestDialog
-            onCreated={async (
-              createdProject,
-              createdRepository,
-              pullRequestId,
-            ) => {
-              await goProject(createdProject.id, {
+        <div
+          className={cn(
+            "relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden",
+            !isNarrowProjectsLayout
+              ? "ml-px rounded-2xl bg-background"
+              : cn("rounded-tl-xl", topChromeInset.divider),
+          )}
+          data-testid={
+            overviewDetached ? "projects-overview-content-pod" : undefined
+          }
+        >
+          <ProjectCreationDialog
+            onOpenChange={setCreateProjectOpen}
+            open={createProjectOpen}
+          />
+          {createPullRequestOpen ? (
+            <CreatePullRequestDialog
+              onCreated={async (
+                createdProject,
+                createdRepository,
                 pullRequestId,
+              ) => {
+                await goProject(createdProject.id, {
+                  pullRequestId,
+                  repositoryId: createdRepository.id,
+                });
+              }}
+              onOpenChange={setCreatePullRequestOpen}
+              open
+              projects={projects}
+              reposDir={activeCommunity?.reposDir}
+            />
+          ) : null}
+          <CreateProjectIssueDialog
+            onCreated={async (createdProject, createdRepository, issueId) => {
+              await goProject(createdProject.id, {
+                issueId,
                 repositoryId: createdRepository.id,
               });
             }}
-            onOpenChange={setCreatePullRequestOpen}
-            open
+            onOpenChange={setCreateIssueOpen}
+            open={createIssueOpen}
             projects={projects}
-            reposDir={activeCommunity?.reposDir}
           />
-        ) : null}
-        <CreateProjectIssueDialog
-          onCreated={async (createdProject, createdRepository, issueId) => {
-            await goProject(createdProject.id, {
-              issueId,
-              repositoryId: createdRepository.id,
-            });
-          }}
-          onOpenChange={setCreateIssueOpen}
-          open={createIssueOpen}
-          projects={projects}
-        />
-        <div className="relative min-h-0 min-w-0 flex-1">
-          <div
-            aria-hidden="true"
-            className="pointer-events-none absolute right-[3px] top-0 z-50 w-1 rounded-full bg-border/80 opacity-0 transition-opacity duration-200"
-            ref={scrollIndicatorRef}
+          <ProjectsCategoryCreateDialogs
+            channelOpen={createChannelOpen}
+            editableProjects={editableProjects}
+            onChannelOpenChange={setCreateChannelOpen}
+            onRepositoryOpenChange={setCreateRepositoryOpen}
+            ownerControlAgentPubkeyFor={ownerControlAgentPubkeyFor}
+            repositoryOpen={createRepositoryOpen}
           />
-          <div
-            className="buzz-content-scrollbar h-full min-h-0 min-w-0 overflow-x-hidden overflow-y-scroll"
-            onScroll={handleContentScroll}
-          >
-            <div className="px-4 pb-4">
-              <div className="w-full space-y-3">
-                <div
-                  className={cn(
-                    "sticky top-0 z-30 -mx-4 flex h-13 min-w-0 items-center gap-1.5 px-4",
-                    PROJECT_COLUMN_HEADER_BACKDROP_CLASS,
-                    overviewDetached && "rounded-t-2xl",
-                  )}
-                  data-testid="projects-page-tabs"
-                >
-                  {filter === "all" ? (
-                    <Button
-                      aria-label="Search everything"
-                      className="h-7 w-7 shrink-0 text-muted-foreground hover:text-foreground"
-                      data-testid="projects-activity-search"
-                      onClick={openAppSearch}
-                      size="icon"
-                      title="Search everything"
-                      type="button"
-                      variant="ghost"
+          <div className="flex min-h-0 min-w-0 flex-1">
+            <div className="relative min-h-0 min-w-0 flex-1">
+              <div
+                aria-hidden="true"
+                className="pointer-events-none absolute right-[3px] top-0 z-50 w-1 rounded-full bg-border/80 opacity-0 transition-opacity duration-200"
+                ref={scrollIndicatorRef}
+              />
+              <div
+                className="buzz-content-scrollbar h-full min-h-0 min-w-0 overflow-x-hidden overflow-y-scroll"
+                onScroll={handleContentScroll}
+              >
+                <div className="px-4 pb-4">
+                  <div className="w-full space-y-3">
+                    <div
+                      className={cn(
+                        "sticky top-0 z-30 -mx-4 flex h-13 min-w-0 items-center gap-1.5 px-4",
+                        PROJECT_COLUMN_HEADER_BACKDROP_CLASS,
+                        overviewDetached && "rounded-t-2xl",
+                      )}
+                      data-testid="projects-page-tabs"
                     >
-                      <Search className="h-4 w-4" />
-                    </Button>
-                  ) : null}
-                  <ProjectsToolbar
-                    filter={filter}
-                    onFilterChange={handleFilterChange}
-                  />
-                </div>
-                <div
-                  className={
-                    filter === "all" ? "mx-auto w-full max-w-xl" : "w-full"
-                  }
-                >
-                  {filter === "all" ? (
-                    <ProjectsOverviewPanel>
-                      <ProjectsActivityIntro />
-                      <section className="space-y-3">{activityFeed}</section>
-                    </ProjectsOverviewPanel>
-                  ) : (
-                    <>
-                      <ProjectSectionHeader
-                        className="-mx-4"
-                        icon={projectsSectionIcon(filter)}
-                        testId="projects-page-header"
-                        title={projectsSectionTitle(filter)}
+                      <ProjectsSectionSearch
+                        filter={filter}
+                        onFilterChange={handleFilterChange}
+                        onQueryChange={setSearchQuery}
+                        onSortChange={handleSortChange}
+                        sort={sort}
                       />
-                      <section>
-                        <div className="space-y-3">
-                          {filter === "channels" ? null : listHeaderBar}
-                          {filter === "prs" ? (
-                            <ProjectsPullRequestsList
-                              embedded={viewMode === "list"}
-                              error={projectsWorkItemsQuery.error}
-                              failedSections={
-                                projectsWorkItemsQuery.data?.pullRequests
-                                  .failedSections ?? []
-                              }
-                              isLoading={projectsWorkItemsQuery.isLoading}
-                              isRetrying={
-                                projectsWorkItemsQuery.isFetching &&
-                                !projectsWorkItemsQuery.isLoading
-                              }
-                              onOpen={handleOpenPullRequest}
-                              onRetry={() =>
-                                void projectsWorkItemsQuery.refetch()
-                              }
-                              profiles={profiles}
-                              pullRequests={visiblePullRequests}
-                              viewMode={viewMode}
-                            />
-                          ) : filter === "issues" ? (
-                            <ProjectsIssuesList
-                              embedded={viewMode === "list"}
-                              error={projectsWorkItemsQuery.error}
-                              failedSections={
-                                projectsWorkItemsQuery.data?.issues
-                                  .failedSections ?? []
-                              }
-                              isLoading={projectsWorkItemsQuery.isLoading}
-                              isRetrying={
-                                projectsWorkItemsQuery.isFetching &&
-                                !projectsWorkItemsQuery.isLoading
-                              }
-                              issues={visibleIssues}
-                              onOpen={handleOpenIssue}
-                              onRetry={() =>
-                                void projectsWorkItemsQuery.refetch()
-                              }
-                              profiles={profiles}
-                              viewMode={viewMode}
-                            />
-                          ) : filter === "channels" ? (
-                            <ProjectsChannelsList projects={projects} />
-                          ) : filter === "projects" ? (
-                            projectItems
-                          ) : (
-                            repositoryItems
-                          )}
-                        </div>
-                      </section>
-                    </>
-                  )}
+                    </div>
+                    <div
+                      className={
+                        filter === "all" ? "mx-auto w-full max-w-6xl" : "w-full"
+                      }
+                    >
+                      {filter === "all" ? (
+                        <ProjectsOverviewPanel>
+                          <ProjectsActivityIntro digest={activityDigest} />
+                          <section className="space-y-3">
+                            {activityFeed}
+                          </section>
+                        </ProjectsOverviewPanel>
+                      ) : (
+                        <>
+                          <ProjectSectionHeader
+                            className="mb-2 rounded-md bg-muted/40"
+                            icon={projectsSectionIcon(filter)}
+                            testId="projects-page-header"
+                            title={projectsSectionTitle(filter)}
+                            trailing={
+                              filter === "channels" ? undefined : listHeaderBar
+                            }
+                          />
+                          <section>
+                            <div className="space-y-3">
+                              {filter === "prs" ? (
+                                <ProjectsPullRequestsList
+                                  embedded={viewMode === "list"}
+                                  emptyMessage={
+                                    searchQuery.trim()
+                                      ? "No matching reviews"
+                                      : undefined
+                                  }
+                                  error={projectsWorkItemsQuery.error}
+                                  failedSections={
+                                    projectsWorkItemsQuery.data?.pullRequests
+                                      .failedSections ?? []
+                                  }
+                                  isLoading={projectsWorkItemsQuery.isLoading}
+                                  isRetrying={
+                                    projectsWorkItemsQuery.isFetching &&
+                                    !projectsWorkItemsQuery.isLoading
+                                  }
+                                  onOpen={handleOpenPullRequest}
+                                  onRetry={() =>
+                                    void projectsWorkItemsQuery.refetch()
+                                  }
+                                  profiles={profiles}
+                                  pullRequests={visiblePullRequests}
+                                  viewMode={viewMode}
+                                />
+                              ) : filter === "issues" ? (
+                                <ProjectsIssuesList
+                                  embedded={viewMode === "list"}
+                                  emptyMessage={
+                                    searchQuery.trim()
+                                      ? "No matching tasks"
+                                      : undefined
+                                  }
+                                  error={projectsWorkItemsQuery.error}
+                                  failedSections={
+                                    projectsWorkItemsQuery.data?.issues
+                                      .failedSections ?? []
+                                  }
+                                  isLoading={projectsWorkItemsQuery.isLoading}
+                                  isRetrying={
+                                    projectsWorkItemsQuery.isFetching &&
+                                    !projectsWorkItemsQuery.isLoading
+                                  }
+                                  issues={visibleIssues}
+                                  onOpen={handleOpenIssue}
+                                  onRetry={() =>
+                                    void projectsWorkItemsQuery.refetch()
+                                  }
+                                  profiles={profiles}
+                                  viewMode={viewMode}
+                                />
+                              ) : filter === "channels" ? (
+                                <ProjectsChannelsList
+                                  projects={projectReadModels}
+                                  searchQuery={searchQuery}
+                                />
+                              ) : filter === "projects" ? (
+                                projectItems
+                              ) : (
+                                repositoryItems
+                              )}
+                            </div>
+                          </section>
+                        </>
+                      )}
+                    </div>
+                  </div>
                 </div>
               </div>
             </div>
           </div>
         </div>
-      </div>
-      {overviewDetached ? (
-        <aside
-          aria-label="Project context"
-          className="relative z-30 flex h-full shrink-0 flex-col overflow-hidden bg-transparent"
-          style={{ width: PROJECT_CONTEXT_PANEL_DEFAULT_WIDTH_PX }}
+        <ProjectContextRail
+          open={overviewChatOpen}
+          panelWidthPx={overviewAgentPanelWidth.widthPx}
+          resizing={overviewAgentPanelWidth.isResizing}
+          testId="projects-overview-agent-rail"
         >
-          <div className="min-h-0 flex-1 overflow-y-auto">
+          {selectionAgentContext ? (
+            <ProjectAgentChatPanel
+              canResetWidth={overviewAgentPanelWidth.canReset}
+              constrainToAvailableSpace={false}
+              context={selectionAgentContext}
+              detached
+              onClose={() => setSelectionAgentContext(null)}
+              onResetWidth={overviewAgentPanelWidth.onResetWidth}
+              onResizeStart={overviewAgentPanelWidth.onResizeStart}
+              widthPx={overviewAgentPanelWidth.widthPx}
+            />
+          ) : null}
+        </ProjectContextRail>
+        <ProjectContextRail
+          open={overviewContextOpen}
+          panelWidthPx={PROJECT_CONTEXT_PANEL_DEFAULT_WIDTH_PX}
+          rounded={false}
+          testId="projects-overview-context-rail"
+        >
+          <aside
+            aria-label="Project context"
+            className="relative z-30 flex h-full flex-col overflow-hidden bg-sidebar text-sidebar-foreground"
+          >
+            <div className="min-h-0 flex-1 overflow-y-auto">
+              <ProjectsOverviewContextPanel
+                {...contextPanelProps}
+                onSelectSection={(section) => {
+                  handleFilterChange(section);
+                }}
+              />
+            </div>
+          </aside>
+        </ProjectContextRail>
+        {isNarrowProjectsLayout ? (
+          <ProjectsOverviewContextSheet
+            onCloseAutoFocus={(event) => {
+              // Return focus to the chrome toggle so the keyboard journey can
+              // continue where it started.
+              event.preventDefault();
+              contextToggleRef.current?.focus();
+            }}
+            onOpenChange={setNarrowContextOpen}
+            open={narrowContextOpen}
+          >
             <ProjectsOverviewContextPanel
               {...contextPanelProps}
               onSelectSection={(section) => {
                 handleFilterChange(section);
+                setNarrowContextOpen(false);
               }}
             />
-          </div>
-        </aside>
-      ) : null}
-      {isNarrowProjectsLayout ? (
-        <ProjectsOverviewContextSheet
-          onCloseAutoFocus={(event) => {
-            // Return focus to the chrome toggle so the keyboard journey can
-            // continue where it started.
-            event.preventDefault();
-            contextToggleRef.current?.focus();
-          }}
-          onOpenChange={setNarrowContextOpen}
-          open={narrowContextOpen}
-        >
-          <ProjectsOverviewContextPanel
-            {...contextPanelProps}
-            onSelectSection={(section) => {
-              handleFilterChange(section);
-              setNarrowContextOpen(false);
-            }}
-          />
-        </ProjectsOverviewContextSheet>
-      ) : null}
-    </div>
+          </ProjectsOverviewContextSheet>
+        ) : null}
+      </div>
+    </ProjectSelectionProvider>
   );
 }

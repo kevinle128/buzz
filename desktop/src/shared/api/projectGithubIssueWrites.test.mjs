@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { afterEach, test } from "node:test";
 
 import {
@@ -77,4 +78,56 @@ test("GitHub issue write wrappers trim values and reject unsafe numbers", async 
       input: { ...TARGET, login: "ada" },
     },
   ]);
+});
+
+// The real desktop builder owns IPC dispatch; an unused handler inventory
+// cannot make the frontend's commands available.
+test("all existing GitHub IPC commands register once in the desktop builder", () => {
+  const modules = [
+    "ahead_behind",
+    "issue_writes",
+    "issues",
+    "pulls",
+    "repository_snapshot",
+    "repository_state",
+  ];
+  const commands = modules.flatMap((suffix) => {
+    const source = readFileSync(
+      new URL(
+        `../../../src-tauri/src/commands/project_github_${suffix}.rs`,
+        import.meta.url,
+      ),
+      "utf8",
+    );
+    return [...source.matchAll(/pub async fn (\w+)\(/g)].map(
+      (match) => match[1],
+    );
+  });
+  assert.equal(commands.length, 18);
+  const frontend = [
+    "projectGit.ts",
+    "projectGithubPulls.ts",
+    "projectGithubIssueWrites.ts",
+  ]
+    .map((name) => readFileSync(new URL(name, import.meta.url), "utf8"))
+    .join("\n");
+  const builder = readFileSync(
+    new URL("../../../src-tauri/src/lib.rs", import.meta.url),
+    "utf8",
+  );
+  const handler = builder
+    .split(".invoke_handler(tauri::generate_handler![")[1]
+    ?.split("])")[0];
+  assert.ok(handler, "the shipping Tauri builder must register its handler");
+  for (const command of commands) {
+    assert.ok(
+      frontend.includes(`"${command}"`),
+      `${command} must match its frontend IPC name`,
+    );
+    assert.equal(
+      [...handler.matchAll(new RegExp(`\\b${command}\\s*,`, "g"))].length,
+      1,
+      `${command} must be registered exactly once`,
+    );
+  }
 });

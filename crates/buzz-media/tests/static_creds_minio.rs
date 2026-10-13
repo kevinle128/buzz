@@ -30,6 +30,7 @@ fn minio_config() -> MediaConfig {
         s3_secret_key: std::env::var("BUZZ_S3_SECRET_KEY")
             .unwrap_or_else(|_| "buzz_dev_secret".to_string()),
         s3_bucket: std::env::var("BUZZ_S3_BUCKET").unwrap_or_else(|_| "buzz-media".to_string()),
+        s3_prefix: String::new(),
         s3_region: std::env::var("BUZZ_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
         s3_addressing_style: std::env::var("BUZZ_S3_ADDRESSING_STYLE")
             .unwrap_or_else(|_| "path".to_string())

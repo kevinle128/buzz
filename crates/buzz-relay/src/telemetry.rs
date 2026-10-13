@@ -223,9 +223,9 @@ pub enum TracerInit {
     Enabled(SdkTracerProvider),
     /// `OTEL_EXPORTER_OTLP_ENDPOINT` was unset — no-op, no connection.
     Disabled,
-    /// Endpoint was set but the exporter failed to build.  The inner error
-    /// string is suitable for a `tracing::warn!` call made by the caller
-    /// **after** `tracing_subscriber::registry()…init()`.
+    /// Endpoint was set but the exporter failed to build. The inner error is
+    /// diagnostic data only and must not be logged: exporter errors can
+    /// include credential-bearing endpoint URLs.
     ExporterBuildFailed(String),
 }
 
@@ -234,7 +234,8 @@ pub enum TracerInit {
 ///
 /// Deliberately does **not** call `tracing::warn!` internally — the subscriber
 /// may not be installed yet at call time, which would silently drop the event.
-/// Callers are responsible for logging [`TracerInit::ExporterBuildFailed`].
+/// Callers may log a fixed, credential-free message for
+/// [`TracerInit::ExporterBuildFailed`], but must not log its inner error.
 pub fn try_init_tracer(resource: Resource) -> TracerInit {
     if std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_err() {
         return TracerInit::Disabled;
@@ -306,6 +307,7 @@ mod tests {
 
     #[test]
     fn trace_context_json_correlates_nested_span_logs() {
+        let _tracing = crate::test_support::tracing_dispatch_lock();
         let output = Arc::new(Mutex::new(Vec::new()));
         let output_writer = Arc::clone(&output);
         let exporter = InMemorySpanExporter::default();
@@ -473,6 +475,9 @@ mod tests {
 
     #[test]
     fn trace_context_lookup_does_not_enable_callsites() {
+        // Retain another registered subscriber, as parallel tests do.
+        let _other_dispatch = tracing::Dispatch::new(tracing_subscriber::registry());
+        let _tracing = crate::test_support::tracing_dispatch_lock();
         let context_lookup = TraceContextLookup::default();
         let subscriber = tracing_subscriber::registry().with(
             context_lookup
@@ -486,10 +491,19 @@ mod tests {
                 .get()
                 .and_then(tracing::dispatcher::WeakDispatch::upgrade)
                 .is_some());
-            assert!(!tracing::enabled!(
+            use tracing::callsite::Callsite as _;
+            let callsite = tracing::callsite! {
+                name: "trace_context_lookup_filter_test",
+                kind: tracing::metadata::Kind::EVENT,
                 target: "trace_context_lookup_filter_test",
-                tracing::Level::ERROR
-            ));
+                level: tracing::Level::ERROR,
+                fields:
+            };
+            // Test this subscriber's interest directly. `enabled!` can be
+            // conservative when another dispatch keeps this callsite active.
+            tracing::dispatcher::get_default(|dispatch| {
+                assert!(dispatch.register_callsite(callsite.metadata()).is_never());
+            });
         });
     }
 

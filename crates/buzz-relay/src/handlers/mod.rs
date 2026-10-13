@@ -1,7 +1,11 @@
+/// NIP-42 authentication handler.
+pub mod admin_action_worker;
+pub mod admin_outbox_worker;
 /// Community App lifecycle admin command handler (kind 9038).
 pub mod app_admin;
-/// NIP-42 authentication handler.
 pub mod auth;
+/// Pure NIP-29 channel membership-authority decisions (kinds 9000/9001/9022).
+pub mod channel_authz;
 /// Subscription close (CLOSE) handler.
 pub mod close;
 /// Command executor — transactional processing for command kinds.
@@ -32,6 +36,8 @@ pub mod push_lease;
 pub mod relay_admin;
 /// NIP-56 report (kind:1984) validation + moderation queue persistence.
 pub mod report;
+/// HTTP report-resolution orchestrations for the deployment admin API (Phase 2).
+pub mod report_resolution;
 /// REQ handler — subscribe, deliver historical events, then EOSE.
 pub mod req;
 /// NIP-29 and NIP-25 side-effect handlers.
@@ -62,3 +68,6 @@ pub fn resolve_ttl(event: &nostr::Event, ephemeral_ttl_override: Option<i32>) ->
         (ttl, _) => ttl,
     }
 }
+
+/// NIP-AR artifact lifecycle.
+pub mod artifact;

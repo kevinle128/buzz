@@ -53,7 +53,7 @@ function signMetadata({
 }) {
   return finalizeEvent(
     {
-      kind: 39007,
+      kind: 39008,
       created_at: createdAt,
       content: `${name} notifications`,
       tags: [
