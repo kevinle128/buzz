@@ -217,6 +217,8 @@ jobs:
         if: always()
         run: |
           find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+          # Hermit installs packages read-only; make them writable before removal.
+          if [[ -d "$RUNNER_TEMP/mf-cache" ]]; then chmod -R u+w "$RUNNER_TEMP/mf-cache"; fi
           rm -rf "$RUNNER_TEMP/mf-cache"
 
   build-linux:
@@ -346,6 +348,8 @@ jobs:
         if: always()
         run: |
           find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+          # Hermit installs packages read-only; make them writable before removal.
+          if [[ -d "$RUNNER_TEMP/mf-cache" ]]; then chmod -R u+w "$RUNNER_TEMP/mf-cache"; fi
           rm -rf "$RUNNER_TEMP/mf-cache"
           # The container HOME is a host bind mount; remove what tools cached there.
           find "$HOME" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
