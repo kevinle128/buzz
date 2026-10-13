@@ -132,7 +132,8 @@ jobs:
         id: mesh_rev
         run: |
           set -euo pipefail
-          REV=$(python3 -c 'import tomllib; d=tomllib.load(open("Cargo.lock", "rb")); p=next(p for p in d["package"] if p["name"] == "mesh-llm-sdk"); print(p["source"].rsplit("#", 1)[1])')
+          # awk instead of python tomllib: the runner's system python3 may predate 3.11.
+          REV=$(awk '/^name = "mesh-llm-sdk"$/{f=1} f&&/^source = /{s=$3; gsub(/"/,"",s); sub(/.*#/,"",s); print s; exit}' Cargo.lock)
           [[ -n "$REV" ]] || { echo "::error::could not resolve mesh-llm rev from Cargo.lock"; exit 1; }
           echo "rev=$REV" >> "$GITHUB_OUTPUT"
           echo "short=${REV:0:7}" >> "$GITHUB_OUTPUT"
@@ -161,7 +162,8 @@ jobs:
           LLAMA_STAGE_BACKEND: metal
           LLAMA_STAGE_BUILD_DIR: ${{ github.workspace }}/.cache/mesh-llama/build-stage-abi-metal
           SKIPPY_LLAMA_AUTO_BUILD: "0"
-          TAURI_BUNDLER_DMG_IGNORE_CI: "true"
+          # No TAURI_BUNDLER_DMG_IGNORE_CI: the Finder layout step needs a GUI session
+          # and Automation permission, which the launchd runner does not have.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
@@ -180,7 +182,6 @@ jobs:
           BUNDLE_DIR="desktop/src-tauri/target/${TARGET}/release/bundle"
           DMG=$(find "$BUNDLE_DIR/dmg" -name '*.dmg' -type f | head -1)
           [[ -n "$DMG" ]] || { echo "::error::No DMG found in $BUNDLE_DIR/dmg"; exit 1; }
-          desktop/scripts/set-dmg-finder-text-size.sh "$DMG" 14
 
           ARCHIVE=$(find "$BUNDLE_DIR/macos" -name '*.tar.gz' ! -name '*.sig' -type f | head -1)
           [[ -n "$ARCHIVE" && -f "${ARCHIVE}.sig" ]] || { echo "::error::Updater archive or signature not found in $BUNDLE_DIR/macos"; exit 1; }
