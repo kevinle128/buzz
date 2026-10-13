@@ -52,7 +52,10 @@ async fn make_community(pool: &PgPool) -> CommunityId {
 
 async fn make_app(db: &Db, community: CommunityId) -> Uuid {
     let app_id = Uuid::new_v4();
-    let mut tx = db.begin_transaction().await.expect("begin create app");
+    let mut tx = db
+        .begin_event_write_transaction()
+        .await
+        .expect("begin create app");
     create_app(
         &mut tx,
         community,
