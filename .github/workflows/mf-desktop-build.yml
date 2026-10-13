@@ -110,7 +110,7 @@ jobs:
       - name: Use job-local caches
         run: |
           echo "HERMIT_STATE_DIR=$RUNNER_TEMP/mf-cache/hermit" >> "$GITHUB_ENV"
-          echo "npm_config_store_dir=$RUNNER_TEMP/mf-cache/pnpm-store" >> "$GITHUB_ENV"
+          echo "pnpm_config_store_dir=$RUNNER_TEMP/mf-cache/pnpm-store" >> "$GITHUB_ENV"
 
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
 
@@ -264,7 +264,7 @@ jobs:
       - name: Use job-local caches
         run: |
           echo "HERMIT_STATE_DIR=$RUNNER_TEMP/mf-cache/hermit" >> "$GITHUB_ENV"
-          echo "npm_config_store_dir=$RUNNER_TEMP/mf-cache/pnpm-store" >> "$GITHUB_ENV"
+          echo "pnpm_config_store_dir=$RUNNER_TEMP/mf-cache/pnpm-store" >> "$GITHUB_ENV"
 
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
 
