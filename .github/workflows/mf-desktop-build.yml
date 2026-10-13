@@ -105,6 +105,13 @@ jobs:
       - name: Verify tag-bound source
         run: scripts/verify-release-ref.sh desktop-v "$VERSION"
 
+      # Keep Hermit packages and the pnpm store inside the job temp dir so the
+      # clean step removes them and shared caches on the host stay untouched.
+      - name: Use job-local caches
+        run: |
+          echo "HERMIT_STATE_DIR=$RUNNER_TEMP/mf-cache/hermit" >> "$GITHUB_ENV"
+          echo "npm_config_store_dir=$RUNNER_TEMP/mf-cache/pnpm-store" >> "$GITHUB_ENV"
+
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
 
       - name: Install desktop dependencies
@@ -208,7 +215,9 @@ jobs:
       # Self-hosted runners keep the workspace between runs; free the disk after every build.
       - name: Clean workspace
         if: always()
-        run: find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+        run: |
+          find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+          rm -rf "$RUNNER_TEMP/mf-cache"
 
   build-linux:
     name: Build Linux (x64)
@@ -247,6 +256,13 @@ jobs:
 
       - name: Verify tag-bound source
         run: scripts/verify-release-ref.sh desktop-v "$VERSION"
+
+      # Keep Hermit packages and the pnpm store inside the job temp dir so the
+      # clean step removes them and shared caches on the host stay untouched.
+      - name: Use job-local caches
+        run: |
+          echo "HERMIT_STATE_DIR=$RUNNER_TEMP/mf-cache/hermit" >> "$GITHUB_ENV"
+          echo "npm_config_store_dir=$RUNNER_TEMP/mf-cache/pnpm-store" >> "$GITHUB_ENV"
 
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
 
@@ -328,4 +344,8 @@ jobs:
       # Files in the container are owned by root, so clean them here, not on the host.
       - name: Clean workspace
         if: always()
-        run: find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+        run: |
+          find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+          rm -rf "$RUNNER_TEMP/mf-cache"
+          # The container HOME is a host bind mount; remove what tools cached there.
+          find "$HOME" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
