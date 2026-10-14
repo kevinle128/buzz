@@ -1,3 +1,4 @@
+import { githubRemoteSnapshotEnabled } from "@/features/projects/lib/projectGithubSnapshot";
 import * as React from "react";
 
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
@@ -124,7 +125,10 @@ export function ProjectHomeWorkspaceSheet({
     defaultBranch,
     null,
     null,
-    true,
+    githubRemoteSnapshotEnabled({
+      cloneUrl: repository.cloneUrls[0],
+      githubStateReady: repoStateQuery.isSuccess,
+    }),
   );
   const snapshot = snapshotQuery.data ?? null;
   const repositorySnapshots = useProjectRepositorySnapshots(

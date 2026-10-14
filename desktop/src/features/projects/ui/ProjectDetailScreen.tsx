@@ -38,10 +38,7 @@ import { isGitHubCloneUrl } from "@/features/projects/lib/projectGitError";
 import type { GithubIssueListState } from "@/features/projects/lib/projectGithubIssues";
 import { nextGithubIssueListState } from "@/features/projects/lib/projectGithubIssueWrites";
 import { githubRepositoryStateUnresolved } from "@/features/projects/lib/projectRepoState";
-import {
-  shareTabForWorkspaceTab,
-  workspaceTabForShareTab,
-} from "@/features/projects/lib/projectShareLinks";
+import { workspaceTabForShareTab } from "@/features/projects/lib/projectShareLinks";
 import {
   buildProjectDetailAgentContext,
   type ProjectDetailAgentContext,
@@ -852,11 +849,6 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
                 }}
                 project={project}
                 repository={repository}
-                shareTab={
-                  activeWorkItemCrumb
-                    ? undefined
-                    : shareTabForWorkspaceTab(activeTab)
-                }
               />
               <div
                 className="flex min-h-0 min-w-0 flex-1 flex-col overflow-x-hidden overflow-y-auto overscroll-y-none px-4 pb-4"

@@ -18,7 +18,10 @@ import {
   RepoSyncActionButton,
   RepositoryBranchDropdown,
 } from "./ProjectRepositorySource";
-import { ProjectRepositoryUnavailableState } from "./ProjectRepositoryUnavailableState";
+import {
+  githubStateRecovery,
+  ProjectRepositoryUnavailableState,
+} from "./ProjectRepositoryUnavailableState";
 import { ProjectPanelState } from "./ProjectPanelState";
 
 export function findReadmeFile(files: ProjectRepoFile[]) {
@@ -186,6 +189,7 @@ export function ReadmePanel({
         <ProjectRepositoryUnavailableState
           accessChannelId={accessChannelId}
           externalHost={externalHost}
+          githubRecovery={githubStateRecovery(sourceControls)}
           onAskForAccess={sourceControls?.onAskForAccess}
           onRetry={sourceControls?.onFetch}
           ownerAvatarUrl={ownerAvatarUrl}

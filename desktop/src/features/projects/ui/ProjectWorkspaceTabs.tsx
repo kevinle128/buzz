@@ -56,7 +56,10 @@ import {
 import { PullRequestsPanel } from "./ProjectPullRequestsPanel";
 import { ProjectTabsList } from "./ProjectWorkspaceTabList";
 import { ProjectPullRequestFilesChangedPanel } from "./ProjectPullRequestFilesChangedPanel";
-import { ProjectRepositoryUnavailableState } from "./ProjectRepositoryUnavailableState";
+import {
+  githubStateRecovery,
+  ProjectRepositoryUnavailableState,
+} from "./ProjectRepositoryUnavailableState";
 import {
   PROJECT_COLUMN_HEADER_BACKDROP_CLASS,
   PROJECT_DETAIL_PANEL_CLASS,
@@ -258,6 +261,7 @@ export function WorkspaceTabs({
     <ProjectRepositoryUnavailableState
       accessChannelId={project.channelId}
       externalHost={externalHost}
+      githubRecovery={githubStateRecovery(sourceControls)}
       onAskForAccess={sourceControls?.onAskForAccess}
       onRetry={sourceControls?.onFetch}
       ownerAvatarUrl={ownerProfile?.avatarUrl}

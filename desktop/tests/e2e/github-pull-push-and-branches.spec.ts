@@ -55,7 +55,7 @@ test("GitHub checkout behind shows Pull and invokes the existing command", async
   });
   await installMockBridge(page);
   await openBuzzProject(page);
-  const header = page.getByTestId("project-workspace-panel");
+  const header = page.getByTestId("project-context-card");
   await expect(header.getByRole("button", { name: /^Pull 1$/ })).toBeVisible({
     timeout: 10_000,
   });
@@ -99,14 +99,14 @@ test("GitHub checkout ahead shows Push and invokes the existing command", async 
   });
   await installMockBridge(page);
   await openBuzzProject(page);
-  const header = page.getByTestId("project-workspace-panel");
-  await expect(header.getByRole("button", { name: /^Push$/ })).toBeVisible({
+  const header = page.getByTestId("project-context-card");
+  await expect(header.getByRole("button", { name: /^Push 1$/ })).toBeVisible({
     timeout: 10_000,
   });
   await page.evaluate(() => {
     window.__BUZZ_E2E_COMMANDS__ = [];
   });
-  await header.getByRole("button", { name: /^Push$/ }).click();
+  await header.getByRole("button", { name: /^Push 1$/ }).click();
   await expect
     .poll(() => page.evaluate(() => window.__BUZZ_E2E_COMMANDS__ ?? []))
     .toContain("push_project_local_repository");
@@ -130,7 +130,7 @@ test("G1 recovery keeps Create and Delete visible but disabled", async ({
   await expect(page.getByText("GitHub authentication required")).toBeVisible({
     timeout: 10_000,
   });
-  const header = page.getByTestId("project-workspace-panel");
+  const header = page.getByTestId("project-context-card");
   await expect(header.getByRole("button", { name: /Pull/ })).toHaveCount(0);
   await expect(header.getByRole("button", { name: /Push/ })).toHaveCount(0);
   await header.getByTestId("project-branch-picker").click();
@@ -169,7 +169,7 @@ test("GitHub without a checkout creates and deletes through existing commands", 
   });
   await installMockBridge(page);
   await openBuzzProject(page);
-  const header = page.getByTestId("project-workspace-panel");
+  const header = page.getByTestId("project-context-card");
   await expect(header.getByRole("button", { name: /^Fetch$/ })).toBeVisible({
     timeout: 10_000,
   });
