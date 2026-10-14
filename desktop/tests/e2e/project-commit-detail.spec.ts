@@ -1656,7 +1656,10 @@ test("empty projects keeps project creation available", async ({ page }) => {
   await expect(
     page.getByText("No projects yet", { exact: true }),
   ).toBeVisible();
-  await openCreateProjectDialog(page);
+  await page
+    .getByRole("main")
+    .getByRole("button", { name: "Create project" })
+    .click();
   await expect(page.getByTestId("create-project-dialog")).toBeVisible();
 });
 

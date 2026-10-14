@@ -11767,23 +11767,46 @@ function createDefaultE2eGithubIssueStore(): E2eGithubIssueStore {
   return {
     issues: [
       {
-        number: 1,
-        title: "Default GitHub issue",
-        body: "Default issue body.",
-        html_url: "https://github.com/acme/app/issues/1",
+        number: 42,
+        title: "Broken login",
+        body: "Repro steps",
         state: "open",
+        html_url: "https://github.com/acme/app/issues/42",
+        comments: 2,
         created_at: 1_704_166_645,
-        updated_at: 1_704_166_645,
-        comments: 0,
+        updated_at: 1_704_253_045,
         user: { login: "ada", avatar_url: "" },
-        labels: [],
-        assignees: [],
+        labels: ["bug"],
+        assignees: [{ login: "linus", avatar_url: "" }],
       },
     ],
-    commentsByNumber: {},
-    labels: [],
-    assignees: [],
-    authenticatedUser: { login: "test-user", avatar_url: "" },
+    commentsByNumber: {
+      42: [
+        {
+          id: 2,
+          body: "API-order first comment.",
+          html_url: "https://github.com/acme/app/issues/42#issuecomment-2",
+          created_at: 1_704_253_100,
+          user: { login: "grace", avatar_url: "" },
+        },
+        {
+          id: 10,
+          body: "API-order second comment.",
+          html_url: "https://github.com/acme/app/issues/42#issuecomment-10",
+          created_at: 1_704_253_100,
+          user: { login: "linus", avatar_url: "" },
+        },
+      ],
+    },
+    labels: [
+      { name: "bug", color: "d73a4a" },
+      { name: "docs", color: "0075ca" },
+    ],
+    assignees: [
+      { login: "linus", avatar_url: "" },
+      { login: "ada", avatar_url: "" },
+    ],
+    authenticatedUser: { login: "ada", avatar_url: "" },
   };
 }
 

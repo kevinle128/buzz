@@ -174,7 +174,7 @@ test("GitHub comment drafts do not carry into a different issue", async ({
     .getByTestId("project-github-issue-comment-input")
     .fill("Draft for issue 42");
 
-  await page.getByRole("button", { name: "New issue" }).click();
+  await page.getByRole("button", { name: "Create task" }).first().click();
   await page.getByTestId("create-issue-title").fill("Second GitHub issue");
   await page.getByTestId("create-issue-submit").click();
 

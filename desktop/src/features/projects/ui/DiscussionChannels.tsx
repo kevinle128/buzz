@@ -481,17 +481,14 @@ export function DiscussionChannelsPanel({
                 }}
                 testId="project-channel-row"
                 title={
-                  <>
-                    #{name}
-                    {isBound ? (
-                      <span
-                        className="sr-only"
-                        data-testid="project-bound-discussion-channel"
-                      >
-                        Linked discussion channel
-                      </span>
-                    ) : null}
-                  </>
+                  isBound ? (
+                    <span data-testid="project-bound-discussion-channel">
+                      #{name}
+                      <span className="sr-only">Linked discussion channel</span>
+                    </span>
+                  ) : (
+                    `#${name}`
+                  )
                 }
                 titleAttr={
                   latestHit

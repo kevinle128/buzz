@@ -80,11 +80,13 @@ test("GitHub Issues lists metadata, loads read-only detail, and creates #N", asy
     page.getByText("No closed issues.", { exact: true }),
   ).toBeVisible();
 
-  await page.getByRole("button", { name: "New issue" }).click();
+  await page.getByRole("button", { name: "Create task" }).first().click();
   await page.getByTestId("create-issue-title").fill("New GitHub bug");
   await page.getByTestId("create-issue-body").fill("Created from Buzz");
   await page.getByTestId("create-issue-submit").click();
-  await expect(page.getByText("New GitHub bug", { exact: true })).toBeVisible({
+  await expect(
+    page.getByText("New GitHub bug", { exact: true }).first(),
+  ).toBeVisible({
     timeout: 10_000,
   });
   await expect(page.getByText("#43", { exact: true })).toBeVisible();

@@ -2,7 +2,8 @@ import { expect, test } from "@playwright/test";
 
 import { installMockBridge } from "../helpers/bridge";
 
-const GENERAL_CHANNEL_ID = "9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50";
+// The mock buzz repository is bound to the project home channel.
+const BOUND_CHANNEL_ID = "cf63feec-21bb-5bf0-a2f8-0e4c3de8ec73";
 
 async function enableProjectsFeature(page: import("@playwright/test").Page) {
   await page.addInitScript(() => {
@@ -39,14 +40,12 @@ test("Channels tab pins and opens the zero-hit repository binding", async ({
   const firstRow = list.locator("li").first();
   const bound = firstRow.getByTestId("project-bound-discussion-channel");
   await expect(bound).toBeVisible({ timeout: 10_000 });
-  await expect(bound).toContainText("#general");
+  await expect(bound).toContainText("#buzz");
   await expect(bound).toContainText("Linked discussion channel");
 
-  await bound.click();
-  await expect(page).toHaveURL(
-    new RegExp(`/#/channels/${GENERAL_CHANNEL_ID}$`),
-  );
-  await expect(page.getByTestId("chat-title")).toHaveText("general");
+  await firstRow.getByTestId("project-channel-row").click();
+  await expect(page).toHaveURL(new RegExp(`/#/channels/${BOUND_CHANNEL_ID}$`));
+  await expect(page.getByTestId("chat-title")).toHaveText("buzz");
 });
 
 test("Open Discussion routes the repository binding to Stream", async ({
@@ -62,8 +61,6 @@ test("Open Discussion routes the repository binding to Stream", async ({
   await expect(openDiscussion).toBeVisible({ timeout: 10_000 });
   await openDiscussion.click();
 
-  await expect(page).toHaveURL(
-    new RegExp(`/#/channels/${GENERAL_CHANNEL_ID}$`),
-  );
-  await expect(page.getByTestId("chat-title")).toHaveText("general");
+  await expect(page).toHaveURL(new RegExp(`/#/channels/${BOUND_CHANNEL_ID}$`));
+  await expect(page.getByTestId("chat-title")).toHaveText("buzz");
 });
