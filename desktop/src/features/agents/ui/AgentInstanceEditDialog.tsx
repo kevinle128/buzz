@@ -1,8 +1,6 @@
 import { isRelayRemovedError } from "@/features/agents/managedAgentRelayCleanup";
 import * as React from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { ChevronDown } from "lucide-react";
-import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import { toast } from "sonner";
 
 import {
@@ -32,8 +30,8 @@ import { setManagedAgentAutoRestart } from "@/shared/api/tauriManagedAgents";
 import { effortChoices, isSavableEffort, ownEffortLevel } from "./effortPicker";
 import { EffortPickerField } from "./EffortPickerField";
 import { EditAgentAdvancedFields } from "./EditAgentAdvancedFields";
+import { EditAgentAdvancedSection } from "./EditAgentAdvancedSection";
 import {
-  ADVANCED_FIELDS_MOTION_TRANSITION,
   AUTO_PROVIDER_DROPDOWN_VALUE,
   BLOCK_BUILD_HIDDEN_PROVIDER_IDS,
   CUSTOM_PROVIDER_DROPDOWN_VALUE,
@@ -183,7 +181,6 @@ export function AgentInstanceEditDialog({
   const [isAvatarUploadPending, setIsAvatarUploadPending] =
     React.useState(false);
   const [isAddHarnessOpen, setIsAddHarnessOpen] = React.useState(false);
-  const shouldReduceMotion = useReducedMotion();
 
   // Runtime selector: defaults to "custom" until the dialog opens and the
   // catalog loads. The open-effect re-derives the correct id from the catalog.
@@ -913,9 +910,6 @@ export function AgentInstanceEditDialog({
 
   const previewLabel = name.trim() || "Agent name";
   const previewAvatarUrl = avatarUrl.trim() || null;
-  const advancedFieldsTransition = shouldReduceMotion
-    ? { duration: 0 }
-    : ADVANCED_FIELDS_MOTION_TRANSITION;
   // Displayed inline when either the locked update or a standalone setter fails.
   // setterError takes precedence — the update already committed when it fires.
   const displayError =
@@ -1151,76 +1145,54 @@ export function AgentInstanceEditDialog({
             />
 
             {/* Advanced settings */}
-            <div className="space-y-3">
-              <button
-                aria-expanded={showAdvancedFields}
-                className="inline-flex h-9 items-center gap-1.5 text-sm font-medium text-foreground transition-colors hover:text-foreground/80 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50"
-                disabled={isSaving}
-                onClick={() => setShowAdvancedFields((current) => !current)}
-                type="button"
-              >
-                <span>Advanced</span>
+            <EditAgentAdvancedSection
+              badge={
                 <AdvancedRequiredBadge
                   envVars={inheritedSubmission.envVars}
                   requiredEnvKeys={advancedRequiredEnvKeys}
                   testId="edit-agent-advanced-required-badge"
                 />
-                <ChevronDown
-                  className={cn(
-                    "h-4 w-4 text-muted-foreground transition-transform duration-150 ease-out",
-                    showAdvancedFields && "rotate-180",
-                  )}
-                />
-              </button>
-              <AnimatePresence initial={false}>
-                {showAdvancedFields ? (
-                  <motion.div
-                    animate={{ height: "auto", opacity: 1, scale: 1 }}
-                    className="origin-top overflow-hidden"
-                    exit={{ height: 0, opacity: 0, scale: 0.98 }}
-                    initial={{ height: 0, opacity: 0, scale: 0.98 }}
-                    key="edit-agent-advanced-fields"
-                    transition={advancedFieldsTransition}
-                  >
-                    <EditAgentAdvancedFields
-                      acpCommand={acpCommand}
-                      acpCommandCandidates={acpCommandsQuery.data ?? []}
-                      agentArgs={agentArgs}
-                      autoRestartOnConfigChange={autoRestartOnConfigChange}
-                      disabled={isSaving}
-                      envVars={envVars}
-                      fileSatisfiedEnvKeys={fileSatisfiedEnvKeys}
-                      hiddenEnvKeys={
-                        topLevelSecretEnvVar ? [topLevelSecretEnvVar] : []
-                      }
-                      focusKey={
-                        initialFocus?.type === "env_key"
-                          ? initialFocus.key
-                          : undefined
-                      }
-                      inheritedEnvVars={inheritedEnvVarsForAdvanced}
-                      inheritHarness={inheritHarness}
-                      linkedPersona={linkedPersona}
-                      model={inheritedSubmission.model ?? ""}
-                      modelTuningRuntimeId={prospectiveRuntimeId}
-                      parallelism={parallelism}
-                      provider={effectiveProvider}
-                      requiredEnvKeys={advancedRequiredEnvKeys}
-                      catalogStatus={runtimeCatalogStatus}
-                      selectedRuntime={prospectiveRuntime}
-                      systemPrompt={systemPrompt}
-                      onAcpCommandChange={setAcpCommand}
-                      onAgentArgsChange={setAgentArgs}
-                      onAutoRestartChange={setAutoRestartOnConfigChange}
-                      onEnvVarsChange={setEnvVars}
-                      onInheritHarnessChange={setInheritHarness}
-                      onParallelismChange={setParallelism}
-                      onSystemPromptChange={setSystemPrompt}
-                    />
-                  </motion.div>
-                ) : null}
-              </AnimatePresence>
-            </div>
+              }
+              disabled={isSaving}
+              onOpenChange={setShowAdvancedFields}
+              open={showAdvancedFields}
+            >
+              <EditAgentAdvancedFields
+                acpCommand={acpCommand}
+                acpCommandCandidates={acpCommandsQuery.data ?? []}
+                agentArgs={agentArgs}
+                autoRestartOnConfigChange={autoRestartOnConfigChange}
+                disabled={isSaving}
+                envVars={envVars}
+                fileSatisfiedEnvKeys={fileSatisfiedEnvKeys}
+                hiddenEnvKeys={
+                  topLevelSecretEnvVar ? [topLevelSecretEnvVar] : []
+                }
+                focusKey={
+                  initialFocus?.type === "env_key"
+                    ? initialFocus.key
+                    : undefined
+                }
+                inheritedEnvVars={inheritedEnvVarsForAdvanced}
+                inheritHarness={inheritHarness}
+                linkedPersona={linkedPersona}
+                model={inheritedSubmission.model ?? ""}
+                modelTuningRuntimeId={prospectiveRuntimeId}
+                parallelism={parallelism}
+                provider={effectiveProvider}
+                requiredEnvKeys={advancedRequiredEnvKeys}
+                catalogStatus={runtimeCatalogStatus}
+                selectedRuntime={prospectiveRuntime}
+                systemPrompt={systemPrompt}
+                onAcpCommandChange={setAcpCommand}
+                onAgentArgsChange={setAgentArgs}
+                onAutoRestartChange={setAutoRestartOnConfigChange}
+                onEnvVarsChange={setEnvVars}
+                onInheritHarnessChange={setInheritHarness}
+                onParallelismChange={setParallelism}
+                onSystemPromptChange={setSystemPrompt}
+              />
+            </EditAgentAdvancedSection>
 
             {/* Error — covers both the locked update (React Query) and the
                 standalone setters (setterError); setter error takes precedence
