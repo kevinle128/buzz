@@ -27,6 +27,7 @@ import {
 import { repositoryDiscussionQuery } from "@/features/projects/lib/discussionChannels";
 import type { ProjectDiscussionChannel } from "@/features/projects/lib/projectDiscussionChannel";
 import { isGitHubCloneUrl } from "@/features/projects/lib/projectGitError";
+import { parseGithubPullRequestNumber } from "@/features/projects/lib/projectGithubPullRequests";
 import type { GithubIssueListState } from "@/features/projects/lib/projectGithubIssues";
 import type { ProjectRepoHost } from "@/features/projects/lib/projectRepoHost";
 import { projectReviewFilesChangedBody } from "@/features/projects/lib/projectReviewDisplay";
@@ -128,6 +129,7 @@ export function WorkspaceTabs({
   sharedHeaderBackdrop,
   pullRequests,
   pullRequestsError,
+  buzzPullRequestsError,
   pullRequestsHasMore = false,
   pullRequestsLoading,
   onRetryPullRequests,
@@ -184,6 +186,8 @@ export function WorkspaceTabs({
   sharedHeaderBackdrop?: boolean;
   pullRequests: ProjectPullRequest[];
   pullRequestsError: unknown;
+  /** Load error for Buzz reviews listed under a GitHub-hosted repository. */
+  buzzPullRequestsError?: unknown;
   /** GitHub lists only the first page; true when more pull requests exist. */
   pullRequestsHasMore?: boolean;
   pullRequestsLoading: boolean;
@@ -294,6 +298,22 @@ export function WorkspaceTabs({
     hasSelectedPullRequest: Boolean(selectedPullRequest),
     repositoryUnavailable: Boolean(repositoryUnavailableState),
   });
+  // GitHub-hosted repositories list GitHub pull requests, then Buzz reviews.
+  const githubPullRequests = githubHosted
+    ? pullRequests.filter(
+        (pullRequest) => parseGithubPullRequestNumber(pullRequest.id) !== null,
+      )
+    : [];
+  const buzzPullRequests = githubHosted
+    ? pullRequests.filter(
+        (pullRequest) => parseGithubPullRequestNumber(pullRequest.id) === null,
+      )
+    : pullRequests;
+  const selectedGithubPullRequest =
+    selectedPullRequest &&
+    parseGithubPullRequestNumber(selectedPullRequest.id) !== null
+      ? selectedPullRequest
+      : null;
   const selectedCommitPullRequest = React.useMemo(
     () =>
       pullRequests.find(
@@ -449,6 +469,52 @@ export function WorkspaceTabs({
       />
     ) : null;
 
+  const buzzPullRequestsPanel = (
+    <PullRequestsPanel
+      diffStats={
+        repoDiff
+          ? {
+              additions: repoDiff.additions,
+              deletions: repoDiff.deletions,
+            }
+          : null
+      }
+      error={githubHosted ? buzzPullRequestsError : pullRequestsError}
+      filesChanged={
+        filesChangedBody === "files" && selectedPullRequest ? (
+          <ProjectPullRequestFilesChangedPanel
+            diff={repoDiff}
+            error={repoDiffError}
+            focusedAnchor={
+              pullRequestCommentTarget?.pullRequestId === selectedPullRequestId
+                ? pullRequestCommentTarget.anchor
+                : null
+            }
+            isLoading={repoDiffLoading}
+            profiles={profiles}
+            project={project}
+            pullRequest={selectedPullRequest}
+          />
+        ) : filesChangedBody === "unavailable" ? (
+          repositoryUnavailableState
+        ) : undefined
+      }
+      filesCount={repoDiff?.files.length}
+      forceOpenFiles={
+        pullRequestCommentTarget?.pullRequestId === selectedPullRequestId
+      }
+      isLoading={githubHosted ? false : pullRequestsLoading}
+      onOpenCommit={onSelectedCommitHashChange}
+      onOpenInlineComment={handleOpenPullRequestComment}
+      onOpenTerminal={onOpenMergeRecoveryTerminal}
+      onSelectedPullRequestIdChange={onSelectedPullRequestIdChange}
+      profiles={profiles}
+      project={project}
+      pullRequests={buzzPullRequests}
+      selectedPullRequest={selectedPullRequest}
+    />
+  );
+
   return (
     <Tabs
       className="flex min-w-0 flex-1 flex-col space-y-3"
@@ -555,71 +621,38 @@ export function WorkspaceTabs({
           data-project-detail-panel
           value="prs"
         >
-          {githubHosted ? (
-            selectedPullRequest ? (
-              <GitHubPullRequestDetail
-                key={selectedPullRequest.id}
-                onOpenCommit={onSelectedCommitHashChange}
-                onSelectedPullRequestIdChange={onSelectedPullRequestIdChange}
-                project={project}
-                pullRequest={selectedPullRequest}
-              />
-            ) : (
+          {selectedGithubPullRequest ? (
+            <GitHubPullRequestDetail
+              key={selectedGithubPullRequest.id}
+              onOpenCommit={onSelectedCommitHashChange}
+              onSelectedPullRequestIdChange={onSelectedPullRequestIdChange}
+              project={project}
+              pullRequest={selectedGithubPullRequest}
+            />
+          ) : githubHosted && !selectedPullRequest ? (
+            <>
               <GitHubPullRequestsPanel
                 error={pullRequestsError}
                 hasMore={pullRequestsHasMore}
                 isLoading={pullRequestsLoading}
                 onRetry={() => onRetryPullRequests?.()}
                 onSelectedPullRequestIdChange={onSelectedPullRequestIdChange}
-                pullRequests={pullRequests}
+                pullRequests={githubPullRequests}
               />
-            )
+              {buzzPullRequests.length > 0 || buzzPullRequestsError ? (
+                <section aria-labelledby="project-buzz-reviews-title">
+                  <h3
+                    className="border-border/50 border-t px-4 pt-4 pb-1 text-xs font-medium text-muted-foreground"
+                    id="project-buzz-reviews-title"
+                  >
+                    Buzz reviews
+                  </h3>
+                  {buzzPullRequestsPanel}
+                </section>
+              ) : null}
+            </>
           ) : (
-            <PullRequestsPanel
-              diffStats={
-                repoDiff
-                  ? {
-                      additions: repoDiff.additions,
-                      deletions: repoDiff.deletions,
-                    }
-                  : null
-              }
-              error={pullRequestsError}
-              filesChanged={
-                filesChangedBody === "files" && selectedPullRequest ? (
-                  <ProjectPullRequestFilesChangedPanel
-                    diff={repoDiff}
-                    error={repoDiffError}
-                    focusedAnchor={
-                      pullRequestCommentTarget?.pullRequestId ===
-                      selectedPullRequestId
-                        ? pullRequestCommentTarget.anchor
-                        : null
-                    }
-                    isLoading={repoDiffLoading}
-                    profiles={profiles}
-                    project={project}
-                    pullRequest={selectedPullRequest}
-                  />
-                ) : filesChangedBody === "unavailable" ? (
-                  repositoryUnavailableState
-                ) : undefined
-              }
-              filesCount={repoDiff?.files.length}
-              forceOpenFiles={
-                pullRequestCommentTarget?.pullRequestId ===
-                selectedPullRequestId
-              }
-              isLoading={pullRequestsLoading}
-              onOpenCommit={onSelectedCommitHashChange}
-              onOpenInlineComment={handleOpenPullRequestComment}
-              onOpenTerminal={onOpenMergeRecoveryTerminal}
-              onSelectedPullRequestIdChange={onSelectedPullRequestIdChange}
-              profiles={profiles}
-              project={project}
-              pullRequests={pullRequests}
-              selectedPullRequest={selectedPullRequest}
-            />
+            buzzPullRequestsPanel
           )}
         </TabsContent>
 

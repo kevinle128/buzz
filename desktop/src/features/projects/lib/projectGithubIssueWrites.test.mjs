@@ -60,6 +60,19 @@ test("settled selection waits for the destination list fetch", () => {
   );
 });
 
+test("a Buzz task selection survives a settled GitHub list", () => {
+  const buzzIssueId = "c".repeat(64);
+  assert.equal(
+    selectedGithubIssueAfterListLoad({
+      selectedIssueId: buzzIssueId,
+      issueIds: ["42"],
+      isSuccess: true,
+      isFetching: false,
+    }),
+    buzzIssueId,
+  );
+});
+
 test("write actions pick the destination GitHub list state", () => {
   assert.equal(nextGithubIssueListState("close"), "closed");
   assert.equal(nextGithubIssueListState("reopen"), "open");
@@ -130,6 +143,26 @@ test("comment routing preserves the Buzz publisher input", async () => {
   assert.equal(published.content, "Buzz comment");
   assert.deepEqual(published.mediaTags, [["imeta", "x"]]);
   assert.deepEqual(published.mentionPubkeys, ["a".repeat(64)]);
+});
+
+test("comment routing keeps a Buzz task on a GitHub repository on Buzz", async () => {
+  const calls = { github: 0, buzz: 0 };
+  await createProjectIssueCommentWith(
+    {
+      project: { cloneUrls: ["https://github.com/acme/app"] },
+      issue: { id: "e".repeat(64) },
+      content: "Buzz comment",
+    },
+    {
+      createGithub: async () => {
+        calls.github += 1;
+      },
+      publishBuzz: async () => {
+        calls.buzz += 1;
+      },
+    },
+  );
+  assert.deepEqual(calls, { github: 0, buzz: 1 });
 });
 
 test("blank comments fail before either backend", async () => {

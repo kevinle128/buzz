@@ -810,6 +810,36 @@ export function useProjectIssuesQuery(
   });
 }
 
+/** Buzz tasks addressed to a GitHub-hosted repository, listed beside GitHub's. */
+export function useGithubRepositoryBuzzIssuesQuery(
+  project: Repository | null | undefined,
+) {
+  return useQuery({
+    enabled: Boolean(project) && isGitHubCloneUrl(project?.cloneUrls[0]),
+    queryKey: ["project", project?.id ?? "none", "issues", "buzz"],
+    queryFn: () => {
+      if (!project) throw new Error("No project selected.");
+      return fetchBuzzProjectIssues(project);
+    },
+    staleTime: 30_000,
+  });
+}
+
+/** Buzz reviews addressed to a GitHub-hosted repository, listed beside GitHub's. */
+export function useGithubRepositoryBuzzPullRequestsQuery(
+  project: Repository | null | undefined,
+) {
+  return useQuery({
+    enabled: Boolean(project) && isGitHubCloneUrl(project?.cloneUrls[0]),
+    queryKey: ["project", project?.id ?? "none", "pull-requests", "buzz"],
+    queryFn: () => {
+      if (!project) throw new Error("No project selected.");
+      return fetchBuzzProjectPullRequests(project);
+    },
+    staleTime: 30_000,
+  });
+}
+
 export function useProjectPullRequestsQuery(
   project: Repository | null | undefined,
 ) {

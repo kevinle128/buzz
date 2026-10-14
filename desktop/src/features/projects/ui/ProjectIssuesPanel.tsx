@@ -18,6 +18,7 @@ import {
   type ProjectIssue,
   type Repository as Project,
   useCreateProjectIssueCommentMutation,
+  useGithubRepositoryBuzzIssuesQuery,
   useProjectIssuesQuery,
 } from "@/features/projects/hooks";
 import {
@@ -454,11 +455,21 @@ export function ProjectIssuesPanel({
   );
   const githubHosted =
     issueItems === undefined && isGitHubCloneUrl(project.cloneUrls[0]);
+  // GitHub-hosted repositories list GitHub issues, then Buzz tasks.
+  const buzzIssuesQuery = useGithubRepositoryBuzzIssuesQuery(
+    githubHosted ? project : null,
+  );
   const resolvedItems =
     issueItems ??
     (issuesQuery.data?.issues ?? []).map((issue) => ({ issue, project }));
+  const buzzItems = (buzzIssuesQuery.data ?? []).map((issue) => ({
+    issue,
+    project,
+  }));
   const selectedItem =
-    resolvedItems.find(({ issue }) => issue.id === selectedIssueId) ?? null;
+    [...resolvedItems, ...buzzItems].find(
+      ({ issue }) => issue.id === selectedIssueId,
+    ) ?? null;
   const loading = isLoading ?? issuesQuery.isLoading;
   const loadError = error ?? issuesQuery.error;
   const hasMoreNote =
@@ -489,7 +500,15 @@ export function ProjectIssuesPanel({
   ]);
 
   let body: React.ReactNode;
-  if (loading) {
+  if (selectedItem && githubHosted && buzzItems.includes(selectedItem)) {
+    body = (
+      <ProjectIssueDetail
+        issue={selectedItem.issue}
+        profiles={profiles}
+        project={selectedItem.project}
+      />
+    );
+  } else if (loading) {
     body = (
       <BuzzLoadingState
         label={githubHosted ? "Loading issues" : "Loading tasks"}
@@ -567,44 +586,19 @@ export function ProjectIssuesPanel({
       </div>
     );
   } else {
-    const groups = ISSUE_STATUS_ORDER.map((status) => ({
-      items: resolvedItems.filter(({ issue }) => issue.status === status),
-      status,
-    })).filter((group) => group.items.length > 0);
-    const rangeItems = resolvedItems.map(({ issue, project: itemProject }) =>
-      issueSelectionItem(itemProject, issue),
+    body = (
+      <IssueStatusGroups
+        items={resolvedItems}
+        onSelectedIssueIdChange={onSelectedIssueIdChange}
+        profiles={profiles}
+      />
     );
-    body = groups.map(({ items, status }) => {
-      const visual = issueStatusVisual(status);
-      return (
-        <ProjectWorkItemGroup
-          count={items.length}
-          icon={
-            <ProjectStatusProgressIcon
-              className={`h-4 w-4 ${visual.className}`}
-              state={visual.progress}
-            />
-          }
-          items={items.map(({ issue, project: itemProject }) =>
-            issueSelectionItem(itemProject, issue),
-          )}
-          key={status}
-          label={status}
-        >
-          {items.map(({ issue, project: itemProject }) => (
-            <IssueRow
-              issue={issue}
-              key={issue.id}
-              onOpen={() => onSelectedIssueIdChange(issue.id)}
-              profiles={profiles}
-              project={itemProject}
-              rangeItems={rangeItems}
-            />
-          ))}
-        </ProjectWorkItemGroup>
-      );
-    });
   }
+
+  const showBuzzSection =
+    githubHosted &&
+    !selectedItem &&
+    (buzzItems.length > 0 || buzzIssuesQuery.isError);
 
   return (
     <div>
@@ -615,6 +609,78 @@ export function ProjectIssuesPanel({
         />
       ) : null}
       {body}
+      {showBuzzSection ? (
+        <section aria-labelledby="project-buzz-tasks-title">
+          <h3
+            className="border-border/50 border-t px-4 pt-4 pb-1 text-xs font-medium text-muted-foreground"
+            id="project-buzz-tasks-title"
+          >
+            Buzz tasks
+          </h3>
+          {buzzIssuesQuery.isError ? (
+            <ProjectPanelState
+              description="Refresh the project and try again."
+              error
+              title="Could not load tasks"
+            />
+          ) : (
+            <IssueStatusGroups
+              items={buzzItems}
+              onSelectedIssueIdChange={onSelectedIssueIdChange}
+              profiles={profiles}
+            />
+          )}
+        </section>
+      ) : null}
     </div>
   );
+}
+
+/** Buzz tasks grouped by status, in the shared status order. */
+function IssueStatusGroups({
+  items: issueItems,
+  onSelectedIssueIdChange,
+  profiles,
+}: {
+  items: ProjectIssuePanelItem[];
+  onSelectedIssueIdChange: (id: string | null) => void;
+  profiles?: UserProfileLookup;
+}) {
+  const groups = ISSUE_STATUS_ORDER.map((status) => ({
+    items: issueItems.filter(({ issue }) => issue.status === status),
+    status,
+  })).filter((group) => group.items.length > 0);
+  const rangeItems = issueItems.map(({ issue, project: itemProject }) =>
+    issueSelectionItem(itemProject, issue),
+  );
+  return groups.map(({ items, status }) => {
+    const visual = issueStatusVisual(status);
+    return (
+      <ProjectWorkItemGroup
+        count={items.length}
+        icon={
+          <ProjectStatusProgressIcon
+            className={`h-4 w-4 ${visual.className}`}
+            state={visual.progress}
+          />
+        }
+        items={items.map(({ issue, project: itemProject }) =>
+          issueSelectionItem(itemProject, issue),
+        )}
+        key={status}
+        label={status}
+      >
+        {items.map(({ issue, project: itemProject }) => (
+          <IssueRow
+            issue={issue}
+            key={issue.id}
+            onOpen={() => onSelectedIssueIdChange(issue.id)}
+            profiles={profiles}
+            project={itemProject}
+            rangeItems={rangeItems}
+          />
+        ))}
+      </ProjectWorkItemGroup>
+    );
+  });
 }

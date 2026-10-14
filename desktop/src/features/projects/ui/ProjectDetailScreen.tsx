@@ -6,6 +6,8 @@ import { useTerminalContextOverride } from "@/app/TerminalContextOverrideContext
 import {
   type Project,
   type Repository,
+  useGithubRepositoryBuzzIssuesQuery,
+  useGithubRepositoryBuzzPullRequestsQuery,
   useProjectQuery,
   useProjectIssuesQuery,
   useProjectPullRequestsQuery,
@@ -34,6 +36,7 @@ import {
   resolveProjectDefaultBranch,
 } from "@/features/projects/lib/projectBranches";
 import { githubRemoteSnapshotEnabled } from "@/features/projects/lib/projectGithubSnapshot";
+import { combineRepositoryWorkItems } from "@/features/projects/lib/projectRepositoryWorkItems";
 import { isGitHubCloneUrl } from "@/features/projects/lib/projectGitError";
 import type { GithubIssueListState } from "@/features/projects/lib/projectGithubIssues";
 import { nextGithubIssueListState } from "@/features/projects/lib/projectGithubIssueWrites";
@@ -118,6 +121,17 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
   );
   const repoStateQuery = useRepoStateQuery(repository);
   const pullRequestsQuery = useProjectPullRequestsQuery(repository);
+  // GitHub-hosted repositories list Buzz reviews after GitHub's own.
+  const buzzPullRequestsQuery =
+    useGithubRepositoryBuzzPullRequestsQuery(repository);
+  const repositoryPullRequests = React.useMemo(
+    () =>
+      combineRepositoryWorkItems(
+        pullRequestsQuery.data?.pullRequests,
+        buzzPullRequestsQuery.data,
+      ),
+    [buzzPullRequestsQuery.data, pullRequestsQuery.data?.pullRequests],
+  );
   // GitHub pending/error must not fall back to the announcement default ("main").
   const githubHosted = isGitHubCloneUrl(repository?.cloneUrls[0]);
   const githubStateUnresolved = githubRepositoryStateUnresolved(
@@ -140,7 +154,7 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
       projectId: repository?.id ?? projectId,
       referencedBranches: githubStateUnresolved
         ? []
-        : (pullRequestsQuery.data?.pullRequests.map(
+        : (repositoryPullRequests?.map(
             (pullRequest) => pullRequest.branchName ?? null,
           ) ?? []),
     });
@@ -215,6 +229,15 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
     [],
   );
   const issuesQuery = useProjectIssuesQuery(repository, githubIssueListState);
+  const buzzIssuesQuery = useGithubRepositoryBuzzIssuesQuery(repository);
+  const repositoryIssues = React.useMemo(
+    () =>
+      combineRepositoryWorkItems(
+        issuesQuery.data?.issues,
+        buzzIssuesQuery.data,
+      ) ?? [],
+    [buzzIssuesQuery.data, issuesQuery.data?.issues],
+  );
   const {
     activeRepoPullRequest,
     openBranchPullRequest,
@@ -222,8 +245,9 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
     selectedPullRequest,
   } = useRetainedPullRequestSelection({
     activeBranch,
-    isFetching: pullRequestsQuery.isFetching,
-    pullRequests: pullRequestsQuery.data?.pullRequests,
+    isFetching:
+      pullRequestsQuery.isFetching || buzzPullRequestsQuery.isFetching,
+    pullRequests: repositoryPullRequests,
     repository,
     selectedPullRequestId,
   });
@@ -308,7 +332,7 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
       activeBranch,
       branches: managedBranches,
       defaultBranch,
-      hasOpenPullRequest: (pullRequestsQuery.data?.pullRequests ?? []).some(
+      hasOpenPullRequest: (repositoryPullRequests ?? []).some(
         (pullRequest) =>
           pullRequest.branchName === activeBranch &&
           (pullRequest.status === "Open" || pullRequest.status === "Draft"),
@@ -402,8 +426,8 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
     profiles,
     viewerGitIdentity,
   } = useProjectDetailPeople({
-    issues: issuesQuery.data?.issues ?? [],
-    pullRequests: pullRequestsQuery.data?.pullRequests ?? [],
+    issues: repositoryIssues,
+    pullRequests: repositoryPullRequests ?? [],
     repository,
   });
   const {
@@ -681,8 +705,7 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
     displayedRepositorySnapshot?.contributors ?? repoContributors;
   const displayedRepositoryFiles = displayedRepositorySnapshot?.files ?? [];
   const selectedIssue =
-    issuesQuery.data?.issues.find((item) => item.id === selectedIssueId) ??
-    null;
+    repositoryIssues.find((item) => item.id === selectedIssueId) ?? null;
   const displayedSnapshotCommits =
     repoSource === "local"
       ? (localRepoSnapshotQuery.data?.snapshot.commits ?? [])
@@ -789,7 +812,7 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
                   detachedRepository={detachedRepositoryPanel}
                   files={displayedRepositoryFiles}
                   identityPubkey={identityPubkey}
-                  issues={issuesQuery.data?.issues ?? []}
+                  issues={repositoryIssues}
                   mode={repositoryPanel.mode}
                   onChatWithAgent={selectionChat}
                   onClose={repositoryPanel.collapse}
@@ -803,7 +826,7 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
                   onResetWidth={activeRightPanelWidth.onResetWidth}
                   onResizeStart={activeRightPanelWidth.onResizeStart}
                   profiles={profiles}
-                  pullRequests={pullRequestsQuery.data?.pullRequests ?? []}
+                  pullRequests={repositoryPullRequests ?? []}
                   project={project}
                   projects={projectsQuery.data ?? []}
                   repository={repository}
@@ -920,8 +943,9 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
                     repoDiff={displayedRepoDiff}
                     repoDiffError={displayedRepoDiffError}
                     repoDiffLoading={displayedRepoDiffLoading}
-                    pullRequests={pullRequestsQuery.data?.pullRequests ?? []}
+                    pullRequests={repositoryPullRequests ?? []}
                     pullRequestsError={pullRequestsQuery.error}
+                    buzzPullRequestsError={buzzPullRequestsQuery.error}
                     pullRequestsHasMore={pullRequestsQuery.data?.hasMore}
                     pullRequestsLoading={pullRequestsQuery.isLoading}
                     onRetryPullRequests={() => {
