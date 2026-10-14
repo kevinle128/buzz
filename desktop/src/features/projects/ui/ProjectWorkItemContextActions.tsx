@@ -4,6 +4,7 @@ import type {
   ProjectPullRequest,
   Repository,
 } from "@/features/projects/hooks";
+import { isGitHubCloneUrl } from "@/features/projects/lib/projectGitError";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import { normalizePubkey } from "@/shared/lib/pubkey";
@@ -50,7 +51,8 @@ export function ProjectWorkItemContextActions({
     );
   }
 
-  if (pullRequest) {
+  // GitHub pull requests are read-only in Buzz: no Buzz review requests.
+  if (pullRequest && !isGitHubCloneUrl(repository.cloneUrls[0])) {
     const isAuthor = viewer === normalizePubkey(pullRequest.author);
     const canRequestReview =
       viewer !== null &&

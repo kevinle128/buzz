@@ -71,7 +71,7 @@ export function ProjectTabsList({
 export function PullRequestTabsList({
   conversationCount,
   filesCount,
-  githubHosted: _githubHosted,
+  githubHosted,
   hideFiles,
   pullRequest,
 }: {
@@ -85,9 +85,10 @@ export function PullRequestTabsList({
     updateCount?: number;
   };
 }) {
-  const commitCount = hideFiles
-    ? 1
-    : Math.max(1, (pullRequest.updateCount ?? 0) + 1);
+  const commitCount =
+    githubHosted || hideFiles
+      ? 1
+      : Math.max(1, (pullRequest.updateCount ?? 0) + 1);
   const comments =
     conversationCount ??
     pullRequest.commentCount ??
@@ -114,7 +115,17 @@ export function PullRequestTabsList({
           </span>
         </ProjectTabLabel>
       </TabsTrigger>
-      {!hideFiles && (
+      {githubHosted ? (
+        <TabsTrigger className={PROJECT_TAB_TRIGGER_CLASS} value="pr-checks">
+          <ProjectTabLabel>
+            Checks
+            <span className="rounded-full bg-muted px-1.5 py-0.5 text-2xs">
+              0
+            </span>
+          </ProjectTabLabel>
+        </TabsTrigger>
+      ) : null}
+      {!githubHosted && !hideFiles && (
         <TabsTrigger className={PROJECT_TAB_TRIGGER_CLASS} value="pr-files">
           <ProjectTabLabel>Files changed ({filesCount})</ProjectTabLabel>
         </TabsTrigger>

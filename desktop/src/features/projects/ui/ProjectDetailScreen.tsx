@@ -922,7 +922,11 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
                     repoDiffLoading={displayedRepoDiffLoading}
                     pullRequests={pullRequestsQuery.data?.pullRequests ?? []}
                     pullRequestsError={pullRequestsQuery.error}
+                    pullRequestsHasMore={pullRequestsQuery.data?.hasMore}
                     pullRequestsLoading={pullRequestsQuery.isLoading}
+                    onRetryPullRequests={() => {
+                      void pullRequestsQuery.refetch();
+                    }}
                     repoContributors={repoContributors}
                     repoHost={repoRemote.host}
                     repoSource={repoSource}

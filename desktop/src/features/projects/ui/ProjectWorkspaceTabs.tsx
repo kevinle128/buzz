@@ -66,6 +66,10 @@ import {
   PROJECT_SECTION_HEADER_CLASS,
 } from "./projectPanelStyles";
 import { ProjectSectionHeader } from "./ProjectSectionHeader";
+import {
+  GitHubPullRequestDetail,
+  GitHubPullRequestsPanel,
+} from "./GitHubProjectPullRequests";
 import { ProjectPanelState } from "./ProjectPanelState";
 import { CreatePullRequestDialog } from "./CreatePullRequestDialog";
 import {
@@ -124,7 +128,9 @@ export function WorkspaceTabs({
   sharedHeaderBackdrop,
   pullRequests,
   pullRequestsError,
+  pullRequestsHasMore = false,
   pullRequestsLoading,
+  onRetryPullRequests,
   githubIssueListState,
   onGithubIssueListStateChange,
   onSelectedCommitHashChange,
@@ -178,7 +184,10 @@ export function WorkspaceTabs({
   sharedHeaderBackdrop?: boolean;
   pullRequests: ProjectPullRequest[];
   pullRequestsError: unknown;
+  /** GitHub lists only the first page; true when more pull requests exist. */
+  pullRequestsHasMore?: boolean;
   pullRequestsLoading: boolean;
+  onRetryPullRequests?: () => void;
   githubIssueListState: GithubIssueListState;
   onGithubIssueListStateChange: (state: GithubIssueListState) => void;
   onSelectedCommitHashChange: (hash: string | null) => void;
@@ -546,50 +555,72 @@ export function WorkspaceTabs({
           data-project-detail-panel
           value="prs"
         >
-          <PullRequestsPanel
-            diffStats={
-              repoDiff
-                ? {
-                    additions: repoDiff.additions,
-                    deletions: repoDiff.deletions,
-                  }
-                : null
-            }
-            error={pullRequestsError}
-            filesChanged={
-              filesChangedBody === "files" && selectedPullRequest ? (
-                <ProjectPullRequestFilesChangedPanel
-                  diff={repoDiff}
-                  error={repoDiffError}
-                  focusedAnchor={
-                    pullRequestCommentTarget?.pullRequestId ===
-                    selectedPullRequestId
-                      ? pullRequestCommentTarget.anchor
-                      : null
-                  }
-                  isLoading={repoDiffLoading}
-                  profiles={profiles}
-                  project={project}
-                  pullRequest={selectedPullRequest}
-                />
-              ) : filesChangedBody === "unavailable" ? (
-                repositoryUnavailableState
-              ) : undefined
-            }
-            filesCount={repoDiff?.files.length}
-            forceOpenFiles={
-              pullRequestCommentTarget?.pullRequestId === selectedPullRequestId
-            }
-            isLoading={pullRequestsLoading}
-            onOpenCommit={onSelectedCommitHashChange}
-            onOpenInlineComment={handleOpenPullRequestComment}
-            onOpenTerminal={onOpenMergeRecoveryTerminal}
-            onSelectedPullRequestIdChange={onSelectedPullRequestIdChange}
-            profiles={profiles}
-            project={project}
-            pullRequests={pullRequests}
-            selectedPullRequest={selectedPullRequest}
-          />
+          {githubHosted ? (
+            selectedPullRequest ? (
+              <GitHubPullRequestDetail
+                key={selectedPullRequest.id}
+                onOpenCommit={onSelectedCommitHashChange}
+                onSelectedPullRequestIdChange={onSelectedPullRequestIdChange}
+                project={project}
+                pullRequest={selectedPullRequest}
+              />
+            ) : (
+              <GitHubPullRequestsPanel
+                error={pullRequestsError}
+                hasMore={pullRequestsHasMore}
+                isLoading={pullRequestsLoading}
+                onRetry={() => onRetryPullRequests?.()}
+                onSelectedPullRequestIdChange={onSelectedPullRequestIdChange}
+                pullRequests={pullRequests}
+              />
+            )
+          ) : (
+            <PullRequestsPanel
+              diffStats={
+                repoDiff
+                  ? {
+                      additions: repoDiff.additions,
+                      deletions: repoDiff.deletions,
+                    }
+                  : null
+              }
+              error={pullRequestsError}
+              filesChanged={
+                filesChangedBody === "files" && selectedPullRequest ? (
+                  <ProjectPullRequestFilesChangedPanel
+                    diff={repoDiff}
+                    error={repoDiffError}
+                    focusedAnchor={
+                      pullRequestCommentTarget?.pullRequestId ===
+                      selectedPullRequestId
+                        ? pullRequestCommentTarget.anchor
+                        : null
+                    }
+                    isLoading={repoDiffLoading}
+                    profiles={profiles}
+                    project={project}
+                    pullRequest={selectedPullRequest}
+                  />
+                ) : filesChangedBody === "unavailable" ? (
+                  repositoryUnavailableState
+                ) : undefined
+              }
+              filesCount={repoDiff?.files.length}
+              forceOpenFiles={
+                pullRequestCommentTarget?.pullRequestId ===
+                selectedPullRequestId
+              }
+              isLoading={pullRequestsLoading}
+              onOpenCommit={onSelectedCommitHashChange}
+              onOpenInlineComment={handleOpenPullRequestComment}
+              onOpenTerminal={onOpenMergeRecoveryTerminal}
+              onSelectedPullRequestIdChange={onSelectedPullRequestIdChange}
+              profiles={profiles}
+              project={project}
+              pullRequests={pullRequests}
+              selectedPullRequest={selectedPullRequest}
+            />
+          )}
         </TabsContent>
 
         <TabsContent

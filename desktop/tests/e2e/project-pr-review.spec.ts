@@ -1993,7 +1993,11 @@ test("channels tab opens the latest matching conversation without leaving the pr
   await projectEntry.click();
   await page.getByTestId("project-home-context-repo-buzz").click();
   await page.getByRole("tab", { name: "Channels", exact: true }).click();
-  const channelRow = page.getByTestId("project-channel-row").first();
+  // The linked discussion channel is pinned first; check the discovered row.
+  const channelRow = page
+    .getByTestId("project-channel-row")
+    .filter({ hasNot: page.getByTestId("project-bound-discussion-channel") })
+    .first();
   await expect(channelRow).toBeVisible({ timeout: 10_000 });
 
   const discussedAgent = channelRow.getByRole("button", {
