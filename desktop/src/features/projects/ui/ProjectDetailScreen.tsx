@@ -398,7 +398,13 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
       if (repoSource !== "remote") setRepoSource("remote");
       return;
     }
-    if (repoSource === "local" && !hasLocalCheckout) {
+    // A branch switch refetches the local snapshot; only a settled miss means
+    // the checkout is gone.
+    if (
+      repoSource === "local" &&
+      !hasLocalCheckout &&
+      !localRepoSnapshotQuery.isLoading
+    ) {
       setRepoSource("remote");
       return;
     }
@@ -415,6 +421,7 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
     displayedRepoSnapshot,
     githubHosted,
     hasLocalCheckout,
+    localRepoSnapshotQuery.isLoading,
     repoSource,
     selectedPullRequestId,
     selectedTag,

@@ -774,7 +774,11 @@ test("GitHub merge success publishes one merged status", async ({ page }) => {
   await page.getByTestId("merge-pull-request-confirm-button").click();
 
   await expect(page.getByText("Merged feature into main.")).toBeVisible();
-  await expect(page.getByText("Merged", { exact: true })).toBeVisible();
+  await expect(
+    page
+      .getByTestId("project-detail-meta")
+      .getByText("Merged", { exact: true }),
+  ).toBeVisible();
   await expect
     .poll(() =>
       page.evaluate(
@@ -843,9 +847,7 @@ test("GitHub merged-status retry skips the merge command", async ({ page }) => {
 
   await publishMergedStatus.click();
 
-  await expect(
-    page.getByText("Published merged pull request status."),
-  ).toBeVisible();
+  await expect(page.getByText("Published merged review status.")).toBeVisible();
   await expect(publishMergedStatus).toHaveCount(0);
   const mergeCommandCount = await page.evaluate(
     () =>
@@ -3800,7 +3802,8 @@ test("external repositories stay on local source after a branch round trip", asy
   ).toBeVisible();
   await expectLocalRepositoryOpenAction(page);
 
-  await page.getByRole("button", { name: /main/ }).click();
+  // GitHub-hosted: the default branch comes from GitHub, not the announcement.
+  await page.getByTestId("project-repository-branch-trigger").click();
   await page
     .getByRole("menuitemradio", {
       name: "wintermute/entity-link-recipient-cards-with-a-long-branch-name",

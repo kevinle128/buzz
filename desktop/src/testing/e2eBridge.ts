@@ -13555,11 +13555,24 @@ export function maybeInstallE2eTauriMocks() {
         if (window.__BUZZ_E2E_GITHUB_REPO_STATE_ERROR__) {
           throw window.__BUZZ_E2E_GITHUB_REPO_STATE_ERROR__;
         }
+        // Branches seeded for the repository dtag apply to GitHub too.
+        const { cloneUrl } = payload as { cloneUrl: string };
+        const dtag =
+          cloneUrl
+            .replace(/\.git$/, "")
+            .split("/")
+            .pop() ?? "";
+        const seeded = Object.entries(
+          readMockProjectBranches()[dtag] ?? {},
+        ).map(([name, commit]) => ({ name, commit }));
         return {
           head: "develop",
           branches: [
             { name: "develop", commit: "d".repeat(40) },
             { name: "main", commit: "m".repeat(40) },
+            ...seeded.filter(
+              ({ name }) => name !== "develop" && name !== "main",
+            ),
           ],
           tags: [],
           updated_at: Math.floor(Date.now() / 1000),
