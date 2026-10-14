@@ -187,6 +187,11 @@ export async function activateDesktopNotificationTarget(
       options?: { force?: boolean },
     ) => Promise<unknown>;
     goHome: () => Promise<unknown>;
+    /** Opens an agent's activity panel for agent-scoped alerts (permission requests). */
+    openAgentActivity?: (
+      pubkey: string,
+      options: { channelId: string | null },
+    ) => unknown;
     openSearchHit: (
       hit: SearchHit,
       behavior?: { force?: boolean; signal?: AbortSignal },
@@ -196,6 +201,14 @@ export async function activateDesktopNotificationTarget(
   signal?: AbortSignal,
 ): Promise<void> {
   if (signal?.aborted) {
+    return;
+  }
+
+  if (target.agentPubkey && actions.openAgentActivity) {
+    actions.openAgentActivity(target.agentPubkey, {
+      channelId: target.channelId ?? null,
+    });
+    void actions.revealWindow().catch(() => undefined);
     return;
   }
 

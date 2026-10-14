@@ -15,6 +15,11 @@ ignore = [
     # remove these when upstream catches up.
     { id = "RUSTSEC-2026-0194", reason = "transitive via rust-s3 and mesh-llm→plist; trusted-input XML only; no upstream fix available yet" },
     { id = "RUSTSEC-2026-0195", reason = "transitive via rust-s3 and mesh-llm→plist; trusted-input XML only; no upstream fix available yet" },
+    # unsafe-libyaml 0.2.11 — unmaintained (repository archived), not a known
+    # vulnerability. Pulled in by serde_yaml 0.9, which is itself deprecated and
+    # used across the workspace. No safe upgrade exists; remove when serde_yaml
+    # is replaced.
+    { id = "RUSTSEC-2024-0449", reason = "unmaintained, via deprecated serde_yaml; no safe upgrade available" },
 ]
 
 [licenses]

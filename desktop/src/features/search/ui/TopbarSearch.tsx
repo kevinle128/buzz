@@ -1,8 +1,12 @@
 import { Search } from "lucide-react";
 import * as React from "react";
+import { useAppsQuery } from "@/features/apps/hooks/useAppsQuery";
+import type { AppMetadata } from "@/features/apps/types";
+import { useRelaySelfQuery } from "@/features/moderation/hooks";
 import { resolveUserLabel } from "@/features/profile/lib/identity";
 import { getMinimumSearchQueryLength } from "@/features/search/hooks";
 import { parseSearchOperators } from "@/features/search/lib/parseSearchOperators";
+import { resolveSearchHitActor } from "@/features/search/lib/searchHitActor";
 import { buildSearchResultPreview } from "@/features/search/lib/searchMatch";
 import { useSearchResults } from "@/features/search/useSearchResults";
 import {
@@ -27,6 +31,7 @@ import {
   MENTION_CHIP_BASE_CLASSES,
   MESSAGE_MARKDOWN_CLASS,
 } from "@/shared/ui/mentionChip";
+import { Badge } from "@/shared/ui/badge";
 import { Skeleton } from "@/shared/ui/skeleton";
 import { UserAvatar } from "@/shared/ui/UserAvatar";
 type TopbarSearchProps = {
@@ -46,6 +51,8 @@ type TopbarSearchProps = {
   scopeFocusRequest?: number;
   variant?: "bar" | "icon";
 };
+const EMPTY_APPS: ReadonlyMap<string, AppMetadata> = new Map();
+
 const MAX_SEARCH_SUGGESTIONS = 4;
 const SEARCH_RESULT_LIMIT = 40;
 const SEARCH_SECTION_TITLE_CLASS =
@@ -434,6 +441,8 @@ export function TopbarSearch({
     : null;
   const currentPubkeyNormalized =
     currentPubkey && normalizePubkey(currentPubkey);
+  const apps = useAppsQuery().data;
+  const relaySelfPubkey = useRelaySelfQuery().data;
   const hasScopeAction = Boolean(currentChannel && !scopeChannel);
   const suggestedResults = React.useMemo(
     () => getSuggestedSearchResults(suggestionChannels ?? channels),
@@ -660,15 +669,29 @@ export function TopbarSearch({
         : null;
     const userDisplayName =
       result.kind === "user" ? getUserDisplayName(result.user) : null;
-    const messageAuthorLabel =
+    const messageActor =
       result.kind === "message"
-        ? resolveUserLabel({
-            currentPubkey,
-            profiles: resultProfiles,
-            pubkey: result.hit.pubkey,
-            preferResolvedSelfLabel: true,
+        ? resolveSearchHitActor({
+            hit: result.hit,
+            apps: apps ?? EMPTY_APPS,
+            relaySelfPubkey,
           })
         : null;
+    const messageAuthorLabel =
+      messageActor?.type === "app"
+        ? messageActor.name
+        : messageActor
+          ? resolveUserLabel({
+              currentPubkey,
+              profiles: resultProfiles,
+              pubkey: messageActor.pubkey,
+              preferResolvedSelfLabel: true,
+            })
+          : null;
+    const messageAuthorProfile =
+      messageActor?.type === "user"
+        ? resultProfiles?.[messageActor.pubkey.toLowerCase()]
+        : undefined;
     const messageContextLabel =
       result.kind === "message"
         ? getSearchHitContextLabel(result.hit, channelLookup, channelLabels)
@@ -718,21 +741,14 @@ export function TopbarSearch({
         {result.kind === "message" ? (
           <UserAvatar
             avatarUrl={
-              resultProfiles?.[result.hit.pubkey.toLowerCase()]?.avatarUrl ??
-              null
+              messageActor?.type === "app"
+                ? (messageActor.picture ?? null)
+                : (messageAuthorProfile?.avatarUrl ?? null)
             }
             className="h-8 w-8"
-            displayName={resolveUserLabel({
-              currentPubkey,
-              profiles: resultProfiles,
-              pubkey: result.hit.pubkey,
-              preferResolvedSelfLabel: true,
-            })}
+            displayName={messageAuthorLabel ?? ""}
             shape={
-              resultProfiles?.[result.hit.pubkey.toLowerCase()]?.isAgent ===
-              true
-                ? "squircle"
-                : "circle"
+              messageAuthorProfile?.isAgent === true ? "squircle" : "circle"
             }
             size="md"
           />
@@ -754,8 +770,15 @@ export function TopbarSearch({
         <span className="min-w-0 flex-1">
           {result.kind === "message" ? (
             <span className="grid w-full min-w-0 grid-cols-[minmax(0,1fr)_auto] gap-x-3">
-              <span className="col-start-1 row-start-1 min-w-0 truncate text-sm font-semibold leading-4 text-foreground">
-                {title}
+              <span className="col-start-1 row-start-1 flex min-w-0 items-center gap-1.5">
+                <span className="min-w-0 truncate text-sm font-semibold leading-4 text-foreground">
+                  {title}
+                </span>
+                {messageActor?.type === "app" ? (
+                  <Badge data-testid="search-app-badge" variant="secondary">
+                    App
+                  </Badge>
+                ) : null}
               </span>
               {trailingLabel ? (
                 <span className="col-start-2 row-start-1 flex shrink-0 items-center justify-self-end text-xs font-medium leading-4 text-muted-foreground/70">

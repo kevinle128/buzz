@@ -178,20 +178,33 @@ export function ProjectRepositoryActionsPanel({
   const cloneAction = sourceControls.localDisabled
     ? sourceControls.onCloneLocal
     : undefined;
+  const githubHosted = Boolean(sourceControls.githubHosted);
   const fetchAction =
     branchScoped &&
-    (sourceControls.source === "local" ||
+    (githubHosted ||
+      sourceControls.source === "local" ||
       sourceControls.remoteKind !== "external")
       ? sourceControls.onFetch
       : undefined;
+  const githubAheadBehind =
+    githubHosted &&
+    sourceControls.aheadCount != null &&
+    sourceControls.behindCount != null
+      ? `${sourceControls.aheadCount} / ${sourceControls.behindCount}`
+      : null;
   const pullAction =
     branchScoped && sourceControls.canPull ? sourceControls.onPull : undefined;
   const pushAction =
     branchScoped && sourceControls.canPush ? sourceControls.onPush : undefined;
-  const externalOpenUrl = projectExternalRefUrl(
-    sourceControls.externalUrl,
-    branchScoped ? (sourceControls.selectedTag ?? sourceControls.branch) : null,
-  );
+  // GitHub repositories open from the source menu ("Open on GitHub").
+  const externalOpenUrl = githubHosted
+    ? null
+    : projectExternalRefUrl(
+        sourceControls.externalUrl,
+        branchScoped
+          ? (sourceControls.selectedTag ?? sourceControls.branch)
+          : null,
+      );
   const showCreateTask = activeTab === "issues" && !selectionPresentation;
   const showCreateReview =
     activeTab === "prs" &&
@@ -334,18 +347,29 @@ export function ProjectRepositoryActionsPanel({
                         </RepositoryActionButton>
                       ) : null}
                       {fetchAction ? (
-                        <RepositoryActionButton
-                          disabled={sourceControls.fetchPending}
-                          onClick={fetchAction}
-                          title={sourceControls.fetchTitle}
-                        >
-                          {sourceControls.fetchPending ? (
-                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                          ) : (
-                            <RefreshCw className="h-3.5 w-3.5" />
-                          )}
-                          Fetch
-                        </RepositoryActionButton>
+                        <div className="relative">
+                          <RepositoryActionButton
+                            disabled={sourceControls.fetchPending}
+                            onClick={fetchAction}
+                            title={sourceControls.fetchTitle}
+                          >
+                            {sourceControls.fetchPending ? (
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            ) : (
+                              <RefreshCw className="h-3.5 w-3.5" />
+                            )}
+                            Fetch
+                          </RepositoryActionButton>
+                          {githubAheadBehind ? (
+                            <span
+                              className="pointer-events-none absolute top-1/2 right-0 -translate-y-1/2 font-mono text-2xs text-muted-foreground"
+                              data-testid="repo-ahead-behind"
+                              title="Commits ahead / behind GitHub"
+                            >
+                              {githubAheadBehind}
+                            </span>
+                          ) : null}
+                        </div>
                       ) : null}
                       {pullAction ? (
                         <RepositoryActionButton

@@ -18,6 +18,7 @@ import {
   type ProjectIssue,
   type Repository as Project,
   useCreateProjectIssueCommentMutation,
+  useGithubRepositoryBuzzIssuesQuery,
   useProjectIssuesQuery,
 } from "@/features/projects/hooks";
 import {
@@ -62,6 +63,7 @@ import {
 } from "./ProjectStatusProgressIcon";
 import { ProjectWorkItemGroup } from "./ProjectWorkItemGroup";
 import { ProjectWorkItemRow } from "./ProjectWorkItemRow";
+import { ProjectPanelState } from "./ProjectPanelState";
 
 export function issueStatusClassName(status: ProjectIssue["status"]) {
   if (status === "Triage" || status === "In Progress") return "text-amber-500";
@@ -121,6 +123,11 @@ const ISSUE_STATUS_ORDER: readonly ProjectIssue["status"][] = [
   "Closed",
 ];
 
+export type ProjectIssuePanelItem = {
+  issue: ProjectIssue;
+  project: Project;
+};
+
 function issueMembers(
   project: Project,
   issue: ProjectIssue,
@@ -146,14 +153,28 @@ function issueMembers(
   });
 }
 
+function issueSelectionItem(project: Project, issue: ProjectIssue) {
+  return selectionItemFromTask({
+    author: issue.author,
+    channelId: issue.channelId ?? project.channelId,
+    id: issue.id,
+    shareLink: issueShareLink(issue),
+    title: issue.title,
+  });
+}
+
 function IssueRow({
   issue,
   onOpen,
   profiles,
+  project,
+  rangeItems,
 }: {
   issue: ProjectIssue;
   onOpen: () => void;
   profiles?: UserProfileLookup;
+  project: Project;
+  rangeItems: ReturnType<typeof issueSelectionItem>[];
 }) {
   const authorProfile = profiles?.[normalizePubkey(issue.author)];
   const authorLabel = resolveUserLabel({ profiles, pubkey: issue.author });
@@ -165,6 +186,10 @@ function IssueRow({
       identifier={`#${issue.id.slice(0, 8)}`}
       identifierTitle="View task"
       onOpen={onOpen}
+      selection={{
+        item: issueSelectionItem(project, issue),
+        rangeItems,
+      }}
       statusIcon={
         <ProjectStatusProgressIcon
           aria-label={issue.status}
@@ -177,7 +202,7 @@ function IssueRow({
       trailing={
         <>
           <span
-            className="hidden w-24 shrink-0 truncate text-right text-xs text-muted-foreground md:block"
+            className="hidden w-24 shrink-0 truncate text-right text-xs text-muted-foreground/60 md:block"
             data-testid="project-issue-row-category"
           >
             {projectTaskCategoryLabel(issue.category)}
@@ -228,7 +253,7 @@ function IssueRow({
               }
               className={`flex items-center gap-1 rounded-md text-xs hover:text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring ${
                 issue.comments.length > 0
-                  ? "text-muted-foreground"
+                  ? "text-muted-foreground/60"
                   : "text-muted-foreground/45"
               }`}
               data-testid="project-issue-comments"
@@ -240,7 +265,7 @@ function IssueRow({
             </button>
           </span>
           <span
-            className="hidden w-20 shrink-0 text-right text-xs text-muted-foreground/70 sm:block"
+            className="hidden w-20 shrink-0 text-right text-xs text-muted-foreground/55 sm:block"
             data-testid="project-issue-row-date"
             title={new Date(issue.createdAt * 1_000).toLocaleString()}
           >
@@ -263,7 +288,6 @@ export function ProjectIssueDetail({
   project: Project;
 }) {
   const commentMutation = useCreateProjectIssueCommentMutation(project);
-  const authorLabel = resolveUserLabel({ profiles, pubkey: issue.author });
   const members = React.useMemo(
     () => issueMembers(project, issue, profiles),
     [issue, profiles, project],
@@ -292,7 +316,6 @@ export function ProjectIssueDetail({
     [commentMutation, issue],
   );
   const identityQuery = useIdentityQuery();
-  const authorProfile = profiles?.[normalizePubkey(issue.author)];
   const status = issueStatusVisual(issue.status);
   const labels = projectTaskUserLabels(issue.labels);
   const viewerPubkey = identityQuery.data?.pubkey;
@@ -323,16 +346,7 @@ export function ProjectIssueDetail({
           />
         </h3>
         <p className="flex flex-wrap items-center gap-x-1 gap-y-1 text-xs text-muted-foreground">
-          <ProfileIdentityButton
-            avatarClassName="shrink-0"
-            avatarSize="xs"
-            avatarUrl={authorProfile?.avatarUrl ?? null}
-            isAgent={authorProfile?.isAgent === true}
-            label={authorLabel}
-            pubkey={issue.author}
-            showLabel={false}
-          />
-          <span className="font-medium text-foreground">{authorLabel}</span>
+          <span>Task created</span>
           <span
             className="shrink-0 whitespace-nowrap"
             title={new Date(issue.createdAt * 1_000).toLocaleString()}
@@ -395,7 +409,7 @@ export function ProjectIssueDetail({
         </div>
       </ProjectDetailSection>
       <div
-        className="border-border/50 border-t px-6 pb-6 pt-4"
+        className="px-6 pb-6 pt-4"
         data-testid="project-issue-comment-composer"
       >
         <ForumComposer
@@ -413,36 +427,57 @@ export function ProjectIssueDetail({
 }
 
 export function ProjectIssuesPanel({
-  githubIssueListState,
+  error,
+  githubIssueListState = "open",
+  isLoading,
+  issueItems,
   onGithubIssueListStateChange,
   onSelectedIssueIdChange,
   profiles,
   project,
   selectedIssueId,
 }: {
-  githubIssueListState: GithubIssueListState;
-  onGithubIssueListStateChange: (state: GithubIssueListState) => void;
+  error?: unknown;
+  /** GitHub Open/Closed filter; only used for a single GitHub repository. */
+  githubIssueListState?: GithubIssueListState;
+  isLoading?: boolean;
+  /** Tasks gathered across a project's repositories (project home). */
+  issueItems?: ProjectIssuePanelItem[];
+  onGithubIssueListStateChange?: (state: GithubIssueListState) => void;
   onSelectedIssueIdChange: (id: string | null) => void;
   profiles?: UserProfileLookup;
   project: Project;
   selectedIssueId: string | null;
 }) {
-  const issuesQuery = useProjectIssuesQuery(project, githubIssueListState);
-  const issues = issuesQuery.data?.issues ?? [];
-  const githubHosted = isGitHubCloneUrl(project.cloneUrls[0]);
-  const selectedIssue =
-    issues.find((issue) => issue.id === selectedIssueId) ?? null;
+  const issuesQuery = useProjectIssuesQuery(
+    issueItems === undefined ? project : null,
+    githubIssueListState,
+  );
+  const githubHosted =
+    issueItems === undefined && isGitHubCloneUrl(project.cloneUrls[0]);
+  // GitHub-hosted repositories list GitHub issues, then Buzz tasks.
+  const buzzIssuesQuery = useGithubRepositoryBuzzIssuesQuery(
+    githubHosted ? project : null,
+  );
+  const resolvedItems =
+    issueItems ??
+    (issuesQuery.data?.issues ?? []).map((issue) => ({ issue, project }));
+  const buzzItems = (buzzIssuesQuery.data ?? []).map((issue) => ({
+    issue,
+    project,
+  }));
+  const selectedItem =
+    [...resolvedItems, ...buzzItems].find(
+      ({ issue }) => issue.id === selectedIssueId,
+    ) ?? null;
+  const loading = isLoading ?? issuesQuery.isLoading;
+  const loadError = error ?? issuesQuery.error;
   const hasMoreNote =
     githubHosted && issuesQuery.data?.hasMore
       ? githubIssueListState === "closed"
         ? "More closed issues exist on GitHub."
         : "More open issues exist on GitHub."
       : null;
-  const emptyCopy = githubHosted
-    ? githubIssueListState === "closed"
-      ? "No closed issues."
-      : "No open issues."
-    : "No tasks yet.";
 
   React.useEffect(() => {
     if (!githubHosted) return;
@@ -464,13 +499,16 @@ export function ProjectIssuesPanel({
     selectedIssueId,
   ]);
 
-  const groups = ISSUE_STATUS_ORDER.map((status) => ({
-    items: issues.filter((issue) => issue.status === status),
-    status,
-  })).filter((group) => group.items.length > 0);
-
   let body: React.ReactNode;
-  if (issuesQuery.isLoading) {
+  if (selectedItem && githubHosted && buzzItems.includes(selectedItem)) {
+    body = (
+      <ProjectIssueDetail
+        issue={selectedItem.issue}
+        profiles={profiles}
+        project={selectedItem.project}
+      />
+    );
+  } else if (loading) {
     body = (
       <BuzzLoadingState
         label={githubHosted ? "Loading issues" : "Loading tasks"}
@@ -487,39 +525,52 @@ export function ProjectIssuesPanel({
         />
       </div>
     );
-  } else if (issuesQuery.isError) {
-    body = (
-      <p className="p-4 text-sm text-muted-foreground">
-        Could not load tasks for this repository.
-      </p>
-    );
-  } else if (issues.length === 0) {
+  } else if (resolvedItems.length === 0 && githubHosted) {
     body = (
       <div className="space-y-2 p-4 text-sm text-muted-foreground">
-        <p>{emptyCopy}</p>
+        <p>
+          {githubIssueListState === "closed"
+            ? "No closed issues."
+            : "No open issues."}
+        </p>
         {hasMoreNote ? <p>{hasMoreNote}</p> : null}
       </div>
     );
-  } else if (selectedIssue) {
-    body = githubHosted ? (
-      <GitHubIssueDetail
-        issue={selectedIssue}
-        onListStateChange={onGithubIssueListStateChange}
-        onSelectedIssueIdChange={onSelectedIssueIdChange}
-        project={project}
-      />
-    ) : (
-      <ProjectIssueDetail
-        issue={selectedIssue}
-        profiles={profiles}
-        project={project}
+  } else if (resolvedItems.length === 0) {
+    body = (
+      <ProjectPanelState
+        description={
+          loadError
+            ? "Refresh the project and try again."
+            : issueItems
+              ? "Tasks created for this project's repositories will appear here."
+              : "Tasks created for this repository will appear here."
+        }
+        error={Boolean(loadError)}
+        title={loadError ? "Could not load tasks" : "No tasks yet"}
       />
     );
+  } else if (selectedItem) {
+    body =
+      githubHosted && onGithubIssueListStateChange ? (
+        <GitHubIssueDetail
+          issue={selectedItem.issue}
+          onListStateChange={onGithubIssueListStateChange}
+          onSelectedIssueIdChange={onSelectedIssueIdChange}
+          project={selectedItem.project}
+        />
+      ) : (
+        <ProjectIssueDetail
+          issue={selectedItem.issue}
+          profiles={profiles}
+          project={selectedItem.project}
+        />
+      );
   } else if (githubHosted) {
     body = (
       <div>
         <div className="divide-y divide-border/50">
-          {issues.map((issue) => (
+          {resolvedItems.map(({ issue }) => (
             <GitHubIssueRow
               issue={issue}
               key={issue.id}
@@ -535,51 +586,101 @@ export function ProjectIssuesPanel({
       </div>
     );
   } else {
-    body = groups.map(({ items, status }) => {
-      const visual = issueStatusVisual(status);
-      return (
-        <ProjectWorkItemGroup
-          count={items.length}
-          icon={
-            <ProjectStatusProgressIcon
-              className={`h-4 w-4 ${visual.className}`}
-              state={visual.progress}
-            />
-          }
-          key={status}
-          label={status}
-          items={items.map((issue) =>
-            selectionItemFromTask({
-              author: issue.author,
-              channelId: project.channelId,
-              id: issue.id,
-              shareLink: issueShareLink(issue),
-              title: issue.title,
-            }),
-          )}
-        >
-          {items.map((issue) => (
-            <IssueRow
-              issue={issue}
-              key={issue.id}
-              onOpen={() => onSelectedIssueIdChange(issue.id)}
-              profiles={profiles}
-            />
-          ))}
-        </ProjectWorkItemGroup>
-      );
-    });
+    body = (
+      <IssueStatusGroups
+        items={resolvedItems}
+        onSelectedIssueIdChange={onSelectedIssueIdChange}
+        profiles={profiles}
+      />
+    );
   }
+
+  const showBuzzSection =
+    githubHosted &&
+    !selectedItem &&
+    (buzzItems.length > 0 || buzzIssuesQuery.isError);
 
   return (
     <div>
-      {githubHosted ? (
+      {githubHosted && onGithubIssueListStateChange ? (
         <GitHubIssueStateFilter
           onChange={onGithubIssueListStateChange}
           value={githubIssueListState}
         />
       ) : null}
       {body}
+      {showBuzzSection ? (
+        <section aria-labelledby="project-buzz-tasks-title">
+          <h3
+            className="border-border/50 border-t px-4 pt-4 pb-1 text-xs font-medium text-muted-foreground"
+            id="project-buzz-tasks-title"
+          >
+            Buzz tasks
+          </h3>
+          {buzzIssuesQuery.isError ? (
+            <ProjectPanelState
+              description="Refresh the project and try again."
+              error
+              title="Could not load tasks"
+            />
+          ) : (
+            <IssueStatusGroups
+              items={buzzItems}
+              onSelectedIssueIdChange={onSelectedIssueIdChange}
+              profiles={profiles}
+            />
+          )}
+        </section>
+      ) : null}
     </div>
   );
+}
+
+/** Buzz tasks grouped by status, in the shared status order. */
+function IssueStatusGroups({
+  items: issueItems,
+  onSelectedIssueIdChange,
+  profiles,
+}: {
+  items: ProjectIssuePanelItem[];
+  onSelectedIssueIdChange: (id: string | null) => void;
+  profiles?: UserProfileLookup;
+}) {
+  const groups = ISSUE_STATUS_ORDER.map((status) => ({
+    items: issueItems.filter(({ issue }) => issue.status === status),
+    status,
+  })).filter((group) => group.items.length > 0);
+  const rangeItems = issueItems.map(({ issue, project: itemProject }) =>
+    issueSelectionItem(itemProject, issue),
+  );
+  return groups.map(({ items, status }) => {
+    const visual = issueStatusVisual(status);
+    return (
+      <ProjectWorkItemGroup
+        count={items.length}
+        icon={
+          <ProjectStatusProgressIcon
+            className={`h-4 w-4 ${visual.className}`}
+            state={visual.progress}
+          />
+        }
+        items={items.map(({ issue, project: itemProject }) =>
+          issueSelectionItem(itemProject, issue),
+        )}
+        key={status}
+        label={status}
+      >
+        {items.map(({ issue, project: itemProject }) => (
+          <IssueRow
+            issue={issue}
+            key={issue.id}
+            onOpen={() => onSelectedIssueIdChange(issue.id)}
+            profiles={profiles}
+            project={itemProject}
+            rangeItems={rangeItems}
+          />
+        ))}
+      </ProjectWorkItemGroup>
+    );
+  });
 }

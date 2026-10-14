@@ -9,6 +9,8 @@ import {
 } from "lucide-react";
 import type * as React from "react";
 
+import { isGitHubCloneUrl } from "@/features/projects/lib/projectGitError";
+
 import type {
   ProjectIssue,
   ProjectPullRequest,
@@ -91,16 +93,21 @@ export function ProjectWorkItemContextDetails({
           label="Status"
           value={pullRequest.status}
         />
-        <ContextDetailRow
-          icon={Users}
-          label="Reviewers"
-          value={pullRequest.reviewers.length}
-        />
-        <ContextDetailRow
-          icon={CheckCircle2}
-          label="Approvals"
-          value={pullRequest.approvals.length}
-        />
+        {/* GitHub pull requests carry no Buzz reviewers or approvals. */}
+        {isGitHubCloneUrl(repository.cloneUrls[0]) ? null : (
+          <>
+            <ContextDetailRow
+              icon={Users}
+              label="Reviewers"
+              value={pullRequest.reviewers.length}
+            />
+            <ContextDetailRow
+              icon={CheckCircle2}
+              label="Approvals"
+              value={pullRequest.approvals.length}
+            />
+          </>
+        )}
       </>
     );
   }

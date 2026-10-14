@@ -19,6 +19,7 @@ import {
 } from "@/features/projects/lib/projectRepoAvailability";
 import { Button } from "@/shared/ui/button";
 import { UserAvatar } from "@/shared/ui/UserAvatar";
+import { GitHubRepoStateRecovery } from "./GitHubRepoStateRecovery";
 
 const UNAVAILABLE_ICONS = {
   authentication: LockKeyhole,
@@ -119,8 +120,26 @@ function AccessRestrictedDescription({
   );
 }
 
+export type GitHubStateRecovery = {
+  error: unknown;
+  onRetry?: () => void;
+};
+
+/** GitHub recovery for source controls whose GitHub state failed to load. */
+export function githubStateRecovery(controls?: {
+  onRetryState?: () => void;
+  showGithubStateRecovery?: boolean;
+  stateError?: unknown;
+}): GitHubStateRecovery | undefined {
+  return controls?.showGithubStateRecovery
+    ? { error: controls.stateError, onRetry: controls.onRetryState }
+    : undefined;
+}
+
 export function ProjectRepositoryUnavailableState({
   accessChannelId,
+  externalHost,
+  githubRecovery,
   onAskForAccess,
   onRetry,
   ownerAvatarUrl,
@@ -130,6 +149,9 @@ export function ProjectRepositoryUnavailableState({
   retryPending = false,
 }: {
   accessChannelId?: string | null;
+  externalHost?: string;
+  /** GitHub CLI/auth guidance that replaces the generic copy when set. */
+  githubRecovery?: GitHubStateRecovery;
   onAskForAccess?: () => void;
   onRetry?: () => void;
   ownerAvatarUrl?: string | null;
@@ -138,7 +160,23 @@ export function ProjectRepositoryUnavailableState({
   reason?: ProjectRepoUnavailableReason;
   retryPending?: boolean;
 }) {
-  const unavailable = projectRepoUnavailablePresentation(reason);
+  if (githubRecovery) {
+    return (
+      <div
+        className="flex min-h-[calc(100dvh-7rem)] items-center justify-center p-8"
+        data-testid="project-repository-unavailable"
+      >
+        <div className="w-full max-w-lg">
+          <GitHubRepoStateRecovery
+            error={githubRecovery.error}
+            onRetry={githubRecovery.onRetry}
+          />
+        </div>
+      </div>
+    );
+  }
+
+  const unavailable = projectRepoUnavailablePresentation(reason, externalHost);
   const UnavailableIcon = UNAVAILABLE_ICONS[reason];
 
   return (
