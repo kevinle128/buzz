@@ -10,6 +10,20 @@ export type ProjectEventTemplate = {
   tags: string[][];
 };
 
+export type ProjectAnnouncementTemplate = {
+  dtag: string;
+  project: ProjectEventTemplate;
+};
+
+export type ProjectBootstrapTemplates = ProjectAnnouncementTemplate & {
+  repository: ProjectEventTemplate;
+  repositoryAddress: string;
+  /** Default repository d-tag; equals `dtag` unless a repository name was given. */
+  repositoryDtag: string;
+};
+
+export type ProjectListingVisibility = "listed" | "unlisted";
+
 export function isUnsupportedProjectKindError(error: unknown): boolean {
   return (
     error instanceof Error &&
@@ -29,17 +43,35 @@ export function projectDtagFromName(name: string): string {
   return repositoryDtagFromName(name);
 }
 
-export type ProjectAnnouncementTemplate = {
-  dtag: string;
-  project: ProjectEventTemplate;
-};
-
-export type ProjectBootstrapTemplates = ProjectAnnouncementTemplate & {
-  repository: ProjectEventTemplate;
-  repositoryAddress: string;
-};
-
-export type ProjectListingVisibility = "listed" | "unlisted";
+/**
+ * Resolves the default repository identity. An omitted or blank name keeps the
+ * project identity; a filled name never falls back to the project name.
+ */
+export function defaultRepositoryIdentity({
+  projectDtag,
+  projectName,
+  repositoryName,
+}: {
+  projectDtag: string;
+  projectName: string;
+  repositoryName?: string;
+}): { repositoryDtag: string; repositoryDisplayName: string } {
+  const normalizedRepositoryName = repositoryName?.trim() ?? "";
+  if (!normalizedRepositoryName) {
+    return { repositoryDtag: projectDtag, repositoryDisplayName: projectName };
+  }
+  if (new TextEncoder().encode(normalizedRepositoryName).byteLength > 256) {
+    throw new Error("Repository name must not exceed 256 bytes.");
+  }
+  const repositoryDtag = repositoryDtagFromName(normalizedRepositoryName);
+  if (!repositoryDtag) {
+    throw new Error("Repository name must include letters or numbers.");
+  }
+  if (repositoryDtag.length > 64) {
+    throw new Error("Repository name slug must not exceed 64 characters.");
+  }
+  return { repositoryDtag, repositoryDisplayName: normalizedRepositoryName };
+}
 
 export type ListedProjectIdentity = {
   dtag: string;
@@ -48,7 +80,12 @@ export type ListedProjectIdentity = {
   owner: string;
 };
 
-/** Finds a listed project that would create a duplicate project card. */
+/**
+ * A second listed project with the same slug or display name is the duplicate
+ * card users see when an agent runs `projects create` inside an existing
+ * project. Same-owner + same-slug is handled as resume/idempotent create by
+ * the caller; this finds a *different* listed project that should block create.
+ */
 export function conflictingListedProject(
   projects: readonly ListedProjectIdentity[],
   input: { dtag: string; name: string; ownerPubkey: string },
@@ -80,18 +117,29 @@ function normalizeProjectAnnouncementInput({
   name: string;
   ownerPubkey: string;
   projectChannelId: string;
-}) {
+}): {
+  dtag: string;
+  normalizedDescription: string;
+  normalizedName: string;
+  normalizedOwner: string;
+  normalizedProjectChannelId: string;
+} {
   const normalizedName = name.trim();
-  if (!normalizedName) throw new Error("Project name is required.");
+  if (!normalizedName) {
+    throw new Error("Project name is required.");
+  }
   if (new TextEncoder().encode(normalizedName).byteLength > 256) {
     throw new Error("Project name must not exceed 256 bytes.");
   }
   const dtag = projectDtagFromName(normalizedName);
-  if (!dtag) throw new Error("Project name must include letters or numbers.");
+  if (!dtag) {
+    throw new Error("Project name must include letters or numbers.");
+  }
   const normalizedOwner = ownerPubkey.trim().toLowerCase();
   if (!/^[0-9a-f]{64}$/.test(normalizedOwner)) {
     throw new Error("Project owner public key is invalid.");
   }
+
   const normalizedDescription = description?.trim() ?? "";
   if (new TextEncoder().encode(normalizedDescription).byteLength > 2_048) {
     throw new Error("Project description must not exceed 2,048 bytes.");
@@ -100,6 +148,7 @@ function normalizeProjectAnnouncementInput({
   if (!isValidProjectChannelId(normalizedProjectChannelId)) {
     throw new Error("Project channel is invalid.");
   }
+
   return {
     dtag,
     normalizedDescription,
@@ -109,7 +158,7 @@ function normalizeProjectAnnouncementInput({
   };
 }
 
-/** Channel-first NIP-MP project metadata. */
+/** Channel-first NIP-MP project: metadata, home channel, optional members. */
 export function buildProjectAnnouncementTemplate({
   description,
   name,
@@ -136,6 +185,7 @@ export function buildProjectAnnouncementTemplate({
     ownerPubkey,
     projectChannelId,
   });
+
   if (new Set(repositoryAddresses).size !== repositoryAddresses.length) {
     throw new Error("A project cannot contain duplicate repositories.");
   }
@@ -146,37 +196,79 @@ export function buildProjectAnnouncementTemplate({
   ) {
     throw new Error("Repository address is invalid.");
   }
-  const tags: string[][] = [
+
+  const projectTags: string[][] = [
     ["d", dtag],
     ["name", normalizedName],
     ["buzz-channel", normalizedProjectChannelId],
   ];
-  if (normalizedDescription) tags.push(["description", normalizedDescription]);
-  if (projectVisibility === "unlisted")
-    tags.push(["buzz-visibility", "unlisted"]);
-  for (const address of [...repositoryAddresses].sort())
-    tags.push(["a", address]);
+  if (normalizedDescription) {
+    projectTags.push(["description", normalizedDescription]);
+  }
+  if (projectVisibility === "unlisted") {
+    projectTags.push(["buzz-visibility", "unlisted"]);
+  }
+  for (const address of [...repositoryAddresses].sort()) {
+    projectTags.push(["a", address]);
+  }
+
   return {
     dtag,
-    project: { kind: KIND_PROJECT_ANNOUNCEMENT, content: "", tags },
+    project: {
+      kind: KIND_PROJECT_ANNOUNCEMENT,
+      content: "",
+      tags: projectTags,
+    },
   };
 }
 
-/** Default 30617 bound to the project home channel. */
+/**
+ * Refuses a custom default-repository slug that already names a repository
+ * head, before anything is signed or published. The project slug itself is
+ * resumable by design, and a retry may reuse the head it published itself.
+ */
+export async function assertCustomRepositoryAvailable({
+  fetchRepositoryHead,
+  ownerPubkey,
+  projectDtag,
+  repositoryDtag,
+  resumedRepositoryAddress,
+}: {
+  fetchRepositoryHead: (dtag: string) => Promise<unknown | null>;
+  ownerPubkey: string;
+  projectDtag: string;
+  repositoryDtag: string;
+  resumedRepositoryAddress?: string;
+}): Promise<void> {
+  if (repositoryDtag === projectDtag) return;
+  const repositoryAddress = `${KIND_REPO_ANNOUNCEMENT}:${ownerPubkey.toLowerCase()}:${repositoryDtag}`;
+  if (resumedRepositoryAddress === repositoryAddress) return;
+  if (await fetchRepositoryHead(repositoryDtag)) {
+    throw new Error(
+      `A repository named "${repositoryDtag}" already exists (as a standalone repository or in another project). Choose a different name to avoid overwriting it.`,
+    );
+  }
+}
+
+/** Default 30617 bound to the project home channel, using the project slug
+ * unless a repository name is given. */
 export function buildDefaultProjectRepositoryTemplate({
   description,
   name,
   ownerPubkey,
   projectChannelId,
+  repositoryName,
 }: {
   description?: string;
   name: string;
   ownerPubkey: string;
   projectChannelId: string;
+  repositoryName?: string;
 }): {
   dtag: string;
   repository: ProjectEventTemplate;
   repositoryAddress: string;
+  repositoryDtag: string;
 } {
   const {
     dtag,
@@ -190,43 +282,54 @@ export function buildDefaultProjectRepositoryTemplate({
     ownerPubkey,
     projectChannelId,
   });
-  const repositoryAddress = `${KIND_REPO_ANNOUNCEMENT}:${normalizedOwner}:${dtag}`;
-  const tags: string[][] = [
-    ["d", dtag],
-    ["name", normalizedName],
+  const { repositoryDtag, repositoryDisplayName } = defaultRepositoryIdentity({
+    projectDtag: dtag,
+    projectName: normalizedName,
+    repositoryName,
+  });
+  const repositoryAddress = `${KIND_REPO_ANNOUNCEMENT}:${normalizedOwner}:${repositoryDtag}`;
+  const repositoryTags: string[][] = [
+    ["d", repositoryDtag],
+    ["name", repositoryDisplayName],
     ["buzz-channel", normalizedProjectChannelId],
   ];
-  if (normalizedDescription) tags.push(["description", normalizedDescription]);
+  if (normalizedDescription) {
+    repositoryTags.push(["description", normalizedDescription]);
+  }
   return {
     dtag,
     repositoryAddress,
+    repositoryDtag,
     repository: {
       kind: KIND_REPO_ANNOUNCEMENT,
       content: normalizedDescription,
-      tags,
+      tags: repositoryTags,
     },
   };
 }
 
-/** Home channel plus its default repository. */
+/** Home channel + default repository already listed on the project. */
 export function buildProjectBootstrapTemplates({
   description,
   name,
   ownerPubkey,
   projectChannelId,
   projectVisibility = "listed",
+  repositoryName,
 }: {
   description?: string;
   name: string;
   ownerPubkey: string;
   projectChannelId: string;
   projectVisibility?: ProjectListingVisibility;
+  repositoryName?: string;
 }): ProjectBootstrapTemplates {
   const repository = buildDefaultProjectRepositoryTemplate({
     description,
     name,
     ownerPubkey,
     projectChannelId,
+    repositoryName,
   });
   const announcement = buildProjectAnnouncementTemplate({
     description,
@@ -240,117 +343,6 @@ export function buildProjectBootstrapTemplates({
     ...announcement,
     repository: repository.repository,
     repositoryAddress: repository.repositoryAddress,
-  };
-}
-
-export type InitialProjectEventTemplates = {
-  /** Project d-tag derived from the Create project Name field. */
-  dtag: string;
-  /** Initial repository d-tag derived from Repository name, or `dtag` when omitted. */
-  repositoryDtag: string;
-  project: ProjectEventTemplate;
-  repository: ProjectEventTemplate;
-  repositoryAddress: string;
-};
-
-export function buildInitialProjectEventTemplates({
-  accessChannelId,
-  cloneUrl,
-  description,
-  name,
-  ownerPubkey,
-  repositoryName,
-  webUrl,
-}: {
-  accessChannelId: string;
-  cloneUrl?: string;
-  description?: string;
-  name: string;
-  ownerPubkey: string;
-  repositoryName?: string;
-  webUrl?: string;
-}): InitialProjectEventTemplates {
-  const normalizedName = name.trim();
-  if (!normalizedName) {
-    throw new Error("Project name is required.");
-  }
-  if (new TextEncoder().encode(normalizedName).byteLength > 256) {
-    throw new Error("Project name must not exceed 256 bytes.");
-  }
-  const dtag = projectDtagFromName(normalizedName);
-  if (!dtag) {
-    throw new Error("Project name must include letters or numbers.");
-  }
-
-  const normalizedRepositoryName = repositoryName?.trim() ?? "";
-  let repositoryDisplayName = normalizedName;
-  let repositoryDtag = dtag;
-  if (normalizedRepositoryName) {
-    if (new TextEncoder().encode(normalizedRepositoryName).byteLength > 256) {
-      throw new Error("Repository name must not exceed 256 bytes.");
-    }
-    repositoryDtag = repositoryDtagFromName(normalizedRepositoryName);
-    if (!repositoryDtag) {
-      throw new Error("Repository name must include letters or numbers.");
-    }
-    if (repositoryDtag.length > 64) {
-      throw new Error("Repository name slug must not exceed 64 characters.");
-    }
-    repositoryDisplayName = normalizedRepositoryName;
-  }
-
-  const normalizedOwner = ownerPubkey.trim().toLowerCase();
-  if (!/^[0-9a-f]{64}$/.test(normalizedOwner)) {
-    throw new Error("Project owner public key is invalid.");
-  }
-
-  const normalizedDescription = description?.trim() ?? "";
-  if (new TextEncoder().encode(normalizedDescription).byteLength > 2_048) {
-    throw new Error("Project description must not exceed 2,048 bytes.");
-  }
-  const repositoryTags: string[][] = [
-    ["d", repositoryDtag],
-    ["name", repositoryDisplayName],
-  ];
-  const projectTags: string[][] = [
-    ["d", dtag],
-    ["name", normalizedName],
-  ];
-  const normalizedAccessChannelId = accessChannelId.trim();
-  if (!isValidProjectChannelId(normalizedAccessChannelId)) {
-    throw new Error("Repository access channel is invalid.");
-  }
-  repositoryTags.push(["buzz-channel", normalizedAccessChannelId]);
-  projectTags.push(["buzz-channel", normalizedAccessChannelId]);
-  if (normalizedDescription) {
-    repositoryTags.push(["description", normalizedDescription]);
-    projectTags.push(["description", normalizedDescription]);
-  }
-  const normalizedCloneUrl = cloneUrl?.trim();
-  if (normalizedCloneUrl) {
-    repositoryTags.push(["clone", normalizedCloneUrl]);
-  }
-  const normalizedWebUrl = webUrl?.trim();
-  if (normalizedWebUrl) {
-    repositoryTags.push(["web", normalizedWebUrl]);
-  }
-
-  const repositoryAddress = `${KIND_REPO_ANNOUNCEMENT}:${normalizedOwner}:${repositoryDtag}`;
-  projectTags.push(["a", repositoryAddress]);
-
-  return {
-    dtag,
-    repositoryDtag,
-    project: {
-      kind: KIND_PROJECT_ANNOUNCEMENT,
-      content: "",
-      tags: projectTags,
-    },
-    repository: {
-      kind: KIND_REPO_ANNOUNCEMENT,
-      content: normalizedDescription,
-      tags: repositoryTags,
-    },
-    repositoryAddress,
+    repositoryDtag: repository.repositoryDtag,
   };
 }

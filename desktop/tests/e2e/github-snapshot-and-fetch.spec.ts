@@ -23,6 +23,7 @@ async function openBuzzProject(page: import("@playwright/test").Page) {
     .first();
   await expect(projectEntry).toBeVisible({ timeout: 10_000 });
   await projectEntry.click();
+  await page.getByTestId("project-home-context-repo-buzz").click();
 }
 
 test("GitHub remote source shows README instead of the hosted-elsewhere card", async ({
@@ -40,7 +41,7 @@ test("GitHub remote source shows README instead of the hosted-elsewhere card", a
   });
   await waitForAnimations(page);
   await expect(page.getByText("Code hosted on github.com")).toHaveCount(0);
-  const header = page.getByTestId("project-repository-selection-row");
+  const header = page.getByTestId("project-workspace-panel");
   await expect(header.getByRole("button", { name: /^Fetch$/ })).toBeVisible();
   await expect(header.getByRole("link", { name: /^Open$/ })).toHaveCount(0);
   await expect(header.getByRole("button", { name: /Pull/ })).toHaveCount(0);

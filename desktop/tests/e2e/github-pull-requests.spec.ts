@@ -24,13 +24,14 @@ async function openBuzzProject(page: import("@playwright/test").Page) {
     .first();
   await expect(entry).toBeVisible({ timeout: 10_000 });
   await entry.click();
+  await page.getByTestId("project-home-context-repo-buzz").click();
 }
 
 async function openGithubPullRequests(page: import("@playwright/test").Page) {
   await enableProjectsFeature(page);
   await installMockBridge(page);
   await openBuzzProject(page);
-  await page.getByRole("tab", { name: "Pull Request", exact: true }).click();
+  await page.getByRole("tab", { name: "Review", exact: true }).click();
 }
 
 test("GitHub pull requests list, open read-only detail, and create #N", async ({

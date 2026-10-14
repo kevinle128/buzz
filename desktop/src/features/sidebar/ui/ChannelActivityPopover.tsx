@@ -7,6 +7,8 @@ import type { ActiveChannelTurnSummary } from "@/features/agents/activeAgentTurn
 import { formatElapsed } from "@/features/agents/ui/agentSessionUtils";
 import { useOpenAgentActivity } from "@/features/agents/useOpenAgentActivity";
 import { buildInboxItems, type InboxItem } from "@/features/home/lib/inbox";
+import { useAppsQuery } from "@/features/apps/hooks/useAppsQuery";
+import { useRelaySelfQuery } from "@/features/moderation/hooks";
 import { MessageAppBadge } from "@/features/messages/ui/MessageAuthorIdentity";
 import { getGroupedInboxItemIds } from "@/features/home/useHomeInboxReadState";
 import { useUsersBatchQuery } from "@/features/profile/hooks";
@@ -268,6 +270,8 @@ export function ChannelActivityPopover({
   const { goChannel } = useAppNavigation();
   const { openAgentActivity } = useOpenAgentActivity();
   const { openReminder } = useRemindLater();
+  const apps = useAppsQuery().data;
+  const relaySelfPubkey = useRelaySelfQuery().data;
 
   const unreadChannelFeedItems = React.useMemo(() => {
     return unreadThreadFeedItems.filter(
@@ -306,13 +310,17 @@ export function ChannelActivityPopover({
       getMessageReadAt: (messageId) =>
         activityReadAtByMessageId.get(messageId) ?? null,
       profiles,
+      apps,
+      relaySelfPubkey,
     });
   }, [
+    apps,
     channel,
     activityReadAtByMessageId,
     identityQuery.data?.pubkey,
     open,
     profiles,
+    relaySelfPubkey,
     unreadChannelFeedItems,
   ]);
   const hasContent =

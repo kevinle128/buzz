@@ -159,7 +159,8 @@ export function useAgentAddressLockPicker({
         mentions.getDraftMentionRefs(text),
       )[0];
       if (
-        first?.start !== 0 ||
+        !first ||
+        first.start !== 0 ||
         !first.candidates.every(
           (ref) => normalizePubkey(ref.pubkey) === normalized,
         )

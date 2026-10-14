@@ -24,6 +24,7 @@ async function openBuzzProject(page: import("@playwright/test").Page) {
     .first();
   await expect(projectEntry).toBeVisible({ timeout: 10_000 });
   await projectEntry.click();
+  await page.getByTestId("project-home-context-repo-buzz").click();
 }
 
 test("GitHub-hosted project selects develop from repository state", async ({
@@ -37,7 +38,7 @@ test("GitHub-hosted project selects develop from repository state", async ({
   await installMockBridge(page);
   await openBuzzProject(page);
 
-  const selectionRow = page.getByTestId("project-repository-selection-row");
+  const selectionRow = page.getByTestId("project-workspace-panel");
   const branchTrigger = selectionRow
     .getByRole("button")
     .filter({ hasText: "develop" });
@@ -72,7 +73,7 @@ test("GitHub auth recovery does not fall back to announced main", async ({
   });
   await waitForAnimations(page);
 
-  const selectionRow = page.getByTestId("project-repository-selection-row");
+  const selectionRow = page.getByTestId("project-workspace-panel");
   await expect(
     selectionRow.getByRole("button").filter({ hasText: /^main$/ }),
   ).toHaveCount(0);

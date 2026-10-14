@@ -79,6 +79,10 @@ import {
   MODEL_DISCOVERY_LOADING_VALUE,
   usePersonaModelDiscovery,
 } from "./usePersonaModelDiscovery";
+import {
+  EditAgentPermissionPolicy,
+  useEditAgentPermissionPolicy,
+} from "./EditAgentPermissionPolicy";
 import { EditAgentProviderModelFields } from "./EditAgentProviderModelFields";
 import {
   getBakedModelInheritLabel,
@@ -173,6 +177,7 @@ export function AgentInstanceEditDialog({
   const [respondToAllowlist, setRespondToAllowlist] = React.useState<string[]>(
     agent.respondToAllowlist,
   );
+  const permissionPolicy = useEditAgentPermissionPolicy(agent, open);
   const [showAdvancedFields, setShowAdvancedFields] = React.useState(false);
   const [avatarUrl, setAvatarUrl] = React.useState(agent.avatarUrl ?? "");
   const [isAvatarUploadPending, setIsAvatarUploadPending] =
@@ -745,6 +750,7 @@ export function AgentInstanceEditDialog({
           respondToAllowlist.join(",") !== agent.respondToAllowlist.join(",")
             ? respondToAllowlist
             : undefined,
+        permissionPolicy: permissionPolicy.update,
       };
 
       // Effort rides the locked update so restarts launch the new value.
@@ -1013,6 +1019,12 @@ export function AgentInstanceEditDialog({
               mode={respondTo}
               onAllowlistChange={setRespondToAllowlist}
               onModeChange={setRespondTo}
+            />
+            <EditAgentPermissionPolicy
+              agent={agent}
+              disabled={isSaving}
+              value={permissionPolicy.value}
+              onChange={permissionPolicy.setValue}
             />
             <RunOnSummarySection backend={agent.backend} />
 

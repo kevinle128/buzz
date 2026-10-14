@@ -1532,12 +1532,12 @@ test("reduced motion removes addressed agents without spatial animation", async 
 test("post-send restore keeps a trailing space so typing does not collapse the mention", async ({
   page,
 }) => {
-  await seedAudience(page, [AGENT_A]);
   await installAudienceFixtures(page);
   await openThread(page);
 
   const composer = threadComposer(page);
   const input = composer.getByTestId("message-input");
+  await automaticallyMention(composer, "Morgarita");
   await expect(input).toHaveText("@Morgarita ");
 
   await input.pressSequentially("hello");

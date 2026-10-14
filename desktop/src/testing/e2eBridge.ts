@@ -57,6 +57,8 @@ import {
 } from "@/shared/api/customEmoji";
 import {
   KIND_AGENT_OBSERVER_FRAME,
+  KIND_APP_ADMIN_COMMAND,
+  KIND_APP_METADATA,
   KIND_CHANNEL_THREAD_SUMMARY,
   KIND_CHANNEL_WINDOW_BOUNDS,
   KIND_DM_VISIBILITY,
@@ -512,6 +514,26 @@ type E2eConfig = {
     // equals this is treated as a moderation DM (composer disabled). Absent →
     // fail open (no mod-DM detection), matching the Rust command's contract.
     relaySelf?: string | null;
+    /** Signed kind 39007 events served to `useAppsQuery`. */
+    appMetadataEvents?: RelayEvent[];
+    /** Community-scoped kind 39007 events keyed by relay URL. */
+    appMetadataEventsByRelay?: Record<string, RelayEvent[]>;
+    /** Hex-encoded relay secret used to sign kind 39007 after kind 9038 mutations. */
+    appRelaySecret?: string;
+    /** One-time secret returned by mocked App create. */
+    appCreateSecret?: string;
+    /** One-time secret returned by mocked App rotate. */
+    appRotateSecret?: string;
+    /** Delay EOSE for kind 39007 App metadata queries. */
+    appMetadataEoseDelayMs?: number;
+    /** CLOSED the kind 39007 App metadata query. */
+    appMetadataQueryError?: boolean;
+    /** Delay kind 9038 OK so mutation-pending UI is observable. */
+    appAdminDelayMs?: number;
+    /** Reject kind 9038 EVENT messages with this OK message. */
+    appAdminReject?: string;
+    /** Delay `relay_requires_membership` so membership stays pending. */
+    relayRequiresMembershipDelayMs?: number;
     oaOwnerIsMe?: boolean;
     /** Whether the mock relay advertises NIP-43 membership support. Defaults to false. */
     relayRequiresMembership?: boolean;
@@ -935,6 +957,7 @@ type RawSearchHit = {
   channel_name: string | null;
   created_at: number;
   score: number;
+  tags: string[][];
 };
 
 type RawSearchResponse = {
@@ -1326,6 +1349,8 @@ declare global {
       pending?: boolean;
       /** 64-hex id required for the event to be a valid reaction target. */
       id?: string;
+      /** Real signature for App attribution verification. */
+      sig?: string;
     }) => RelayEvent;
     /** Prepend `count` synthetic older messages to a channel's mock store so
      *  an older-history fetch has something to paginate. Mirrors how the real
@@ -1411,14 +1436,52 @@ declare global {
     __BUZZ_E2E_PROJECT_MERGE_ERROR__?: {
       code: string;
       message: string;
-      recovery: {
-        action: "open_terminal";
-        sourceBranch: string;
-        targetBranch: string;
-      } | null;
+      recovery:
+        | {
+            action: "open_terminal";
+            sourceBranch: string;
+            targetBranch: string;
+          }
+        | {
+            action: "open_url";
+            url: string;
+            reasons: string[];
+          }
+        | null;
     };
+    /** Structured error returned by the mock GitHub repository-state command. */
+    __BUZZ_E2E_GITHUB_REPO_STATE_ERROR__?: {
+      code: string;
+      message: string;
+    };
+    __BUZZ_E2E_GITHUB_SNAPSHOT_ERROR__?: { code: string; message: string };
+    __BUZZ_E2E_GITHUB_AHEAD_BEHIND__?: {
+      status: "compared" | "unpushed";
+      ahead?: number;
+      behind?: number;
+    };
+    /** Structured error returned by GitHub issue mock commands. */
+    __BUZZ_E2E_GITHUB_ISSUES_ERROR__?: { code: string; message: string };
+    /** Structured error returned only by the GitHub comment mock command. */
+    __BUZZ_E2E_GITHUB_ISSUE_COMMENTS_ERROR__?: {
+      code: string;
+      message: string;
+    };
+    /** Structured error thrown by GitHub issue write mock commands. */
+    __BUZZ_E2E_GITHUB_ISSUE_WRITE_ERROR__?: { code: string; message: string };
+    /** Structured error thrown by the authenticated GitHub user mock command. */
+    __BUZZ_E2E_GITHUB_USER_ERROR__?: { code: string; message: string };
+    /** Shared in-memory GitHub issue store for list, create, and writes. */
+    __BUZZ_E2E_GITHUB_ISSUE_STORE__?: E2eGithubIssueStore;
+    /** Structured error thrown by GitHub pull-request list/create mocks. */
+    __BUZZ_E2E_GITHUB_PULLS_ERROR__?: { code: string; message: string };
+    /** Structured error thrown only by the GitHub PR comments mock. */
+    __BUZZ_E2E_GITHUB_PULL_COMMENTS_ERROR__?: { code: string; message: string };
+    /** Shared in-memory GitHub pull-request store for list, create, and comments. */
+    __BUZZ_E2E_GITHUB_PULL_STORE__?: E2eGithubPullRequestStore;
     /** Overrides the first mock repository owner for delegated-owner tests. */
     __BUZZ_E2E_PROJECT_OWNER_OVERRIDE__?: string;
+    __BUZZ_E2E_PROJECT_CLONE_URL_OVERRIDE__?: string;
     /** Project history kinds rejected with CLOSED for aggregate-query tests. */
     __BUZZ_E2E_REJECT_PROJECT_QUERY_KINDS__?: number[];
     /** Captured aggregate project-history filters for request-count assertions. */
@@ -4462,6 +4525,178 @@ function getRelayWsUrl(config: E2eConfig | undefined): string {
   return config?.relayWsUrl ?? DEFAULT_RELAY_WS_URL;
 }
 
+function getActiveCommunityRelayUrl(config: E2eConfig | undefined): string {
+  try {
+    const activeId = window.localStorage.getItem("buzz-active-community-id");
+    const communities = JSON.parse(
+      window.localStorage.getItem("buzz-communities") ?? "[]",
+    ) as { id: string; relayUrl: string }[];
+    return (
+      communities.find((community) => community.id === activeId)?.relayUrl ??
+      getRelayWsUrl(config)
+    );
+  } catch {
+    return getRelayWsUrl(config);
+  }
+}
+
+let mockAppMetadataEvents: RelayEvent[] = [];
+
+function getMockAppMetadataEvents(config: E2eConfig | undefined): RelayEvent[] {
+  const relayUrl = getActiveCommunityRelayUrl(config);
+  return (
+    config?.mock?.appMetadataEventsByRelay?.[relayUrl] ??
+    config?.mock?.appMetadataEvents ??
+    mockAppMetadataEvents
+  );
+}
+
+function resetMockApps(config: E2eConfig | undefined) {
+  const events = getMockAppMetadataEvents(config);
+  if (events === mockAppMetadataEvents) {
+    return;
+  }
+  mockAppMetadataEvents = [...events];
+}
+
+function tagValue(event: RelayEvent, name: string): string | undefined {
+  return event.tags.find((tag) => tag[0] === name)?.[1];
+}
+
+function replaceMockAppMetadata(event: RelayEvent) {
+  const events = getMockAppMetadataEvents(getConfig());
+  const appId = tagValue(event, "d");
+  const next = events.filter((existing) => tagValue(existing, "d") !== appId);
+  events.length = 0;
+  events.push(...next, event);
+}
+
+function signMockAppMetadata(input: {
+  appId: string;
+  name: string;
+  status: "active" | "disabled";
+  description: string;
+  picture?: string;
+}): RelayEvent {
+  const secretHex = getConfig()?.mock?.appRelaySecret;
+  if (!secretHex) {
+    throw new Error("mock app relay secret missing");
+  }
+  const tags: string[][] = [
+    ["d", input.appId],
+    ["name", input.name],
+    ["status", input.status],
+  ];
+  if (input.picture) {
+    tags.push(["picture", input.picture]);
+  }
+  return finalizeEvent(
+    {
+      kind: KIND_APP_METADATA,
+      created_at: Math.floor(Date.now() / 1000),
+      content: input.description,
+      tags,
+    },
+    hexToBytes(secretHex),
+  );
+}
+
+function applyMockAppAdmin(event: RelayEvent): string {
+  const command = JSON.parse(event.content) as {
+    action?: string;
+    app_id?: string;
+    name?: string;
+    description?: string;
+    icon_url?: string;
+  };
+  if (command.action === "create") {
+    const appId = crypto.randomUUID();
+    replaceMockAppMetadata(
+      signMockAppMetadata({
+        appId,
+        name: command.name ?? "Untitled",
+        status: "active",
+        description: command.description ?? "",
+        picture: command.icon_url || undefined,
+      }),
+    );
+    const secret = getConfig()?.mock?.appCreateSecret ?? "one-time-secret";
+    return `response:${JSON.stringify({ app_id: appId, webhook_secret: secret })}`;
+  }
+  const appId = command.app_id;
+  if (!appId) {
+    throw new Error("invalid: missing app_id");
+  }
+  const current = getMockAppMetadataEvents(getConfig()).find(
+    (existing) => tagValue(existing, "d") === appId,
+  );
+  if (command.action === "rotate_secret") {
+    const secret = getConfig()?.mock?.appRotateSecret ?? "rotated-secret";
+    return `response:${JSON.stringify({ app_id: appId, webhook_secret: secret })}`;
+  }
+  if (!current) {
+    throw new Error("invalid: unknown app");
+  }
+  const currentName = tagValue(current, "name") ?? "Untitled";
+  const currentPicture = tagValue(current, "picture");
+  const currentStatus =
+    tagValue(current, "status") === "disabled" ? "disabled" : "active";
+  if (command.action === "update") {
+    const nextDescription =
+      command.description === undefined ? current.content : command.description;
+    const nextPicture =
+      command.icon_url === undefined
+        ? currentPicture
+        : command.icon_url || undefined;
+    replaceMockAppMetadata(
+      signMockAppMetadata({
+        appId,
+        name: command.name ?? currentName,
+        status: currentStatus,
+        description: nextDescription,
+        picture: nextPicture,
+      }),
+    );
+    return `response:${JSON.stringify({ app_id: appId })}`;
+  }
+  if (command.action === "enable" || command.action === "disable") {
+    replaceMockAppMetadata(
+      signMockAppMetadata({
+        appId,
+        name: currentName,
+        status: command.action === "enable" ? "active" : "disabled",
+        description: current.content,
+        picture: currentPicture,
+      }),
+    );
+    return `response:${JSON.stringify({ app_id: appId })}`;
+  }
+  throw new Error("invalid: unknown app action");
+}
+
+async function handleMockAppAdmin(event: RelayEvent, socket: MockSocket) {
+  const delayMs = getConfig()?.mock?.appAdminDelayMs ?? 0;
+  if (delayMs > 0) {
+    await new Promise((resolve) => window.setTimeout(resolve, delayMs));
+  }
+  const reject = getConfig()?.mock?.appAdminReject;
+  if (reject) {
+    sendWsText(socket.handler, ["OK", event.id, false, reject]);
+    return;
+  }
+  try {
+    const message = applyMockAppAdmin(event);
+    sendWsText(socket.handler, ["OK", event.id, true, message]);
+  } catch (error) {
+    sendWsText(socket.handler, [
+      "OK",
+      event.id,
+      false,
+      error instanceof Error ? error.message : "invalid: app command",
+    ]);
+  }
+}
+
 /**
  * Mirror of the backend's `assert_expected_relay_scope`: a caller-captured
  * tenant scope must still match the active community when the command runs.
@@ -5258,8 +5493,25 @@ function emitMockChannelMessage(
   createdAt?: number,
   pending?: boolean,
   id?: string,
+  sig?: string,
 ) {
   const eventKind = kind ?? 9;
+  if (sig) {
+    const tags = extraTags ? [...extraTags] : [];
+    const event = createMockEvent(
+      eventKind,
+      content,
+      tags,
+      pubkey,
+      createdAt,
+      id,
+      sig,
+    );
+    if (pending) event.pending = true;
+    recordMockMessage(channelId, event);
+    emitMockLiveEvent(channelId, event);
+    return event;
+  }
   if (!parentEventId) {
     const tags = buildTopLevelMessageTags(
       channelId,
@@ -5274,6 +5526,7 @@ function emitMockChannelMessage(
       pubkey,
       createdAt,
       id,
+      sig,
     );
     if (pending) event.pending = true;
     recordMockMessage(channelId, event);
@@ -5307,6 +5560,7 @@ function emitMockChannelMessage(
     authorPubkey,
     createdAt,
     id,
+    sig,
   );
   if (pending) event.pending = true;
   recordMockMessage(channelId, event);
@@ -6311,6 +6565,14 @@ function buildMockProjectEvents(): RelayEvent[] {
       projectIndex === 0
         ? (window.__BUZZ_E2E_PROJECT_OWNER_OVERRIDE__ ?? seed.owner)
         : seed.owner;
+    const cloneUrl =
+      projectIndex === 0
+        ? (window.__BUZZ_E2E_PROJECT_CLONE_URL_OVERRIDE__ ?? seed.cloneUrl)
+        : seed.cloneUrl;
+    // GitHub override: announce stale `main` so first-open must take GitHub HEAD.
+    const githubCloneOverride =
+      projectIndex === 0 &&
+      Boolean(window.__BUZZ_E2E_PROJECT_CLONE_URL_OVERRIDE__);
     const repoAddress = `${KIND_REPO_ANNOUNCEMENT}:${owner}:${seed.dtag}`;
     const authors = [seed.owner, ...seed.contributors];
     const random = mulberry32(projectIndex + 1);
@@ -6328,8 +6590,13 @@ function buildMockProjectEvents(): RelayEvent[] {
             getConfig()?.mock?.projectAccessChannelId ??
               STARTER_PROJECT_HOME_CHANNEL_ID,
           ],
-          ["clone", seed.cloneUrl],
-          ...(seed.webUrl ? [["web", seed.webUrl]] : []),
+          ["clone", cloneUrl],
+          ...(githubCloneOverride ? [["default-branch", "main"]] : []),
+          ...(githubCloneOverride && cloneUrl.startsWith("https://")
+            ? [["web", cloneUrl]]
+            : seed.webUrl
+              ? [["web", seed.webUrl]]
+              : []),
           ...seed.contributors.map((pubkey) => ["p", pubkey]),
         ],
         owner,
@@ -6394,7 +6661,7 @@ function buildMockProjectEvents(): RelayEvent[] {
             ? [
                 ["h", "9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50"],
                 ["branch-name", `feature/mock-${dayOffset}-${index}`],
-                ["clone", seed.cloneUrl],
+                ["clone", cloneUrl],
               ]
             : []),
         ];
@@ -6522,6 +6789,7 @@ function createMockEvent(
   // 64 hex chars like a real event id — share-link builders reject shorter
   // ids, so copy-link buttons only render with full-length ids.
   id = (crypto.randomUUID() + crypto.randomUUID()).replace(/-/g, ""),
+  sig?: string,
 ): RelayEvent {
   return {
     id,
@@ -6530,7 +6798,7 @@ function createMockEvent(
     kind,
     tags,
     content,
-    sig: "mocksig".repeat(20).slice(0, 128),
+    sig: sig ?? "mocksig".repeat(20).slice(0, 128),
   };
 }
 
@@ -10042,6 +10310,7 @@ async function handleSearchMessages(
         channel_name: "general",
         created_at: now - 60,
         score: 8.5,
+        tags: [["h", "9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50"]],
       },
       {
         event_id: "mock-engineering-shipped",
@@ -10053,6 +10322,7 @@ async function handleSearchMessages(
         channel_name: "engineering",
         created_at: now - 42 * 60,
         score: 7.2,
+        tags: [["h", "1c7e1c02-87bb-5e88-b2da-5a7a9432d0c9"]],
       },
       {
         event_id: "mock-design-critique",
@@ -10064,6 +10334,7 @@ async function handleSearchMessages(
         channel_name: "design",
         created_at: now - 75 * 60,
         score: 6.6,
+        tags: [["h", "b5e2f8a1-3c44-5912-9e67-4a8d1f2b3c4e"]],
       },
       {
         event_id: "mock-forum-release-thread",
@@ -10075,6 +10346,7 @@ async function handleSearchMessages(
         channel_name: "watercooler",
         created_at: now - 90 * 60,
         score: 5.8,
+        tags: [["h", "a27e1ee9-76a6-5bdf-a5d5-1d85610dad11"]],
       },
       {
         event_id: "mock-forum-release-reply",
@@ -10085,6 +10357,7 @@ async function handleSearchMessages(
         channel_name: "watercooler",
         created_at: now - 80 * 60,
         score: 5.2,
+        tags: [["h", "a27e1ee9-76a6-5bdf-a5d5-1d85610dad11"]],
       },
     ];
     for (const [channelId, events] of mockMessages) {
@@ -10101,6 +10374,7 @@ async function handleSearchMessages(
           channel_name: channel?.name ?? null,
           created_at: event.created_at,
           score: 1,
+          tags: event.tags ?? [],
         });
       }
     }
@@ -11092,6 +11366,34 @@ function sendToMockSocket(args: {
       return;
     }
 
+    if (filter.kinds?.includes(KIND_APP_METADATA)) {
+      if (getConfig()?.mock?.appMetadataQueryError) {
+        sendWsText(socket.handler, [
+          "CLOSED",
+          subId,
+          "mock app metadata query failure",
+        ]);
+        return;
+      }
+      const authors = filter.authors?.map((author) => author.toLowerCase());
+      const deliver = () => {
+        for (const event of getMockAppMetadataEvents(getConfig())) {
+          if (authors && !authors.includes(event.pubkey.toLowerCase())) {
+            continue;
+          }
+          sendWsText(socket.handler, ["EVENT", subId, event]);
+        }
+        sendWsText(socket.handler, ["EOSE", subId]);
+      };
+      const delayMs = getConfig()?.mock?.appMetadataEoseDelayMs ?? 0;
+      if (delayMs > 0) {
+        window.setTimeout(deliver, delayMs);
+      } else {
+        deliver();
+      }
+      return;
+    }
+
     // Project queries: NIP-34 kinds, or kind:1 comments scoped by repo `a`
     // tag or by issue/PR root `e` tag (discussions, approvals, review
     // requests, assignment operations). Channel messages are kind 9, so a
@@ -11239,6 +11541,11 @@ function sendToMockSocket(args: {
 
     if (event.kind === 9033) {
       sendWsText(socket.handler, ["OK", event.id, true, ""]);
+      return;
+    }
+
+    if (event.kind === KIND_APP_ADMIN_COMMAND) {
+      void handleMockAppAdmin(event, socket);
       return;
     }
 
@@ -11424,6 +11731,220 @@ function disconnectMockSocket(id: number) {
   sendWsClose(socket.handler);
 }
 
+type E2eGithubIssueUser = { login: string; avatar_url: string };
+
+type E2eGithubIssueDto = {
+  number: number;
+  title: string;
+  body: string;
+  state: "open" | "closed";
+  html_url: string;
+  comments: number;
+  created_at: number;
+  updated_at: number;
+  user: E2eGithubIssueUser;
+  labels: string[];
+  assignees: E2eGithubIssueUser[];
+};
+
+type E2eGithubIssueCommentDto = {
+  id: number;
+  body: string;
+  html_url: string;
+  created_at: number;
+  user: E2eGithubIssueUser;
+};
+
+type E2eGithubIssueStore = {
+  issues: E2eGithubIssueDto[];
+  commentsByNumber: Record<number, E2eGithubIssueCommentDto[]>;
+  labels: Array<{ name: string; color: string }>;
+  assignees: E2eGithubIssueUser[];
+  authenticatedUser: E2eGithubIssueUser;
+};
+
+function createDefaultE2eGithubIssueStore(): E2eGithubIssueStore {
+  return {
+    issues: [
+      {
+        number: 1,
+        title: "Default GitHub issue",
+        body: "Default issue body.",
+        html_url: "https://github.com/acme/app/issues/1",
+        state: "open",
+        created_at: 1_704_166_645,
+        updated_at: 1_704_166_645,
+        comments: 0,
+        user: { login: "ada", avatar_url: "" },
+        labels: [],
+        assignees: [],
+      },
+    ],
+    commentsByNumber: {},
+    labels: [],
+    assignees: [],
+    authenticatedUser: { login: "test-user", avatar_url: "" },
+  };
+}
+
+function e2eGithubIssueStore(): E2eGithubIssueStore {
+  window.__BUZZ_E2E_GITHUB_ISSUE_STORE__ ??= createDefaultE2eGithubIssueStore();
+  return window.__BUZZ_E2E_GITHUB_ISSUE_STORE__;
+}
+
+function cloneE2eGithubIssueUser(user: E2eGithubIssueUser): E2eGithubIssueUser {
+  return { ...user };
+}
+
+function cloneE2eGithubIssue(issue: E2eGithubIssueDto): E2eGithubIssueDto {
+  return {
+    ...issue,
+    user: cloneE2eGithubIssueUser(issue.user),
+    labels: [...issue.labels],
+    assignees: issue.assignees.map(cloneE2eGithubIssueUser),
+  };
+}
+
+function cloneE2eGithubIssueComment(
+  comment: E2eGithubIssueCommentDto,
+): E2eGithubIssueCommentDto {
+  return {
+    ...comment,
+    user: cloneE2eGithubIssueUser(comment.user),
+  };
+}
+
+function throwIfGithubIssueWriteError() {
+  if (window.__BUZZ_E2E_GITHUB_ISSUE_WRITE_ERROR__) {
+    throw window.__BUZZ_E2E_GITHUB_ISSUE_WRITE_ERROR__;
+  }
+}
+
+type E2eGithubPullRequestDto = {
+  number: number;
+  title: string;
+  body: string;
+  html_url: string;
+  draft: boolean;
+  created_at: number;
+  updated_at: number;
+  comments: number;
+  user: E2eGithubIssueUser;
+  head: {
+    ref: string;
+    sha: string;
+    repo: { full_name: string };
+  };
+  base: {
+    ref: string;
+    repo: { full_name: string };
+  };
+};
+
+type E2eGithubPullRequestCommentDto = {
+  id: number;
+  body: string;
+  html_url: string;
+  created_at: number;
+  user: E2eGithubIssueUser;
+};
+
+type E2eGithubPullRequestStore = {
+  pulls: E2eGithubPullRequestDto[];
+  commentsByNumber: Record<number, E2eGithubPullRequestCommentDto[]>;
+};
+
+function createDefaultE2eGithubPullRequestStore(): E2eGithubPullRequestStore {
+  return {
+    pulls: [
+      {
+        number: 42,
+        title: "Add GitHub pull request support",
+        body: "GitHub pull request body",
+        html_url: "https://github.com/acme/app/pull/42",
+        draft: false,
+        created_at: 1_704_166_645,
+        updated_at: 1_704_253_045,
+        comments: 2,
+        user: { login: "ada", avatar_url: "" },
+        head: {
+          ref: "feature/readme",
+          sha: "1".repeat(40),
+          repo: { full_name: "acme/app" },
+        },
+        base: {
+          ref: "develop",
+          repo: { full_name: "acme/app" },
+        },
+      },
+    ],
+    commentsByNumber: {
+      42: [
+        {
+          id: 2,
+          body: "API-order first PR comment.",
+          html_url: "https://github.com/acme/app/pull/42#issuecomment-2",
+          created_at: 1_704_253_100,
+          user: { login: "grace", avatar_url: "" },
+        },
+        {
+          id: 10,
+          body: "API-order second PR comment.",
+          html_url: "https://github.com/acme/app/issues/42#issuecomment-10",
+          created_at: 1_704_253_101,
+          user: { login: "linus", avatar_url: "" },
+        },
+      ],
+    },
+  };
+}
+
+function e2eGithubPullRequestStore(): E2eGithubPullRequestStore {
+  window.__BUZZ_E2E_GITHUB_PULL_STORE__ ??=
+    createDefaultE2eGithubPullRequestStore();
+  return window.__BUZZ_E2E_GITHUB_PULL_STORE__;
+}
+
+function cloneE2eGithubPullRequest(
+  pull: E2eGithubPullRequestDto,
+): E2eGithubPullRequestDto {
+  return {
+    ...pull,
+    user: cloneE2eGithubIssueUser(pull.user),
+    head: {
+      ...pull.head,
+      repo: { ...pull.head.repo },
+    },
+    base: {
+      ...pull.base,
+      repo: { ...pull.base.repo },
+    },
+  };
+}
+
+function cloneE2eGithubPullRequestComment(
+  comment: E2eGithubPullRequestCommentDto,
+): E2eGithubPullRequestCommentDto {
+  return {
+    ...comment,
+    user: cloneE2eGithubIssueUser(comment.user),
+  };
+}
+
+function e2eGithubIssueByNumber(
+  store: E2eGithubIssueStore,
+  number: number,
+): E2eGithubIssueDto {
+  const issue = store.issues.find((item) => item.number === number);
+  if (!issue) {
+    throw {
+      code: "github_issue_unavailable",
+      message: "Issue not found.",
+    };
+  }
+  return issue;
+}
+
 export function maybeInstallE2eTauriMocks() {
   if (installed) {
     return;
@@ -11497,6 +12018,7 @@ export function maybeInstallE2eTauriMocks() {
     ? { ...config.mock.globalAgentConfig }
     : null;
   resetMockRelayMembers(config);
+  resetMockApps(config);
   resetMockRelayAgents(config);
   resetMockManagedAgents(config);
   resetMockPersonas(config);
@@ -11608,6 +12130,9 @@ export function maybeInstallE2eTauriMocks() {
     );
     await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
   };
+  window.__BUZZ_E2E_GITHUB_ISSUE_STORE__ ??= createDefaultE2eGithubIssueStore();
+  window.__BUZZ_E2E_GITHUB_PULL_STORE__ ??=
+    createDefaultE2eGithubPullRequestStore();
   mockMediaProxyPort = config.mock?.mediaProxyInitiallyUnavailable
     ? 0
     : MOCK_MEDIA_PROXY_PORT;
@@ -11651,6 +12176,7 @@ export function maybeInstallE2eTauriMocks() {
     createdAt,
     pending,
     id,
+    sig,
   }) => {
     const channel = mockChannels.find(
       (candidate) => candidate.name === channelName,
@@ -11670,6 +12196,7 @@ export function maybeInstallE2eTauriMocks() {
       createdAt,
       pending,
       id,
+      sig,
     );
   };
   window.__BUZZ_E2E_SET_MOCK_USER_STATUS__ = ({
@@ -13001,6 +13528,281 @@ export function maybeInstallE2eTauriMocks() {
         // Matches the synthetic human author on a mock snapshot commit so the
         // viewer-identity avatar attribution is exercised in e2e.
         return { name: "Avery E", email: "avery@example.com" };
+      case "get_github_repository_state": {
+        if (window.__BUZZ_E2E_GITHUB_REPO_STATE_ERROR__) {
+          throw window.__BUZZ_E2E_GITHUB_REPO_STATE_ERROR__;
+        }
+        return {
+          head: "develop",
+          branches: [
+            { name: "develop", commit: "d".repeat(40) },
+            { name: "main", commit: "m".repeat(40) },
+          ],
+          tags: [],
+          updated_at: Math.floor(Date.now() / 1000),
+        };
+      }
+      case "get_github_repository_snapshot": {
+        if (window.__BUZZ_E2E_GITHUB_SNAPSHOT_ERROR__) {
+          throw window.__BUZZ_E2E_GITHUB_SNAPSHOT_ERROR__;
+        }
+        return {
+          latest_commit: {
+            hash: "d".repeat(40),
+            short_hash: "ddddddd",
+            author_name: "Ada",
+            author_email: "ada@example.com",
+            timestamp: Math.floor(Date.now() / 1000) - 120,
+            subject: "Document develop",
+          },
+          commits: [
+            {
+              hash: "d".repeat(40),
+              short_hash: "ddddddd",
+              author_name: "Ada",
+              author_email: "ada@example.com",
+              timestamp: Math.floor(Date.now() / 1000) - 120,
+              subject: "Document develop",
+            },
+          ],
+          contributors: [],
+          files: [
+            {
+              path: "README.md",
+              kind: "blob",
+              size: 24,
+              preview_content: "# Develop branch\n",
+              last_changed_at: null,
+              latest_commit: null,
+            },
+            {
+              path: "src/lib.rs",
+              kind: "blob",
+              size: 12,
+              preview_content: null,
+              last_changed_at: null,
+              latest_commit: null,
+            },
+          ],
+        };
+      }
+      case "get_github_ahead_behind": {
+        if (window.__BUZZ_E2E_GITHUB_AHEAD_BEHIND__) {
+          return window.__BUZZ_E2E_GITHUB_AHEAD_BEHIND__;
+        }
+        const input = payload as { localSha?: string; remoteSha?: string };
+        if (
+          input.localSha &&
+          input.remoteSha &&
+          input.localSha.toLowerCase() === input.remoteSha.toLowerCase()
+        ) {
+          return { status: "compared", ahead: 0, behind: 0 };
+        }
+        return { status: "unpushed" };
+      }
+      case "list_github_issues": {
+        if (window.__BUZZ_E2E_GITHUB_ISSUES_ERROR__) {
+          throw window.__BUZZ_E2E_GITHUB_ISSUES_ERROR__;
+        }
+        const input = payload as { state?: string };
+        return {
+          issues: e2eGithubIssueStore()
+            .issues.filter((issue) => issue.state === input.state)
+            .map(cloneE2eGithubIssue),
+          has_more: false,
+        };
+      }
+      case "create_github_issue": {
+        if (window.__BUZZ_E2E_GITHUB_ISSUES_ERROR__) {
+          throw window.__BUZZ_E2E_GITHUB_ISSUES_ERROR__;
+        }
+        throwIfGithubIssueWriteError();
+        const input = payload as { title?: string; body?: string };
+        const store = e2eGithubIssueStore();
+        const number =
+          Math.max(0, ...store.issues.map((issue) => issue.number)) + 1;
+        const created: E2eGithubIssueDto = {
+          number,
+          title: input.title ?? "Untitled",
+          body: input.body ?? "",
+          state: "open",
+          html_url: `https://github.com/acme/app/issues/${number}`,
+          comments: 0,
+          created_at: 1_704_253_100,
+          updated_at: 1_704_253_100,
+          user: { login: "ada", avatar_url: "" },
+          labels: [],
+          assignees: [],
+        };
+        store.issues.push(created);
+        return cloneE2eGithubIssue(created);
+      }
+      case "list_github_issue_comments": {
+        if (window.__BUZZ_E2E_GITHUB_ISSUE_COMMENTS_ERROR__) {
+          throw window.__BUZZ_E2E_GITHUB_ISSUE_COMMENTS_ERROR__;
+        }
+        const input = payload as { number?: number };
+        return (
+          e2eGithubIssueStore().commentsByNumber[input.number ?? 0] ?? []
+        ).map(cloneE2eGithubIssueComment);
+      }
+      case "update_github_issue_state": {
+        throwIfGithubIssueWriteError();
+        const input = payload as { number?: number; state?: string };
+        const issue = e2eGithubIssueByNumber(
+          e2eGithubIssueStore(),
+          input.number ?? 0,
+        );
+        issue.state = input.state === "closed" ? "closed" : "open";
+        return cloneE2eGithubIssue(issue);
+      }
+      case "create_github_issue_comment": {
+        throwIfGithubIssueWriteError();
+        const input = payload as { number?: number; body?: string };
+        const store = e2eGithubIssueStore();
+        const number = input.number ?? 0;
+        const issue = e2eGithubIssueByNumber(store, number);
+        const comments = store.commentsByNumber[number] ?? [];
+        const id = Math.max(0, ...comments.map((comment) => comment.id)) + 1;
+        const comment: E2eGithubIssueCommentDto = {
+          id,
+          body: input.body ?? "",
+          html_url: `https://github.com/acme/app/issues/${number}#issuecomment-${id}`,
+          created_at: 1_704_253_100,
+          user: { ...store.authenticatedUser },
+        };
+        store.commentsByNumber[number] = [...comments, comment];
+        issue.comments = store.commentsByNumber[number].length;
+        return cloneE2eGithubIssueComment(comment);
+      }
+      case "list_github_repo_labels":
+        return e2eGithubIssueStore().labels.map((label) => ({ ...label }));
+      case "add_github_issue_labels": {
+        throwIfGithubIssueWriteError();
+        const input = payload as { number?: number; name?: string };
+        const issue = e2eGithubIssueByNumber(
+          e2eGithubIssueStore(),
+          input.number ?? 0,
+        );
+        const name = input.name ?? "";
+        if (name && !issue.labels.includes(name)) {
+          issue.labels = [...issue.labels, name];
+        }
+        return cloneE2eGithubIssue(issue);
+      }
+      case "remove_github_issue_label": {
+        throwIfGithubIssueWriteError();
+        const input = payload as { number?: number; name?: string };
+        const issue = e2eGithubIssueByNumber(
+          e2eGithubIssueStore(),
+          input.number ?? 0,
+        );
+        issue.labels = issue.labels.filter((label) => label !== input.name);
+        return cloneE2eGithubIssue(issue);
+      }
+      case "list_github_repo_assignees":
+        return e2eGithubIssueStore().assignees.map(cloneE2eGithubIssueUser);
+      case "add_github_issue_assignees": {
+        throwIfGithubIssueWriteError();
+        const input = payload as { number?: number; login?: string };
+        const store = e2eGithubIssueStore();
+        const issue = e2eGithubIssueByNumber(store, input.number ?? 0);
+        const login = input.login ?? "";
+        if (
+          login &&
+          !issue.assignees.some((assignee) => assignee.login === login)
+        ) {
+          const user = store.assignees.find(
+            (assignee) => assignee.login === login,
+          ) ?? {
+            login,
+            avatar_url: "",
+          };
+          issue.assignees = [...issue.assignees, user];
+        }
+        return cloneE2eGithubIssue(issue);
+      }
+      case "remove_github_issue_assignee": {
+        throwIfGithubIssueWriteError();
+        const input = payload as { number?: number; login?: string };
+        const issue = e2eGithubIssueByNumber(
+          e2eGithubIssueStore(),
+          input.number ?? 0,
+        );
+        issue.assignees = issue.assignees.filter(
+          (assignee) => assignee.login !== input.login,
+        );
+        return cloneE2eGithubIssue(issue);
+      }
+      case "get_github_authenticated_user":
+        if (window.__BUZZ_E2E_GITHUB_USER_ERROR__) {
+          throw window.__BUZZ_E2E_GITHUB_USER_ERROR__;
+        }
+        return cloneE2eGithubIssueUser(e2eGithubIssueStore().authenticatedUser);
+      case "list_github_pull_requests": {
+        if (window.__BUZZ_E2E_GITHUB_PULLS_ERROR__) {
+          throw window.__BUZZ_E2E_GITHUB_PULLS_ERROR__;
+        }
+        return {
+          pulls: e2eGithubPullRequestStore().pulls.map(
+            cloneE2eGithubPullRequest,
+          ),
+          has_more: false,
+        };
+      }
+      case "create_github_pull_request": {
+        if (window.__BUZZ_E2E_GITHUB_PULLS_ERROR__) {
+          throw window.__BUZZ_E2E_GITHUB_PULLS_ERROR__;
+        }
+        const input = payload as {
+          title?: string;
+          body?: string;
+          head?: string;
+          base?: string;
+        };
+        if (!input.title || !input.head || !input.base) {
+          throw new Error("Missing GitHub pull request create field.");
+        }
+        const store = e2eGithubPullRequestStore();
+        const number =
+          Math.max(0, ...store.pulls.map((pull) => pull.number)) + 1;
+        const branchCommits: Record<string, string> = {
+          develop: "d".repeat(40),
+          main: "m".repeat(40),
+        };
+        const created: E2eGithubPullRequestDto = {
+          number,
+          title: input.title,
+          body: input.body ?? "",
+          html_url: `https://github.com/acme/app/pull/${number}`,
+          draft: false,
+          created_at: 1_704_253_100,
+          updated_at: 1_704_253_100,
+          comments: 0,
+          user: { login: "ada", avatar_url: "" },
+          head: {
+            ref: input.head,
+            sha: branchCommits[input.head] ?? "1".repeat(40),
+            repo: { full_name: "acme/app" },
+          },
+          base: {
+            ref: input.base,
+            repo: { full_name: "acme/app" },
+          },
+        };
+        store.pulls.push(created);
+        store.commentsByNumber[number] = [];
+        return cloneE2eGithubPullRequest(created);
+      }
+      case "list_github_pull_request_comments": {
+        if (window.__BUZZ_E2E_GITHUB_PULL_COMMENTS_ERROR__) {
+          throw window.__BUZZ_E2E_GITHUB_PULL_COMMENTS_ERROR__;
+        }
+        const input = payload as { number?: number };
+        return (
+          e2eGithubPullRequestStore().commentsByNumber[input.number ?? 0] ?? []
+        ).map(cloneE2eGithubPullRequestComment);
+      }
       case "get_project_repo_snapshot":
         if (activeConfig?.mock?.projectRepoSnapshotDelayMs) {
           await new Promise((resolve) =>
@@ -13107,8 +13909,32 @@ export function maybeInstallE2eTauriMocks() {
             },
           ],
         };
-      case "get_project_local_repo_snapshot":
-        return window.__BUZZ_E2E_PROJECT_LOCAL_REPO_SNAPSHOT__ ?? null;
+      case "get_project_local_repo_snapshot": {
+        const snapshot = window.__BUZZ_E2E_PROJECT_LOCAL_REPO_SNAPSHOT__;
+        if (snapshot) return snapshot;
+        const status = window.__BUZZ_E2E_PROJECT_REPO_SYNC_STATUS__;
+        const path = status?.local_path;
+        if (!path) return null;
+        const hash = status.local_head;
+        return {
+          path,
+          snapshot: {
+            latest_commit: hash
+              ? {
+                  hash,
+                  short_hash: hash.slice(0, 7),
+                  author_name: "Local",
+                  author_email: "local@example.com",
+                  timestamp: Math.floor(Date.now() / 1000),
+                  subject: "Local HEAD",
+                }
+              : null,
+            commits: [],
+            files: [],
+            contributors: [],
+          },
+        };
+      }
       case "get_project_repo_file_content":
       case "get_project_local_repo_file_content": {
         const path = (payload as { path?: string } | undefined)?.path;
@@ -13484,6 +14310,8 @@ export function maybeInstallE2eTauriMocks() {
             repoAddress: string;
             sourceBranch: string;
             statusCreatedAt: number;
+            title: string;
+            body: string;
             targetBranch: string;
             targetOwner: string;
           };
@@ -13614,11 +14442,16 @@ export function maybeInstallE2eTauriMocks() {
       }
       case "get_relay_http_url":
         return getRelayHttpUrl(activeConfig);
-      case "relay_requires_membership":
+      case "relay_requires_membership": {
         if (activeConfig?.mock?.relayRequiresMembershipError) {
           throw new Error(activeConfig.mock.relayRequiresMembershipError);
         }
+        const delayMs = activeConfig?.mock?.relayRequiresMembershipDelayMs ?? 0;
+        if (delayMs > 0) {
+          await new Promise((resolve) => window.setTimeout(resolve, delayMs));
+        }
         return activeConfig?.mock?.relayRequiresMembership ?? false;
+      }
       case "discover_acp_providers":
         return handleDiscoverAcpRuntimes(activeConfig);
       case "save_custom_harness":
