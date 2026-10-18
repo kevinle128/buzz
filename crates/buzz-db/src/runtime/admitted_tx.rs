@@ -1,4 +1,4 @@
-//! Community-admitted event-write transactions.
+//! Community-admitted write transactions.
 
 use std::collections::BTreeSet;
 
@@ -9,12 +9,12 @@ use uuid::Uuid;
 use crate::deletion::{DeletionStore, ServingWriteLease};
 use crate::Result;
 
-/// An event-write transaction that has passed community admission.
+/// A transaction that has passed community write admission.
 ///
 /// Its only constructors take the shared community admission lock (or
 /// validate a serving write lease) on the transaction they wrap, for the
 /// community they record, so construction and admission are one step.
-/// Event-write helpers take `&mut AdmittedTx` and read the community from it,
+/// Write helpers take `&mut AdmittedTx` and read the community from it,
 /// so the compiler rejects a raw [`sqlx::Transaction`] or a transaction
 /// admitted for a different community.
 ///
@@ -24,8 +24,9 @@ use crate::Result;
 /// are the only ways it can end the transaction. Inside the crate, the
 /// `conn()` accessor hands statements the connection; the type can't stop
 /// crate code from issuing a raw `COMMIT` through it, so the database
-/// community write fences remain the backstop. Dropping the value without
-/// committing rolls back, as with [`sqlx::Transaction`].
+/// community write fences remain the backstop while deployed. Internal writers
+/// must preserve this boundary and use `commit()` for staged follow-up work.
+/// Dropping the value without committing rolls back, as with [`sqlx::Transaction`].
 ///
 /// These are live regressions for the guarantee. Event-write helpers accept an
 /// admitted transaction:
@@ -154,7 +155,7 @@ impl AdmittedTx {
     }
 
     /// Commit the transaction. This is the only commit path for admitted
-    /// event writes.
+    /// writes.
     ///
     /// Refreshes the TTL of every channel that received an event first, as
     /// the last statement before COMMIT.

@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -8,7 +9,10 @@ import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 
 import '../relay/relay.dart';
+import '../theme/theme_extensions.dart';
+import '../animated_avatar.dart';
 import 'avatar_image.dart';
+import 'app_route_observer.dart';
 import 'ios_navigation_metrics.dart';
 export 'ios_navigation_metrics.dart';
 
@@ -17,6 +21,7 @@ class IosNavigationAction {
   const IosNavigationAction({
     required this.label,
     this.symbol,
+    this.icon,
     this.imageUrl,
     this.avatarInitial,
     this.avatarIdentity,
@@ -30,10 +35,14 @@ class IosNavigationAction {
     this.avatarHidden = false,
 
     this.plain = false,
+    this.sharesBackground = true,
   });
 
   final String label;
   final String? symbol;
+
+  /// Custom font artwork rendered as a native template image.
+  final IconData? icon;
   final String? imageUrl;
   final String? avatarInitial;
   final String? avatarIdentity;
@@ -53,12 +62,16 @@ class IosNavigationAction {
   /// Omits the shared Liquid Glass background for a text-only action.
   final bool plain;
 
+  /// Whether this action can share its glass background with adjacent actions.
+  final bool sharesBackground;
+
   Map<String, Object?> _encode(String id) => {
     'id': id,
     'label': label,
     'symbol': avatarInitial == null ? symbol : null,
     'avatarInitial': avatarInitial,
     'avatarIsAgent': avatarIsAgent,
+    'avatarArtwork': avatarIsAgent && usesInsetAgentArtwork(imageUrl),
     'activityColor': activityColor?.toARGB32(),
     'activityLabel': activityLabel,
     'imageUrl': imageUrl,
@@ -68,6 +81,7 @@ class IosNavigationAction {
     'avatarHidden': avatarHidden,
 
     'plain': plain,
+    'sharesBackground': sharesBackground,
     'children': [
       for (var i = 0; i < children.length; i++) children[i]._encode('$id.$i'),
     ],
@@ -181,7 +195,12 @@ class IosNavigationBar extends HookConsumerWidget {
               url: entry.value.imageUrl,
               initial: entry.value.avatarInitial!,
               isAgent: entry.value.avatarIsAgent,
-              background: colors.primaryContainer,
+              circular: true,
+              background:
+                  entry.value.avatarIsAgent &&
+                      usesInsetAgentArtwork(entry.value.imageUrl)
+                  ? Colors.transparent
+                  : colors.primaryContainer,
               foreground: colors.onPrimaryContainer,
               networkImage: (url) =>
                   MediaImageProvider(url: url, auth: auth, client: client),
@@ -212,11 +231,69 @@ class IosNavigationBar extends HookConsumerWidget {
         colors.onPrimaryContainer,
       ],
     );
+    final iconImages = useState(<String, String>{});
+    final icons = <String, IconData>{
+      if (leading?.icon != null) 'leading': leading!.icon!,
+      for (var i = 0; i < actions.length; i++)
+        if (actions[i].icon != null) '$i': actions[i].icon!,
+    };
+    final iconKey = jsonEncode([
+      for (final entry in icons.entries)
+        [
+          entry.key,
+          entry.value.codePoint,
+          entry.value.fontFamily,
+          entry.value.fontPackage,
+        ],
+    ]);
+    useEffect(() {
+      if (icons.isEmpty) return null;
+      var active = true;
+      unawaited(
+        Future.microtask(() async {
+          final rendered = <String, String>{};
+          for (final entry in icons.entries) {
+            final recorder = ui.PictureRecorder();
+            final painter = TextPainter(
+              text: TextSpan(
+                text: String.fromCharCode(entry.value.codePoint),
+                style: TextStyle(
+                  fontFamily: entry.value.fontFamily,
+                  package: entry.value.fontPackage,
+                  fontSize: 22,
+                  color: const Color(0xff000000),
+                ),
+              ),
+              textDirection: TextDirection.ltr,
+            )..layout();
+            final canvas = Canvas(recorder)..scale(3);
+            painter.paint(
+              canvas,
+              Offset((24 - painter.width) / 2, (24 - painter.height) / 2),
+            );
+            final picture = recorder.endRecording();
+            final image = await picture.toImage(72, 72);
+            final bytes = await image.toByteData(
+              format: ui.ImageByteFormat.png,
+            );
+            if (bytes != null) {
+              rendered[entry.key] = base64Encode(bytes.buffer.asUint8List());
+            }
+            image.dispose();
+            picture.dispose();
+            painter.dispose();
+          }
+          if (active && context.mounted) iconImages.value = rendered;
+        }),
+      );
+      return () => active = false;
+    }, [iconKey]);
     Map<String, Object?> encodeAction(IosNavigationAction action, String id) {
       final key = imageKey(action);
       final retained = avatarImages.value[id];
       return {
         ...action._encode(id),
+        if (iconImages.value[id] != null) 'iconData': iconImages.value[id],
         'avatarBackground': colors.primaryContainer.toARGB32(),
         'avatarForeground': colors.onPrimaryContainer.toARGB32(),
         if (retained?.key == key) 'imageData': retained!.data,
@@ -225,6 +302,7 @@ class IosNavigationBar extends HookConsumerWidget {
 
     final payload = <String, Object?>{
       'title': title,
+      'safeTop': MediaQuery.viewPaddingOf(context).top,
       'subtitle': subtitle,
       'ephemeralLabel': ephemeralLabel,
       'titleAvatar': titleAvatar == null
@@ -240,6 +318,7 @@ class IosNavigationBar extends HookConsumerWidget {
         for (var i = 0; i < actions.length; i++) encodeAction(actions[i], '$i'),
       ],
       'background': colors.surface.toARGB32(),
+      'controlBackground': context.controlSurface.toARGB32(),
       'dark': Theme.of(context).brightness == Brightness.dark,
       'foreground': (foregroundColor ?? Theme.of(context).colorScheme.onSurface)
           .toARGB32(),
@@ -326,13 +405,15 @@ class IosNavigationBar extends HookConsumerWidget {
     }, [channel.value, signature]);
 
     useEffect(() {
+      // UIKit owns its collapse range. Send real page depth so a changed native
+      // inset cannot leave a deeply scrolled page short of the collapse point.
       void sync() {
         final current = channel.value;
         if (current != null) {
           unawaited(
             current.invokeMethod<void>(
               'scroll',
-              (offset?.value ?? 0).clamp(0.0, collapseRange),
+              (offset?.value ?? 0).clamp(0.0, double.infinity),
             ),
           );
         }
@@ -342,6 +423,56 @@ class IosNavigationBar extends HookConsumerWidget {
       offset?.addListener(sync);
       return () => offset?.removeListener(sync);
     }, [channel.value, offset, collapseRange]);
+
+    final route = ModalRoute.of(context);
+    useEffect(() {
+      var active = true;
+      Future<void> restoreOnReveal() async {
+        final current = channel.value;
+        if (!active ||
+            !context.mounted ||
+            route?.isCurrent != true ||
+            current == null) {
+          return;
+        }
+        try {
+          // Home stays mounted while another route covers its platform view.
+          // Returning does not emit a scroll notification, so replay the live
+          // depth before asking UIKit to lay out the revealed navigation bar.
+          await current.invokeMethod<void>(
+            'scroll',
+            (offset?.value ?? 0).clamp(0.0, double.infinity),
+          );
+          if (!active || route?.isCurrent != true) return;
+          await current.invokeMethod<void>('prepareForReveal');
+        } on PlatformException catch (error) {
+          debugPrint('Native navigation reveal failed: $error');
+        }
+      }
+
+      void scheduleRestore() {
+        // Restore at reveal and again after the covering route exits. Route
+        // transforms can change UIKit's safe-area layout during transitions.
+        // The initial didPopNext alone runs before that transform has settled.
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          unawaited(restoreOnReveal());
+        });
+        WidgetsBinding.instance.ensureVisualUpdate();
+      }
+
+      final observer = _NavigationRevealObserver(scheduleRestore);
+      if (route != null) {
+        appRouteObserver.subscribe(observer, route);
+        appRouteObserver.addRevealListener(route, scheduleRestore);
+      }
+      return () {
+        active = false;
+        appRouteObserver.unsubscribe(observer);
+        if (route != null) {
+          appRouteObserver.removeRevealListener(route, scheduleRestore);
+        }
+      };
+    }, [channel.value, offset, collapseRange, route]);
 
     return UiKitView(
       key: viewKey,
@@ -353,4 +484,13 @@ class IosNavigationBar extends HookConsumerWidget {
       },
     );
   }
+}
+
+class _NavigationRevealObserver extends RouteAware {
+  _NavigationRevealObserver(this.onReveal);
+
+  final VoidCallback onReveal;
+
+  @override
+  void didPopNext() => onReveal();
 }

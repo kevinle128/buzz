@@ -1,3 +1,7 @@
+import 'channel_unread.dart';
+import '../../shared/widgets/collapsible_section_body.dart';
+import '../../shared/widgets/compose_morph_icon.dart';
+import '../../shared/me/me_sync.dart';
 import 'dart:async';
 import 'dart:io';
 import 'dart:math' show max, min, pi;
@@ -24,17 +28,16 @@ import '../../shared/theme/theme.dart';
 import '../../shared/widgets/avatar_image.dart';
 import '../../shared/widgets/anchored_popover_menu.dart';
 import '../../shared/widgets/bee_refresh_indicator.dart';
+import '../../shared/widgets/bottom_up_page_route.dart';
 import '../../shared/widgets/buzz_loading_indicator.dart';
 import '../../shared/widgets/concentric_sheet_surface.dart';
 import '../../shared/widgets/frosted_app_bar.dart';
 import '../../shared/widgets/ios_navigation_bar.dart';
 import '../../shared/widgets/frosted_scaffold.dart';
+import '../../shared/widgets/mobile_tab_footer_backdrop.dart';
 import '../../shared/widgets/modal_presentation.dart';
 import '../../shared/widgets/confirmation_dialog.dart';
 import '../../shared/widgets/skeleton.dart';
-import '../../shared/custom_emoji/custom_emoji.dart';
-import '../../shared/custom_emoji/custom_emoji_provider.dart';
-import '../../shared/custom_emoji/custom_emoji_render.dart';
 import '../profile/profile_avatar.dart';
 import '../profile/profile_provider.dart';
 import '../profile/presence_cache_provider.dart';
@@ -58,7 +61,6 @@ import 'channels_provider.dart';
 import '../../shared/read_state/deferred_read_state_update.dart';
 import '../../shared/read_state/read_state_provider.dart';
 import '../../shared/read_state/read_state_time.dart';
-import 'unread_badge/observed_unread_event.dart';
 
 part 'channels_page/body.dart';
 part 'channels_page/browse_channels_sheet.dart';
@@ -72,6 +74,7 @@ part 'channels_page/community_switcher.dart';
 part 'channels_page/community_switcher_action.dart';
 part 'channels_page/quick_actions.dart';
 part 'channels_page/quick_actions_launcher.dart';
+part 'channels_page/header_actions.dart';
 
 enum _QuickAction { createChannel, newDm, browseChannels }
 
@@ -87,88 +90,26 @@ const double _kSectionHeaderVerticalPadding =
 // centre sits lower than a channel row's. This keeps an expanded section's
 // final row equally spaced from the following divider.
 const double _kExpandedSectionTrailingPadding =
-    11.0 - _kSectionSpacingTightening;
-const double _kChannelLabelInset =
-    _kChannelSectionInset + _kChannelLeadingWidth + _kChannelLabelGap;
+    11.5 - _kSectionSpacingTightening;
+const double _kChannelLabelInset = _kChannelSectionInset;
 
-/// DM avatars are circles, so they fill their box edge to edge where a channel
-/// glyph leaves 4dp of slack inside the same 22dp leading column. Sizing them to
-/// the glyph's ink width keeps the icon-to-label distance identical across both
-/// sections while the labels stay on [_kChannelLabelInset].
+/// Compact avatars remain on direct-message rows.
 const double _kDmAvatarSize = _kChannelIconSize;
 
 const double _kTopSectionProfileAvatarSize = 36.0;
 const double _kTopSectionBottomPadding = Grid.xxs;
 
-/// The top section's avatars are 40dp circles, which fill their box edge to
-/// edge; the channel rows below lead with an 18dp glyph left-aligned in a 22dp
-/// box at [_kChannelSectionInset]. Edge-aligning the two leaves the circles
-/// looking pushed outward, so the bar is pulled in to sit the avatar's centre
-/// near the channel-icon column.
+/// Inset for the community and profile avatar row.
 const double _kTopSectionInset = Grid.twelve;
-const Duration _kSectionExpandDuration = Duration(milliseconds: 220);
-const Duration _kSectionCollapseDuration = Duration(milliseconds: 170);
-const Curve _kSectionExpandCurve = Cubic(0.23, 1, 0.32, 1);
-const Curve _kSectionCollapseCurve = Curves.easeInCubic;
-const double _kSectionCollapsedScaleY = 0.98;
 const double _kHeaderFrostScrollDistance = Grid.xxl;
 const double _kHeaderFrostMaxBlurSigma = 23.12;
-
-class _UnreadChannelState {
-  final Set<String> ids;
-
-  const _UnreadChannelState({required this.ids});
-}
-
-_UnreadChannelState _computeUnreadChannelState({
-  required Iterable<Channel> channels,
-  required ReadStateState readState,
-  required ChannelsNotifier channelsNotifier,
-}) {
-  if (!readState.isReady) {
-    return const _UnreadChannelState(ids: {});
-  }
-
-  final latestObservedByChannel = channelsNotifier.latestObservedByChannel;
-  final observedEventsByChannel =
-      channelsNotifier.observedUnreadEventsByChannel;
-  final ids = <String>{};
-
-  for (final channel in channels) {
-    if (readState.locallyForcedChannelIds.contains(channel.id)) {
-      ids.add(channel.id);
-      continue;
-    }
-
-    final latestObserved = latestObservedByChannel[channel.id];
-    if (latestObserved == null) continue;
-
-    final channelReadAt = readState.effectiveTimestamp(channel.id);
-    if (channelReadAt != null && latestObserved <= channelReadAt) continue;
-
-    final observedEvents = observedEventsByChannel[channel.id];
-    int? readAtForObservedEvent(ObservedUnreadEvent event) =>
-        observedUnreadEventReadAt(
-          event,
-          channel.id,
-          readState.effectiveTimestamp,
-        );
-
-    final unreadCount = countUnreadObservedEvents(
-      observedEvents,
-      readAtForObservedEvent,
-    );
-    if (unreadCount == 0) continue;
-
-    ids.add(channel.id);
-  }
-
-  return _UnreadChannelState(ids: ids);
-}
 
 class ChannelsPage extends HookConsumerWidget {
   const ChannelsPage({
     required this.settingsPageBuilder,
+    this.onSearch,
+    this.onInbox,
+    this.hasUnreadInbox = false,
     this.communityInvitePageBuilder,
     this.communityAppearancePageBuilder,
     required this.onSettingsTransitionProgress,
@@ -177,6 +118,15 @@ class ChannelsPage extends HookConsumerWidget {
   });
 
   final WidgetBuilder settingsPageBuilder;
+
+  /// Opens global search from the header.
+  final VoidCallback? onSearch;
+
+  /// Opens the conversation inbox from the header.
+  final VoidCallback? onInbox;
+
+  /// Whether the inbox contains unread conversations.
+  final bool hasUnreadInbox;
 
   /// Builds the invite destination opened from the community sheet.
   final WidgetBuilder? communityInvitePageBuilder;
@@ -212,7 +162,7 @@ class ChannelsPage extends HookConsumerWidget {
       context,
       titleStyle: headerTitleStyle,
       bottomHeight: _kTopSectionBottomPadding,
-      nativeLargeTitle: true,
+      nativeLargeTitle: false,
     );
     final communityAvatarKey = useMemoized(GlobalKey.new);
     final nativeCommunityAvatarBounds = useRef<Rect?>(null);
@@ -281,12 +231,19 @@ class ChannelsPage extends HookConsumerWidget {
     if (channelsAsync.asData?.value case final data?) {
       cachedChannels.value = data;
     }
-    final channels = cachedChannels.value;
+    final personalIds =
+        ref.watch(meGroupsProvider).asData?.value.channels ?? const <String>[];
+    final channels = cachedChannels.value
+        ?.where((channel) => !personalIds.contains(channel.id))
+        .toList();
     Future<void> openChannel(Channel channel) async {
       if (!context.mounted) return;
       await Navigator.of(context).push(
         MaterialPageRoute<void>(
-          builder: (_) => ChannelDetailPage(channel: channel),
+          builder: (_) => ChannelDetailPage(
+            channel: channel,
+            placement: ChannelRoutePlacement.ordinary,
+          ),
         ),
       );
     }
@@ -478,8 +435,8 @@ class ChannelsPage extends HookConsumerWidget {
       appBar: FrostedAppBar(
         key: headerKey,
         onNativeReadyChanged: (ready) => nativeHeaderReady.value = ready,
-        nativeTitle: communityName.isEmpty ? 'Community' : communityName,
-        nativeLargeTitle: true,
+        nativeTitle: '',
+        nativeLargeTitle: false,
         nativeLeading: IosNavigationAction(
           label: 'Community settings',
           onAvatarBoundsChanged: (bounds) {
@@ -501,16 +458,35 @@ class ChannelsPage extends HookConsumerWidget {
           onPressed: openCommunitySwitcher,
         ),
         nativeActions: [
+          if (onSearch != null)
+            IosNavigationAction(
+              label: 'Search',
+              symbol: 'magnifyingglass',
+              sharesBackground: true,
+              icon: BuzzIcons.search300,
+              onPressed: onSearch,
+            ),
+          if (onInbox != null)
+            IosNavigationAction(
+              label: 'Inbox',
+              symbol: 'tray',
+              sharesBackground: true,
+              icon: BuzzIcons.inbox300,
+              activityColor: hasUnreadInbox ? context.colors.primary : null,
+              activityLabel: hasUnreadInbox ? 'Unread' : null,
+              onPressed: onInbox,
+            ),
           IosNavigationAction(
             label: 'Settings',
+            sharesBackground: false,
             avatarIdentity: '${activeCommunity?.id}:${activeCommunity?.pubkey}',
             symbol: 'person.crop.circle',
             imageUrl: profile?.avatarUrl,
             avatarInitial: profile?.initial ?? '?',
             onPressed: () => Navigator.of(context).push(
-              _SettingsPageRoute(
+              BottomUpPageRoute<void>(
                 builder: settingsPageBuilder,
-                onTransitionProgress: onSettingsTransitionProgress,
+                reducedMotion: reducedMotion,
               ),
             ),
           ),
@@ -534,28 +510,21 @@ class ChannelsPage extends HookConsumerWidget {
         ),
         centerTitle: false,
         titleStyle: headerTitleStyle,
-        title: _CommunityHeaderTitle(
-          style: headerTitleStyle,
-          onTap: openCommunitySwitcher,
-        ),
+        title: const SizedBox.shrink(),
         actions: [
-          SizedBox(
-            width: Grid.xl,
-            height: Grid.xl,
-            child: Center(
-              child: ProfileAvatar(
-                size: _kTopSectionProfileAvatarSize,
-                showPresence: false,
-                onTap: () {
-                  unawaited(HapticFeedback.lightImpact());
-                  final route = _SettingsPageRoute(
-                    builder: settingsPageBuilder,
-                    onTransitionProgress: onSettingsTransitionProgress,
-                  );
-                  Navigator.of(context).push(route);
-                },
-              ),
-            ),
+          _ChannelHeaderActions(
+            onSearch: onSearch,
+            onInbox: onInbox,
+            hasUnreadInbox: hasUnreadInbox,
+            onSettings: () {
+              unawaited(HapticFeedback.lightImpact());
+              Navigator.of(context).push(
+                BottomUpPageRoute<void>(
+                  builder: settingsPageBuilder,
+                  reducedMotion: reducedMotion,
+                ),
+              );
+            },
           ),
         ],
         bottomHeight: _kTopSectionBottomPadding,
@@ -578,11 +547,9 @@ class ChannelsPage extends HookConsumerWidget {
   }
 }
 
-/// A custom route deliberately avoids [MaterialPageRoute]'s platform exit
-/// transition on Home. Settings has a centered scale-and-fade transition, not
-/// a lateral page push.
-class _SettingsPageRoute extends PageRouteBuilder<void> {
-  _SettingsPageRoute({
+/// Scale-and-fade route retained for the community switcher.
+class _CommunitySurfaceRoute extends PageRouteBuilder<void> {
+  _CommunitySurfaceRoute({
     required WidgetBuilder builder,
     required this.onTransitionProgress,
     bool? opaque,

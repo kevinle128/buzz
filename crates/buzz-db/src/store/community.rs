@@ -450,14 +450,32 @@ impl Db {
         &self,
         normalized_host: &str,
     ) -> Result<EnsuredCommunityRecord> {
+        self.ensure_configured_community_with_nip_fi_issuers(normalized_host, &[])
+            .await
+    }
+
+    /// Like [`Db::ensure_configured_community`], binding `nip_fi_issuers` to
+    /// the community in the same transaction when this call creates its row.
+    /// An existing row keeps its bindings unchanged.
+    #[datastore_span(
+        name = "ensure_configured_community_with_nip_fi_issuers",
+        system = "postgresql"
+    )]
+    pub async fn ensure_configured_community_with_nip_fi_issuers(
+        &self,
+        normalized_host: &str,
+        nip_fi_issuers: &[String],
+    ) -> Result<EnsuredCommunityRecord> {
         self.ensure_configured_community_with_operation(
             normalized_host,
+            nip_fi_issuers,
             crate::observability::WriterOperation::Authorization,
         )
         .await
     }
 
-    /// Ensure the deployment-configured community during process bootstrap.
+    /// Ensure the deployment-configured community during process bootstrap,
+    /// binding `nip_fi_issuers` when this call creates its row.
     #[datastore_span(
         name = "ensure_configured_community_for_bootstrap",
         system = "postgresql"
@@ -465,9 +483,11 @@ impl Db {
     pub async fn ensure_configured_community_for_bootstrap(
         &self,
         normalized_host: &str,
+        nip_fi_issuers: &[String],
     ) -> Result<EnsuredCommunityRecord> {
         self.ensure_configured_community_with_operation(
             normalized_host,
+            nip_fi_issuers,
             crate::observability::WriterOperation::Bootstrap,
         )
         .await
@@ -476,9 +496,11 @@ impl Db {
     async fn ensure_configured_community_with_operation(
         &self,
         normalized_host: &str,
+        nip_fi_issuers: &[String],
         operation: crate::observability::WriterOperation,
     ) -> Result<EnsuredCommunityRecord> {
-        let mut connection = crate::observability::acquire_writer(&self.pool, operation).await?;
+        let connection = crate::observability::acquire_writer(&self.pool, operation).await?;
+        let mut connection = sqlx::Transaction::begin(connection, None).await?;
         let row = sqlx::query(
             r#"
             INSERT INTO communities (host)
@@ -498,15 +520,16 @@ impl Db {
             ))
         })?;
 
-        let id: Uuid = row.try_get("id")?;
+        let id = CommunityId::from_uuid(row.try_get("id")?);
         let host: String = row.try_get("host")?;
         let created: bool = row.try_get("created")?;
+        if created {
+            self.insert_nip_fi_issuers_in_transaction(&mut connection, id, nip_fi_issuers)
+                .await?;
+        }
+        connection.commit().await?;
 
-        Ok(EnsuredCommunityRecord {
-            id: CommunityId::from_uuid(id),
-            host,
-            created,
-        })
+        Ok(EnsuredCommunityRecord { id, host, created })
     }
 
     /// Atomically creates a community and its initial owner.
@@ -519,6 +542,23 @@ impl Db {
         &self,
         normalized_host: &str,
         owner_pubkey: &str,
+    ) -> Result<CreateCommunityWithOwnerResult> {
+        self.create_community_with_owner_and_nip_fi_issuers(normalized_host, owner_pubkey, &[])
+            .await
+    }
+
+    /// Like [`Db::create_community_with_owner`], binding `nip_fi_issuers` to
+    /// the new community in the same transaction. Identical retries return the
+    /// original record without touching its bindings.
+    #[datastore_span(
+        name = "create_community_with_owner_and_nip_fi_issuers",
+        system = "postgresql"
+    )]
+    pub async fn create_community_with_owner_and_nip_fi_issuers(
+        &self,
+        normalized_host: &str,
+        owner_pubkey: &str,
+        nip_fi_issuers: &[String],
     ) -> Result<CreateCommunityWithOwnerResult> {
         let owner_pubkey = owner_pubkey.to_ascii_lowercase();
         let connection = crate::observability::acquire_writer(
@@ -563,12 +603,24 @@ impl Db {
                 return Ok(CreateCommunityWithOwnerResult::LimitReached);
             }
 
+            // The community row was just created in this transaction. Admit
+            // its first tenant row before inserting the initial owner.
+            self.deletion_store()
+                .guard_transaction(&mut tx, CommunityId::from_uuid(id))
+                .await?;
+
             sqlx::query(
                 "INSERT INTO relay_members (community_id, pubkey, role, added_by) VALUES ($1, $2, 'owner', NULL)",
             )
             .bind(id)
             .bind(&owner_pubkey)
             .execute(&mut *tx)
+            .await?;
+            self.insert_nip_fi_issuers_in_transaction(
+                &mut tx,
+                CommunityId::from_uuid(id),
+                nip_fi_issuers,
+            )
             .await?;
             (id, host)
         } else {
@@ -1180,39 +1232,7 @@ mod postgres_tests {
     }
 
     async fn named_contender_db(application_name: &str) -> Db {
-        use std::str::FromStr as _;
-        let options =
-            sqlx::postgres::PgConnectOptions::from_str(&crate::test_support::database_url())
-                .expect("parse test database URL")
-                .application_name(application_name);
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(1)
-            .connect_with(options)
-            .await
-            .expect("connect contender DB");
-        Db::from_pool(pool)
-    }
-
-    async fn wait_for_lock_wait(db: &Db, application_name: &str) {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                let waiting: bool = sqlx::query_scalar(
-                    "SELECT EXISTS(SELECT 1 FROM pg_stat_activity \
-                     WHERE datname = current_database() AND application_name = $1 \
-                       AND wait_event_type = 'Lock')",
-                )
-                .bind(application_name)
-                .fetch_one(&db.pool)
-                .await
-                .expect("inspect contender lock wait");
-                if waiting {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("contender reached a lock wait");
+        Db::from_pool(crate::test_support::named_pool(application_name).await)
     }
 
     /// An archive that queues behind an ownership transfer must re-check
@@ -1256,7 +1276,7 @@ mod postgres_tests {
                     .await
             }
         });
-        wait_for_lock_wait(&db, &transfer_name).await;
+        crate::test_support::wait_for_lock_wait(&db.pool, &transfer_name).await;
 
         let archive_name = format!("archive-transfer-archive-{}", Uuid::new_v4().simple());
         let archive_db = named_contender_db(&archive_name).await;
@@ -1269,7 +1289,7 @@ mod postgres_tests {
                     .await
             }
         });
-        wait_for_lock_wait(&db, &archive_name).await;
+        crate::test_support::wait_for_lock_wait(&db.pool, &archive_name).await;
 
         owner_rows_gate
             .rollback()

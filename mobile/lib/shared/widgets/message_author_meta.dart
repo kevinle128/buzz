@@ -13,6 +13,9 @@ class MessageAuthorMeta extends StatelessWidget {
   /// Timestamp label shown after the author metadata.
   final String timestamp;
 
+  /// Whether metadata includes the timestamp alongside the author.
+  final bool showTimestamp;
+
   /// Color applied to [displayName].
   final Color nameColor;
 
@@ -51,6 +54,7 @@ class MessageAuthorMeta extends StatelessWidget {
     required this.nameColor,
     required this.metadataColor,
     this.username,
+    this.showTimestamp = true,
     this.onAuthorTap,
     this.badge,
     this.displayNameKey,
@@ -109,17 +113,19 @@ class MessageAuthorMeta extends StatelessWidget {
                 ),
               ),
             ],
-            const SizedBox(width: Grid.xxs),
-            ConstrainedBox(
-              constraints: BoxConstraints(maxWidth: metadataMaxWidth),
-              child: Text(
-                timestamp,
-                key: timestampKey,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: resolvedTimestampStyle,
+            if (showTimestamp) ...[
+              const SizedBox(width: Grid.xxs),
+              ConstrainedBox(
+                constraints: BoxConstraints(maxWidth: metadataMaxWidth),
+                child: Text(
+                  timestamp,
+                  key: timestampKey,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: resolvedTimestampStyle,
+                ),
               ),
-            ),
+            ],
           ],
         );
       },

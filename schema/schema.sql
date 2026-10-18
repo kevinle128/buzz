@@ -64,8 +64,6 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 -- functions
 \i functions/channels_community_id_immutable.sql
-\i functions/enqueue_push_match_job.sql
-\i functions/refresh_channel_ttl_after_event_insert.sql
 \i functions/guard_channel_roster_snapshot.sql
 \i functions/events_created_at_floor_guard.sql
 \i functions/prevent_community_deletion_request_retargeting.sql
@@ -78,6 +76,7 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 \i functions/enforce_community_write_fence.sql
 \i functions/enforce_community_tombstone.sql
 \i functions/attach_community_write_fence.sql
+\i functions/profile_name_fields.sql
 
 \i functions/prevent_app_created_by_update.sql
 
@@ -115,6 +114,7 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 \i tables/public/moderation_actions.sql
 \i tables/public/moderation_reports.sql
 \i tables/public/community_bans.sql
+\i tables/public/community_nip_fi_issuers.sql
 \i tables/public/_operator_global_tables.sql
 \i tables/public/git_repo_names.sql
 \i tables/public/parameterized_event_watermarks.sql
@@ -162,6 +162,7 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 \i triggers/audit_log.sql
 \i triggers/channel_members.sql
 \i triggers/community_bans.sql
+\i triggers/community_nip_fi_issuers.sql
 \i triggers/delivery_log.sql
 \i triggers/event_mentions.sql
 \i triggers/git_repo_names.sql
