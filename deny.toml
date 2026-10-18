@@ -20,6 +20,22 @@ ignore = [
     # used across the workspace. No safe upgrade exists; remove when serde_yaml
     # is replaced.
     { id = "RUSTSEC-2024-0449", reason = "unmaintained, via deprecated serde_yaml; no safe upgrade available" },
+    # zip 8.6.0 — SUID/SGID preservation (0367), symlink escape (0368), and
+    # permissions applied through symlinks (0369). All three are in
+    # ZipArchive::extract and ZipStreamReader::extract. The only callers,
+    # mesh-llm plugin-manager archive.rs and system autoupdate release_fetch.rs,
+    # do not call them: they iterate entries, require enclosed_name(), and write
+    # regular files with File::create, so no symlink or mode bits are applied.
+    # zip >= 9 is blocked until mesh-llm bumps (v0.78.1 still pins 8.6.0).
+    { id = "RUSTSEC-2026-0367", reason = "only in zip extract(); mesh-llm extracts entries manually; blocked on mesh-llm bump" },
+    { id = "RUSTSEC-2026-0368", reason = "only in zip extract(); mesh-llm extracts entries manually; blocked on mesh-llm bump" },
+    { id = "RUSTSEC-2026-0369", reason = "only in zip extract(); mesh-llm extracts entries manually; blocked on mesh-llm bump" },
+    # zvariant, zbus_names, zvariant_derive 5.x — unmaintained, not a known
+    # vulnerability; merged into zbus 6. Pulled in by keyring → secret-service →
+    # zbus 5 (Linux Secret Service). No safe upgrade until keyring moves to zbus 6.
+    { id = "RUSTSEC-2026-0370", reason = "unmaintained, via keyring → zbus 5; no safe upgrade available" },
+    { id = "RUSTSEC-2026-0371", reason = "unmaintained, via keyring → zbus 5; no safe upgrade available" },
+    { id = "RUSTSEC-2026-0372", reason = "unmaintained, via keyring → zbus 5; no safe upgrade available" },
 ]
 
 [licenses]
