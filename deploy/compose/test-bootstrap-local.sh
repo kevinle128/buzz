@@ -24,6 +24,8 @@ owner_pubkey="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 env_file="${TEST_DIR}/.env"
 [[ -f "${env_file}" ]]
+# Try GNU stat first: GNU `stat -f` reports filesystem status and succeeds,
+# so it cannot be the probe. BSD stat rejects -c and falls through.
 [[ "$(stat -c '%a' "${env_file}" 2>/dev/null || stat -f '%Lp' "${env_file}")" == "600" ]]
 grep -Fxq 'BUZZ_IMAGE=buzz-local:current' "${env_file}"
 grep -Fxq 'RELAY_URL=wss://relay-node.example.ts.net' "${env_file}"
