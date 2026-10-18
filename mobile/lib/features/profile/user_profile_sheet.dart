@@ -452,7 +452,12 @@ class _ProfileAvatar extends HookWidget {
               borderRadius: BorderRadius.circular(
                 constraints.biggest.shortestSide * 0.3,
               ),
-              child: avatar,
+              child: !usesInsetAgentArtwork(avatarUrl)
+                  ? avatar
+                  : Transform.scale(
+                      scale: animatedAvatarArtworkScale,
+                      child: avatar,
+                    ),
             );
           },
         ),
@@ -469,7 +474,7 @@ class _AvatarFallback extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      color: context.colors.primaryContainer,
+      color: context.controlSurface,
       alignment: Alignment.center,
       child: Text(
         initial,

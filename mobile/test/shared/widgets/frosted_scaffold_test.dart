@@ -1,6 +1,7 @@
 import 'package:buzz/shared/theme/theme.dart';
 import 'package:buzz/shared/widgets/frosted_app_bar.dart';
 import 'package:buzz/shared/widgets/frosted_scaffold.dart';
+import 'package:buzz/shared/widgets/ios_navigation_bar.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -12,6 +13,72 @@ Border? _appBarBorder(WidgetTester tester) {
 }
 
 void main() {
+  testWidgets('unbounded reversed scroll depth stays finite for native bar', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      const MaterialApp(
+        home: FrostedScaffold(
+          appBar: FrostedAppBar(title: Text('Conversation')),
+          body: SizedBox(key: ValueKey('timeline')),
+        ),
+      ),
+    );
+    final source = tester.element(find.byKey(const ValueKey('timeline')));
+    final offset = IosNavigationScrollScope.maybeOf(source)!;
+    ScrollUpdateNotification(
+      metrics: FixedScrollMetrics(
+        minScrollExtent: 0,
+        maxScrollExtent: double.infinity,
+        pixels: 0,
+        viewportDimension: 600,
+        axisDirection: AxisDirection.up,
+        devicePixelRatio: 1,
+      ),
+      context: source,
+      scrollDelta: 0,
+    ).dispatch(source);
+    await tester.pump();
+    expect(offset.value, 600);
+  });
+
+  testWidgets('foreground paints above header and leaves body interactive', (
+    tester,
+  ) async {
+    var taps = 0;
+    const marker = Text('Foreground date');
+    const bar = FrostedAppBar(title: Text('Header'));
+    await tester.pumpWidget(
+      MaterialApp(
+        home: FrostedScaffold(
+          appBar: bar,
+          body: Center(
+            child: TextButton(
+              onPressed: () => taps++,
+              child: const Text('Body action'),
+            ),
+          ),
+          foreground: const Stack(
+            children: [Positioned(top: 80, left: 0, child: marker)],
+          ),
+        ),
+      ),
+    );
+    final stack = tester.widget<Stack>(
+      find.ancestor(of: find.byWidget(bar), matching: find.byType(Stack)).first,
+    );
+    expect(stack.children.indexOf(bar), lessThan(stack.children.length - 1));
+    expect(
+      find.descendant(
+        of: find.byWidget(stack.children.last),
+        matching: find.byWidget(marker),
+      ),
+      findsOneWidget,
+    );
+    await tester.tap(find.text('Body action'));
+    expect(taps, 1);
+  });
+
   testWidgets('utility pages expose the inverted surface hierarchy', (
     tester,
   ) async {

@@ -11,10 +11,9 @@
 //!   [`refresh_channel_ttls`]). A refresh failure is logged and counted, and
 //!   the event still commits.
 //!
-//! This is the application-side replacement for the `events_enqueue_push_match`
-//! and `events_refresh_channel_ttl` triggers (migrations 0023, 0024, 0040).
-//! Updated writer connections suppress the surviving push trigger. Legacy
-//! writers retain transactional enqueue until replaced. Every production
+//! This replaced the `events_enqueue_push_match` and `events_refresh_channel_ttl`
+//! triggers (migrations 0023, 0024, 0040; retired by 0063 and 0065), so nothing
+//! in the database does this work any more. Every production
 //! `INSERT INTO events` must call this module, enforced by source-policy tests.
 
 use std::collections::BTreeSet;

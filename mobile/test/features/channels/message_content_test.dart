@@ -1,3 +1,5 @@
+import 'package:buzz/shared/widgets/buzz_agent_icon.dart';
+import 'package:buzz/features/channels/local_send_bubble_surface.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'package:http/testing.dart';
@@ -34,10 +36,14 @@ import 'package:buzz/shared/relay/relay.dart';
 import 'package:buzz/shared/theme/theme.dart';
 import 'package:buzz/shared/widgets/buzz_loading_indicator.dart';
 
+part 'message_content_bubble_cases.dart';
+
 Widget _testable(
   Widget child, {
   List<Override> overrides = const [],
   bool disableAnimations = false,
+  bool dark = false,
+  ThemeData? theme,
   VideoPreviewFrameLoader? videoPreviewFrameLoader,
 }) {
   return ProviderScope(
@@ -48,7 +54,7 @@ Widget _testable(
       ...overrides,
     ],
     child: MaterialApp(
-      theme: AppTheme.light(),
+      theme: theme ?? (dark ? AppTheme.dark() : AppTheme.light()),
       // Use MaterialApp.builder so the MediaQuery override (including
       // disableAnimations) applies to every pushed route, not just the
       // home scaffold.  Navigator-pushed routes (e.g. MediaVideoViewerPage)
@@ -373,6 +379,7 @@ class _TestChannelsNotifier extends ChannelsNotifier {
 }
 
 void main() {
+  bubbleContentTests();
   test('wide voice-note waveforms distribute bars across their full width', () {
     const width = 320.0;
     const sampleCount = 48;
@@ -2813,7 +2820,7 @@ Photos
           ),
         );
 
-        expect(find.byIcon(BuzzIcons.bot), findsOneWidget);
+        expect(find.byType(BuzzAgentIcon), findsOneWidget);
         expect(find.text('@'), findsNothing);
         expect(find.text('Helper Bot'), findsOneWidget);
       });
@@ -2831,7 +2838,7 @@ Photos
           ),
         );
 
-        expect(find.byIcon(BuzzIcons.bot), findsOneWidget);
+        expect(find.byType(BuzzAgentIcon), findsOneWidget);
         expect(find.text('Helper Bot'), findsOneWidget);
         expect(_allRichText(tester), isNot(contains('Bot Bot')));
       });

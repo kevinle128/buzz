@@ -113,7 +113,7 @@ Content-Type: application/json
 }
 ```
 
-- `relay_url` selects an adapter-configured relay; the adapter MUST NOT fetch it. Clients MUST send it in the canonical form `wss://host[:port]`, with the scheme in lowercase, a DNS host as its lowercase ASCII (A-label) form with no trailing dot, an IPv4 host in dotted-decimal form, an IPv6 host in brackets in its [RFC 5952](https://www.rfc-editor.org/rfc/rfc5952) text form (for example `wss://[2001:db8::1]:8443`), the default port omitted, and no trailing slash, path, query, or fragment. Relay authorities on port 80 are not supported: clients MUST NOT send, and adapters MUST NOT configure, a `relay_url` with port 80. Adapters MUST configure relays in this canonical form and MUST compare `relay_url` against it exactly. An unknown relay MUST be rejected with 403 `authorization_denied`.
+- `relay_url` selects an adapter-configured relay; the adapter MUST NOT fetch it. An adapter MAY obtain its exact relay list from a configured, authenticated source; it MUST still compare `relay_url` exactly. Clients MUST send it in the canonical form `wss://host[:port]`, with the scheme in lowercase, a DNS host as its lowercase ASCII (A-label) form with no trailing dot, an IPv4 host in dotted-decimal form, an IPv6 host in brackets in its [RFC 5952](https://www.rfc-editor.org/rfc/rfc5952) text form (for example `wss://[2001:db8::1]:8443`), the default port omitted, and no trailing slash, path, query, or fragment. Relay authorities on port 80 are not supported: clients MUST NOT send, and adapters MUST NOT configure, a `relay_url` with port 80. Adapters MUST configure relays in this canonical form and MUST compare `relay_url` against it exactly. An unknown relay MUST be rejected with 403 `authorization_denied`.
 - `nostr_pubkey` is the lowercase hex key the client will authenticate to the relay with. The NIP-98 event MUST be signed by this key, use kind `27235`, carry exactly one `u` tag equal to the absolute URL of this endpoint, exactly one `method` tag of `POST`, and exactly one `payload` tag equal to the lowercase hex SHA-256 of the exact request body bytes. Its `created_at` MUST be no more than 60 seconds old and MUST NOT be more than 5 seconds in the future.
 - The request body is limited to 4096 bytes and MUST NOT be content-encoded. A content-encoded body, such as a gzipped body, MUST be rejected with 400 `invalid_request`. Unknown fields MUST be rejected with 400 `invalid_request`.
 - Credential handling is covered in [Security Considerations](#security-considerations).
@@ -131,6 +131,8 @@ Success response (`200`, `Cache-Control: no-store`):
 `expires_at` is the assertion `exp` as Unix seconds. Adapters MUST issue assertions with `exp - iat <= 300` seconds and MUST NOT set `exp` later than the adapter session's expiry. Clients MAY refuse an assertion with more than 300 seconds remaining when it arrives. The 5-minute cap is a rule of this NIP, not a relay constant: the relay enforces the token `exp` and its own deployment-configured `maximum_assertion_age`.
 
 Adapters MUST issue dedicated [NIP-FI](NIP-FI.md) assertions whose protected `typ` is exactly `nip-fi+jwt` and that carry the NIP-FI required claims; as NIP-FI requires, `sub` is never an email address. The assertion's `aud` MUST be `https://` followed by the authority of the canonical `relay_url`, unchanged: `wss://community.example.com` maps to `https://community.example.com`, `wss://c.example.com:8443` to `https://c.example.com:8443`, and `wss://[2001:db8::1]:8443` to `https://[2001:db8::1]:8443`. This is the canonical host URI of the community the relay resolves from the connection's `Host`. The assertion's `nostr_pubkey` MUST be the key that signs the NIP-42 relay login; the relay rejects any other key. Clients MUST reject a response whose `nostr_pubkey` differs from the key sent in the request.
+
+An adapter MUST NOT issue an assertion for an agent key through a user's own authentication. It MUST issue agent-key assertions only under an owner-authorized grant: a durable record, created through the owner's own authentication, that binds the agent key to the owner. A grant MAY be held by the agent as a credential or kept by the adapter for agents it operates. The adapter MUST issue only while the owner authorization recorded in the grant remains valid. Revoking the owner MUST invalidate every grant the owner authorized before the revocation, and a later authentication by the owner MUST NOT revalidate them. Agent-key assertions follow NIP-FI "Agent keys".
 
 A client that rejects a `200` response, including one it cannot parse, MUST treat it as a refusal: keep the session, show it as refused, and not retry automatically.
 
@@ -171,7 +173,7 @@ WebSocket connections send only `Nostr-Federated-Identity` on the upgrade reques
 
 ## Security Considerations
 
-- Clients MUST send `session_token` only to the adapter endpoints defined in this NIP, and MUST NOT send it to a relay or any other origin. A leaked session token lets its holder request assertions for a key they control until the adapter binds the user to a key.
+- Clients MUST send `session_token` only to the adapter's origin (the scheme, host, and port of `{adapter_base}`), and MUST NOT send it to a relay or any other origin. A leaked session token lets its holder request assertions for a key they control until the adapter binds the user to a key.
 - Clients and adapters MUST NOT log credentials: the `Authorization` and `Nostr-Authorization` header values on every adapter request, including `/v1/session`, and the `handoff_secret` and `session_token` values in the code exchange request and response.
 
 ## Privacy
@@ -180,6 +182,5 @@ NIP-FI defines no public identity projection. Adapter responses are private logi
 
 ## Out of scope
 
-- Assertions for agent keys. This NIP covers assertions for keys a user authenticates with directly; issuing assertions for agent keys requires a separate design.
 - Discovery of which relays require enterprise identity and which adapter serves them.
 - The upstream identity protocol between the adapter and its identity provider.

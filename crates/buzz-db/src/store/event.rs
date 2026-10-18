@@ -82,16 +82,22 @@ pub struct EventQuery {
     /// Restrict results to events with any of these IDs (multi-id `IN` pushdown).
     pub ids: Option<Vec<Vec<u8>>>,
     /// Restrict results to events with an `e` tag referencing any of these event IDs (hex).
-    /// Uses JSONB containment (`tags @> ...`) against the `tags` column.
+    /// Matched positionally, with JSONB containment as the index prefilter.
     pub e_tags: Option<Vec<String>>,
     /// Restrict artifact rows ([`ARTIFACT_KINDS`]) to those with a `d` tag
-    /// matching any of these values, via JSONB containment. Their `d_tag`
+    /// matching any of these values, matched positionally. Their `d_tag`
     /// column is NULL (not NIP-33), so this lets identity lookups match before
     /// SQL `LIMIT`. Rows of other kinds are left to the caller's post-filter.
     pub d_tag_values: Option<Vec<String>>,
-    /// Restrict results to events with an exact custom tag pair.
-    /// Uses JSONB containment against `tags` before SQL `LIMIT`.
+    /// Restrict results to events with an exact custom tag pair: a tag whose
+    /// first element is the name and second the value, checked positionally
+    /// (JSONB containment is only the index prefilter) before SQL `LIMIT`.
     pub custom_tag: Option<(String, String)>,
+    /// Restrict results to events that, for every `(name, values)` entry,
+    /// have a tag whose name is `name` and whose first value is one of
+    /// `values` (NIP-01 tag matching), before SQL `LIMIT`. Entries with no
+    /// values are ignored.
+    pub tag_values: Vec<(String, Vec<String>)>,
     /// Restrict results to events in any of these channels. By default,
     /// channel-less global events are retained so this can enforce a viewer's
     /// accessible-channel scope without hiding global events. Set
@@ -112,17 +118,12 @@ pub struct EventQuery {
     /// private events are excluded from the candidate page rather than
     /// discarded after it.
     ///
-    /// The clause is: `AND (kind NOT IN (...) OR pubkey = $reader OR tags @> ?)`,
-    /// where the `IN` list is [`SHARED_GATED_KINDS`] and `?` is the JSONB
-    /// literal `[["shared","true"]]`.  The GIN index on `tags` (migration 0004,
-    /// jsonb_path_ops) makes the containment check fast.
-    ///
-    /// NOTE: `tags @> '[["shared","true"]]'` uses JSONB containment, which
-    /// matches any tag array that is a superset of `[["shared","true"]]` — it
-    /// would match `["shared","true","extra"]` too.  The ingest `parts.len() ==
-    /// 2` exact-shape check ensures such malformed tags are never stored, so the
-    /// SQL pushdown is sound.  Keeping `event_visible_to_reader` as post-filter
-    /// defense-in-depth catches any residual mismatch.
+    /// The clause is: `AND (kind NOT IN (...) OR pubkey = $reader OR <shared>)`,
+    /// where the `IN` list is [`SHARED_GATED_KINDS`] and `<shared>` requires a
+    /// tag whose element 0 is `shared` and element 1 is `true`. Containment on
+    /// the GIN index (migration 0004, jsonb_path_ops) is the fast first pass;
+    /// containment alone would also admit decoys like `["x","shared","true"]`.
+    /// `event_visible_to_reader` remains the post-filter.
     pub shared_gated_reader: Option<Vec<u8>>,
 }
 
@@ -152,6 +153,7 @@ impl EventQuery {
             e_tags: None,
             d_tag_values: None,
             custom_tag: None,
+            tag_values: Vec::new(),
             channel_ids: None,
             channel_ids_include_global: true,
             max_limit: None,
@@ -480,6 +482,8 @@ async fn insert_event_on(
     let received_at = Utc::now();
     let d_tag = extract_d_tag(event);
     let not_before = extract_not_before(event);
+    crate::channel_members::guard_channel_roster_event(tx, kind_i32, channel_id, &tags_json)
+        .await?;
     let result = sqlx::query(
         r#"
         INSERT INTO events (community_id, id, pubkey, created_at, kind, tags, content, sig, received_at, channel_id, d_tag, not_before)
@@ -580,7 +584,10 @@ pub(crate) async fn query_events_on(
     let rows = if q.e_tags.is_some() {
         fetch_with_e_tag_deadline(conn, &mut qb).await?
     } else {
-        qb.build().fetch_all(&mut *conn).await?
+        qb.build()
+            .persistent(!has_tag_values(q))
+            .fetch_all(&mut *conn)
+            .await?
     };
 
     let mut out = Vec::with_capacity(rows.len());
@@ -720,14 +727,15 @@ fn build_query_events_sql(q: &EventQuery) -> QueryBuilder<sqlx::Postgres> {
         }
     }
 
-    // e-tag pushdown via JSONB containment: tags @> '[["e","<hex>"]]'.
-    // Multiple e-tags use OR (any match). Served by idx_events_tags_gin
+    // e-tag pushdown: exact positional match with a JSONB containment
+    // prefilter, tags @> ANY('[["e","<hex>"]]', ...). Served by idx_events_tags_gin
     // (GIN, jsonb_path_ops — migrations/0004): the channel-window aux closure
     // fans this out once per retained row, which made unindexed containment
     // the dominant scroll-back cost (~1.7s/page on staging).
     if let Some(ref e_tags) = q.e_tags {
         if !e_tags.is_empty() {
-            push_e_tag_filter(&mut qb, col_prefix, e_tags);
+            qb.push(" AND ");
+            push_exact_tag_match(&mut qb, col_prefix, "e", e_tags);
         }
     }
 
@@ -736,10 +744,11 @@ fn build_query_events_sql(q: &EventQuery) -> QueryBuilder<sqlx::Postgres> {
     }
 
     if let Some((ref name, ref value)) = q.custom_tag {
-        let containment = serde_json::json!([[name, value]]);
-        qb.push(format!(" AND {col_prefix}tags @> "))
-            .push_bind(containment);
+        qb.push(" AND ");
+        push_exact_tag_match(&mut qb, col_prefix, name, std::slice::from_ref(value));
     }
+
+    push_tag_value_filters(&mut qb, col_prefix, &q.tag_values);
 
     if let Some(s) = q.since {
         qb.push(format!(" AND {col_prefix}created_at >= "))
@@ -783,16 +792,12 @@ fn build_query_events_sql(q: &EventQuery) -> QueryBuilder<sqlx::Postgres> {
     // shared ones off the end of the result set (the catalog query pattern).
     //
     // Clause: AND (kind NOT IN (30175, 30178) OR pubkey = $reader
-    //              OR tags @> '[["shared","true"]]')
+    //              OR <exact ["shared","true",...] tag>)
     //
-    // The JSONB containment check is served by idx_events_tags_gin (migration
-    // 0004, jsonb_path_ops).  `tags @> '[["shared","true"]]'` matches any array
-    // that contains exactly the sub-array — a two-element `["shared","true"]`
-    // tag passes; a tag-absent event does not.  Because ingest requires exactly
-    // two elements for the shared tag (parts.len() == 2), no stored event can
-    // carry a three-element superset.
+    // The shared match is positional, like the other tag pushdowns: plain
+    // containment would admit a private event carrying ["x","shared","true"],
+    // which then wastes a page slot before the post-filter drops it.
     if let Some(ref reader_bytes) = q.shared_gated_reader {
-        let shared_containment = serde_json::json!([["shared", "true"]]);
         qb.push(format!(" AND ({col_prefix}kind NOT IN ("));
         let mut sep = qb.separated(", ");
         for kind in SHARED_GATED_KINDS {
@@ -800,8 +805,8 @@ fn build_query_events_sql(q: &EventQuery) -> QueryBuilder<sqlx::Postgres> {
         }
         qb.push(format!(") OR {col_prefix}pubkey = "));
         qb.push_bind(reader_bytes.clone());
-        qb.push(format!(" OR {col_prefix}tags @> "));
-        qb.push_bind(shared_containment);
+        qb.push(" OR ");
+        push_exact_tag_match(&mut qb, col_prefix, "shared", &["true".to_owned()]);
         qb.push(")");
     }
 
@@ -852,21 +857,63 @@ async fn fetch_with_e_tag_deadline(
     Ok(rows)
 }
 
-/// e-tag pushdown as one array-bound containment test instead of an N-way
-/// `OR` chain, so planner cost does not scale with the number of referenced
-/// ids (the thread aux hop sends one id per reply).
-fn push_e_tag_filter(qb: &mut QueryBuilder<sqlx::Postgres>, col_prefix: &str, e_tags: &[String]) {
-    let containments: Vec<serde_json::Value> = e_tags
+/// Match a tag whose first element is `name` and whose second is any of
+/// `values` (NIP-01), as one parenthesized predicate.
+///
+/// JSONB containment alone ignores element position and multiplicity:
+/// `[["t","t"]]` is contained in `["t","other"]`, and `[["e",id]]` in
+/// `["x","e",id]`. Over-matching before `LIMIT` lets a non-matching newer row
+/// take the slot, so containment stays only as the GIN-indexed prefilter
+/// (one array-bound test, so planner cost does not scale with `values`) and
+/// the positional check makes the predicate exact.
+fn push_exact_tag_match(
+    qb: &mut QueryBuilder<sqlx::Postgres>,
+    col_prefix: &str,
+    name: &str,
+    values: &[String],
+) {
+    let containments: Vec<serde_json::Value> = values
         .iter()
-        .map(|hex_id| serde_json::json!([["e", hex_id]]))
+        .map(|value| serde_json::json!([[name, value]]))
         .collect();
-    qb.push(format!(" AND {col_prefix}tags @> ANY("))
+    qb.push(format!("({col_prefix}tags @> ANY("))
         .push_bind(containments)
-        .push("::jsonb[])");
+        .push(format!(
+            "::jsonb[]) AND EXISTS (SELECT 1 FROM jsonb_array_elements({col_prefix}tags) AS tag \
+             WHERE tag->>0 = "
+        ))
+        .push_bind(name.to_owned())
+        .push(" AND tag->>1 = ANY(")
+        .push_bind(values.to_vec())
+        .push(")))");
+}
+
+/// Whether `q` carries a [`EventQuery::tag_values`] match. Such a query runs
+/// as an unnamed statement, so Postgres plans it with the bound values. After
+/// a few runs, a cached generic plan ignores the value and can scan every
+/// group-state row in the community instead of using the `tags` GIN index.
+fn has_tag_values(q: &EventQuery) -> bool {
+    q.tag_values.iter().any(|(_, values)| !values.is_empty())
+}
+
+/// AND one [`push_exact_tag_match`] per non-empty [`EventQuery::tag_values`]
+/// entry, so entries are ANDed and values within an entry are ORed.
+fn push_tag_value_filters(
+    qb: &mut QueryBuilder<sqlx::Postgres>,
+    col_prefix: &str,
+    tag_values: &[(String, Vec<String>)],
+) {
+    for (name, values) in tag_values {
+        if values.is_empty() {
+            continue;
+        }
+        qb.push(" AND ");
+        push_exact_tag_match(qb, col_prefix, name, values);
+    }
 }
 
 /// Match `#d` on artifact rows before `LIMIT` while leaving other kinds to the
-/// caller's post-filter: `(kind NOT IN (artifact kinds) OR tags @> [["d", v]] ...)`.
+/// caller's post-filter: `(kind NOT IN (artifact kinds) OR <exact d match>)`.
 fn push_artifact_d_tag_predicate(
     qb: &mut QueryBuilder<sqlx::Postgres>,
     col_prefix: &str,
@@ -877,12 +924,9 @@ fn push_artifact_d_tag_predicate(
     }
     let [revision, removal] = ARTIFACT_KINDS;
     qb.push(format!(
-        " AND ({col_prefix}kind NOT IN ({revision}, {removal})"
+        " AND ({col_prefix}kind NOT IN ({revision}, {removal}) OR "
     ));
-    for value in values {
-        qb.push(format!(" OR {col_prefix}tags @> "));
-        qb.push_bind(serde_json::json!([["d", value]]));
-    }
+    push_exact_tag_match(qb, col_prefix, "d", values);
     qb.push(")");
 }
 
@@ -1055,13 +1099,21 @@ pub(crate) async fn count_events_on(conn: &mut sqlx::PgConnection, q: &EventQuer
 
     if let Some(ref e_tags) = q.e_tags {
         if !e_tags.is_empty() {
-            push_e_tag_filter(&mut qb, col_prefix, e_tags);
+            qb.push(" AND ");
+            push_exact_tag_match(&mut qb, col_prefix, "e", e_tags);
         }
     }
 
     if let Some(ref values) = q.d_tag_values {
         push_artifact_d_tag_predicate(&mut qb, col_prefix, values);
     }
+
+    if let Some((ref name, ref value)) = q.custom_tag {
+        qb.push(" AND ");
+        push_exact_tag_match(&mut qb, col_prefix, name, std::slice::from_ref(value));
+    }
+
+    push_tag_value_filters(&mut qb, col_prefix, &q.tag_values);
 
     if let Some(s) = q.since {
         qb.push(format!(" AND {col_prefix}created_at >= "))
@@ -1094,7 +1146,10 @@ pub(crate) async fn count_events_on(conn: &mut sqlx::PgConnection, q: &EventQuer
             .next()
             .ok_or_else(|| DbError::InvalidData("COUNT returned no rows".to_string()))?
     } else {
-        qb.build().fetch_one(&mut *conn).await?
+        qb.build()
+            .persistent(!has_tag_values(q))
+            .fetch_one(&mut *conn)
+            .await?
     };
     let cnt: i64 = row.try_get("cnt")?;
 
@@ -1743,6 +1798,9 @@ pub(crate) async fn insert_event_with_thread_metadata_tx(
     let received_at = Utc::now();
     let d_tag = extract_d_tag(event);
     let not_before = extract_not_before(event);
+
+    crate::channel_members::guard_channel_roster_event(tx, kind_i32, channel_id, &tags_json)
+        .await?;
 
     let result = sqlx::query(
         r#"
@@ -2690,7 +2748,7 @@ impl Db {
     /// Backfill `d_tag` for existing NIP-33 events (kind 30000–39999) that have `d_tag IS NULL`.
     ///
     /// Idempotent — safe to call on every startup. No-ops when all rows are already populated.
-    /// Runs a single UPDATE touching only NIP-33 rows with NULL d_tag.
+    /// Admits each community before updating its NIP-33 rows with NULL d_tag.
     #[datastore_span(name = "backfill_d_tags", system = "postgresql")]
     pub async fn backfill_d_tags(&self) -> Result<u64> {
         let mut connection = crate::observability::acquire_writer(
@@ -2698,19 +2756,40 @@ impl Db {
             crate::observability::WriterOperation::Bootstrap,
         )
         .await?;
-        let result = sqlx::query(
-            "UPDATE events \
+        let communities: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT DISTINCT community_id FROM events \
+             WHERE kind BETWEEN 30000 AND 39999 AND d_tag IS NULL",
+        )
+        .fetch_all(&mut *connection)
+        .await?;
+        drop(connection);
+        let mut updated = 0;
+        for id in communities {
+            let Some(mut tx) = crate::begin_community_sweep_transaction(
+                &self.pool,
+                CommunityId::from_uuid(id),
+                crate::observability::WriterOperation::Bootstrap,
+            )
+            .await?
+            else {
+                continue;
+            };
+            let result = sqlx::query(
+                "UPDATE events \
              SET d_tag = COALESCE( \
                  (SELECT elem->>1 FROM jsonb_array_elements(tags) AS elem \
                   WHERE elem->>0 = 'd' LIMIT 1), \
                  '' \
              ) \
-             WHERE kind BETWEEN 30000 AND 39999 AND d_tag IS NULL \
-               AND community_write_allowed(community_id)",
-        )
-        .execute(&mut *connection)
-        .await?;
-        Ok(result.rows_affected())
+             WHERE community_id = $1 AND kind BETWEEN 30000 AND 39999 AND d_tag IS NULL",
+            )
+            .bind(id)
+            .execute(tx.conn())
+            .await?;
+            tx.commit().await?;
+            updated += result.rows_affected();
+        }
+        Ok(updated)
     }
 
     /// Soft-delete NIP-29 discovery events for a channel created by a specific relay pubkey.
@@ -2848,6 +2927,44 @@ mod postgres_tests {
         id
     }
 
+    /// Statements on `conn` that Postgres holds as prepared, matching `like`.
+    async fn prepared_like(conn: &mut sqlx::PgConnection, like: &str) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM pg_prepared_statements WHERE statement LIKE $1")
+            .bind(like)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("read prepared statements")
+    }
+
+    /// A label or creator match must keep parameter-aware planning. A cached
+    /// generic plan ignores the label value and scans every group-state row in
+    /// the community instead of using the `tags` GIN index.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn tag_value_queries_are_not_cached_as_prepared_statements() {
+        let pool = setup_pool().await;
+        let community = CommunityId::from_uuid(make_test_community(&pool).await);
+        let mut conn = pool.acquire().await.expect("acquire");
+        sqlx::query("DEALLOCATE ALL")
+            .execute(&mut *conn)
+            .await
+            .expect("clear prepared statements");
+        let mut q = EventQuery::for_community(community);
+        q.kinds = Some(vec![39000]);
+        q.tag_values = vec![("t".to_owned(), vec!["for-you".to_owned()])];
+        for _ in 0..6 {
+            query_events_on(&mut conn, &q).await.expect("label query");
+            count_events_on(&mut conn, &q).await.expect("label count");
+        }
+        assert_eq!(prepared_like(&mut conn, "%tags @> ANY(%").await, 0);
+
+        // Control: the same query without a tag match stays a cached statement,
+        // so the check above can see one.
+        q.tag_values.clear();
+        query_events_on(&mut conn, &q).await.expect("plain query");
+        assert!(prepared_like(&mut conn, "%FROM events%").await > 0);
+    }
+
     /// Effective `statement_timeout` observed *inside* the e-tag deadline, and
     /// the value restored on `conn` afterwards.
     async fn deadline_inside_and_after(conn: &mut sqlx::PgConnection) -> (String, String) {
@@ -2861,6 +2978,145 @@ mod postgres_tests {
             .await
             .expect("show timeout");
         (inside, after)
+    }
+
+    /// Every pushed-down tag filter matches by position: a newer decoy whose
+    /// tag holds the wanted name and value in the wrong slots must not take a
+    /// `limit: 1` page or be counted.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn pushed_down_tag_filters_reject_positional_decoys() {
+        let pool = setup_pool().await;
+        let community = CommunityId::from_uuid(make_test_community(&pool).await);
+        let keys = Keys::generate();
+        let now = nostr::Timestamp::now().as_secs();
+        let target = "ab".repeat(32);
+        let insert = |kind: u16, tag: Vec<&str>, at: u64| {
+            let event = EventBuilder::new(Kind::Custom(kind), "")
+                .tags([Tag::parse(tag).unwrap()])
+                .custom_created_at(nostr::Timestamp::from(at))
+                .sign_with_keys(&keys)
+                .unwrap();
+            let pool = pool.clone();
+            async move {
+                insert_event(&pool, community, &event, None).await.unwrap();
+                event.id.as_bytes().to_vec()
+            }
+        };
+        // Removals: revisions also need an `artifact_heads` row to be read.
+        let [_, artifact_kind] = ARTIFACT_KINDS;
+        let artifact_kind = artifact_kind as u16;
+
+        struct Case<'a> {
+            label: &'a str,
+            kind: u16,
+            real: Vec<&'a str>,
+            /// Inserted after `real`, so it wins a `limit: 1` read if matched.
+            decoy: Vec<&'a str>,
+            query: EventQuery,
+        }
+        let cases = [
+            Case {
+                label: "custom tag value in name slot",
+                kind: 1,
+                real: vec!["t", "t"],
+                decoy: vec!["t", "other"],
+                query: {
+                    let mut q = EventQuery::for_community(community);
+                    q.custom_tag = Some(("t".into(), "t".into()));
+                    q
+                },
+            },
+            Case {
+                label: "custom tag shifted right",
+                kind: 1,
+                real: vec!["t", "v"],
+                decoy: vec!["meta", "t", "v"],
+                query: {
+                    let mut q = EventQuery::for_community(community);
+                    q.custom_tag = Some(("t".into(), "v".into()));
+                    q
+                },
+            },
+            Case {
+                label: "e tag shifted right",
+                kind: 7,
+                real: vec!["e", &target],
+                decoy: vec!["x", "e", &target],
+                query: {
+                    let mut q = EventQuery::for_community(community);
+                    q.e_tags = Some(vec![target.clone()]);
+                    q
+                },
+            },
+            Case {
+                label: "artifact d tag shifted right",
+                kind: artifact_kind,
+                real: vec!["d", "a1"],
+                decoy: vec!["x", "d", "a1"],
+                query: {
+                    let mut q = EventQuery::for_community(community);
+                    q.d_tag_values = Some(vec!["a1".into()]);
+                    q
+                },
+            },
+        ];
+        for (offset, case) in (0u64..).step_by(10).zip(cases) {
+            let Case {
+                label,
+                kind,
+                real,
+                decoy,
+                query: mut q,
+            } = case;
+            let real_id = insert(kind, real, now - 1000 + offset).await;
+            insert(kind, decoy, now - 995 + offset).await;
+            q.kinds = Some(vec![i32::from(kind)]);
+            q.pubkey = Some(keys.public_key().to_bytes().to_vec());
+            q.since = Some(DateTime::from_timestamp((now - 1000 + offset) as i64, 0).unwrap());
+            q.until = Some(DateTime::from_timestamp((now - 995 + offset) as i64, 0).unwrap());
+            q.limit = Some(1);
+            let rows = query_events(&pool, &q).await.unwrap();
+            assert_eq!(rows.len(), 1, "{label}");
+            assert_eq!(rows[0].event.id.as_bytes().to_vec(), real_id, "{label}");
+            assert_eq!(count_events(&pool, &q).await.unwrap(), 1, "{label} count");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn shared_gate_rejects_positional_decoy() {
+        let pool = setup_pool().await;
+        let community = CommunityId::from_uuid(make_test_community(&pool).await);
+        let (author, reader) = (Keys::generate(), Keys::generate());
+        let kind = SHARED_GATED_KINDS[0];
+        let now = nostr::Timestamp::now().as_secs();
+        let mut ids = Vec::new();
+        // Real shared event, then a newer private one whose shared marker is
+        // shifted right, so it would win a `limit: 1` read if admitted.
+        for (tag, at) in [
+            (["shared", "true"].as_slice(), now - 10),
+            (&["x", "shared", "true"], now),
+        ] {
+            let event = EventBuilder::new(Kind::Custom(kind as u16), "")
+                .tags([
+                    Tag::parse(["d", &Uuid::new_v4().to_string()]).unwrap(),
+                    Tag::parse(tag.iter().copied()).unwrap(),
+                ])
+                .custom_created_at(nostr::Timestamp::from(at))
+                .sign_with_keys(&author)
+                .unwrap();
+            insert_event(&pool, community, &event, None).await.unwrap();
+            ids.push(event.id.as_bytes().to_vec());
+        }
+        let mut q = EventQuery::for_community(community);
+        q.kinds = Some(vec![kind as i32]);
+        q.pubkey = Some(author.public_key().to_bytes().to_vec());
+        q.shared_gated_reader = Some(reader.public_key().to_bytes().to_vec());
+        q.limit = Some(1);
+        let rows = query_events(&pool, &q).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event.id.as_bytes().to_vec(), ids[0]);
     }
 
     #[tokio::test]
@@ -3055,7 +3311,7 @@ mod postgres_tests {
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
-    async fn event_insert_ttl_trigger_handles_permanent_ephemeral_duplicate_and_activation_race() {
+    async fn event_insert_ttl_refresh_handles_permanent_ephemeral_duplicate_and_activation_race() {
         let pool = setup_pool().await;
         let community_uuid = make_test_community(&pool).await;
         let community = CommunityId::from_uuid(community_uuid);
@@ -3122,8 +3378,8 @@ mod postgres_tests {
 
         // Reproduce the blocked stale-prefetch ordering: ingest has already
         // observed a permanent channel, then TTL activation locks/updates the
-        // row before the event INSERT reaches its trigger. The trigger must
-        // wait and refresh from the later event after activation commits.
+        // row before the event INSERT reaches its pre-commit TTL refresh. The
+        // refresh must wait, then use the later event once activation commits.
         let racing = make_test_channel(&pool, community_uuid, None).await;
         let stale_ttl: Option<i32> = sqlx::query_scalar(
             "SELECT ttl_seconds FROM channels WHERE community_id = $1 AND id = $2",
@@ -3138,7 +3394,7 @@ mod postgres_tests {
         let mut activation = pool.begin().await.expect("begin TTL activation");
         // Model the repaired update_channel protocol (migration 0024): the
         // TTL transition holds the per-channel advisory key EXCLUSIVE, which
-        // is what the event trigger's shared acquisition now waits on.
+        // is what the event TTL refresh's shared acquisition waits on.
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
             .bind(format!("buzz_channel_ttl:{community_uuid}:{racing}"))
             .execute(&mut *activation)
@@ -3163,7 +3419,7 @@ mod postgres_tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(
             !insert.is_finished(),
-            "event trigger must wait on TTL activation"
+            "event TTL refresh must wait on TTL activation"
         );
         activation.commit().await.expect("commit TTL activation");
         assert!(
@@ -3188,53 +3444,59 @@ mod postgres_tests {
         );
     }
 
-    /// T1a repair regression test (migration 0024): permanent-channel event
-    /// commits must not serialize on the channel row. The 0022 trigger took
-    /// `FOR UPDATE` on the channel tuple before testing `ttl_seconds`, so
-    /// concurrent commits into one hot permanent channel queued at commit
-    /// time (deferred trigger) — invisible to any single-connection test.
-    /// This holds N insert transactions at a barrier past their INSERTs,
-    /// then proves (a) while all N sit pre-commit, no transaction holds a
-    /// row-level lock on the channel tuple, and (b) all N commits succeed
-    /// with the channel row untouched (permanent ⇒ no deadline write).
+    /// T1a repair regression test (migration 0024, now app-side): commits of
+    /// permanent-channel events must not lock the channel row. The 0022
+    /// trigger took `FOR UPDATE` on the channel tuple before testing
+    /// `ttl_seconds`, so concurrent commits into one hot permanent channel
+    /// queued at commit time, which no single-connection test can see. The
+    /// refresh now runs in [`AdmittedTx::commit`] as the last statement before
+    /// COMMIT.
+    ///
+    /// This inserts N events through the production admitted-transaction
+    /// path and holds every transaction at a barrier past its INSERT. It then
+    /// proves three things:
+    /// - (a) while all N are uncommitted, no transaction holds a row-level
+    ///   lock on the channel tuple;
+    /// - (b) while an external transaction holds `FOR SHARE` on the channel
+    ///   row, all N commits, and therefore their TTL refreshes, finish
+    ///   without blocking and without a counted refresh failure;
+    /// - (c) the permanent channel's deadline stays NULL.
+    ///
+    /// Mutation oracle: if the refresh takes `FOR UPDATE` on the channel row,
+    /// the commits queue behind the `FOR SHARE` holder. The join times out,
+    /// or a `lock_timeout` is counted as a refresh failure.
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn permanent_channel_event_commits_do_not_lock_the_channel_row() {
         const N: usize = 8;
-        // setup_pool's default cap (10) covers N held transactions plus the
-        // pg_locks inspector connection.
+        // setup_pool's default cap (10) covers N held transactions, the
+        // FOR SHARE holder, and the pg_locks inspector connection.
         let pool = setup_pool().await;
         let community_uuid = make_test_community(&pool).await;
+        let community = CommunityId::from_uuid(community_uuid);
         let channel = make_test_channel(&pool, community_uuid, None).await;
 
-        // Open N transactions, run the full event INSERT in each (the deferred
-        // trigger fires at COMMIT), and park them at a barrier.
+        // Open N admitted transactions, run the production event insert in
+        // each (the TTL refresh runs in `commit`), and park them at a barrier.
         let mut txs = Vec::new();
         for i in 0..N {
-            let mut tx = pool.begin().await.expect("begin insert txn");
-            let event = make_text_event(&format!("hot channel event {i}"));
-            sqlx::query(
-                "INSERT INTO events (community_id,id,pubkey,created_at,kind,tags,content,sig,received_at,channel_id) \
-                 VALUES ($1,$2,$3,$4,9,$5,$6,$7,now(),$8)",
+            let mut tx = crate::begin_community_event_write_transaction(
+                &pool,
+                community,
+                crate::observability::WriterOperation::EventWrite,
             )
-            .bind(community_uuid)
-            .bind(event.id.as_bytes().as_slice())
-            .bind(event.pubkey.as_bytes().as_slice())
-            .bind(DateTime::from_timestamp(event.created_at.as_secs() as i64, 0).unwrap())
-            .bind(serde_json::to_value(&event.tags).unwrap())
-            .bind(&event.content)
-            .bind(event.sig.serialize().as_slice())
-            .bind(channel)
-            .execute(&mut *tx)
             .await
-            .expect("insert event inside held txn");
+            .expect("begin admitted insert txn");
+            let event = make_text_event(&format!("hot channel event {i}"));
+            let (_, inserted) = insert_event_in_transaction(&mut tx, &event, Some(channel))
+                .await
+                .expect("insert event inside held txn");
+            assert!(inserted, "held txn {i} must insert its event");
             txs.push(tx);
         }
 
         // With all N transactions holding completed INSERTs, none may hold a
-        // row-level lock on the channels tuple. (The 0022 trigger would not
-        // have taken it yet either — it locks at COMMIT — so also verify the
-        // commit phase below completes without mutual blocking.)
+        // row-level lock on the channels tuple.
         let tuple_locks: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM pg_locks l \
              JOIN pg_class c ON c.oid = l.relation \
@@ -3245,21 +3507,43 @@ mod postgres_tests {
         .expect("inspect pg_locks");
         assert_eq!(tuple_locks, 0, "no channel tuple locks while txns are held");
 
-        // Release all commits concurrently. Under 0022 these serialized on the
-        // channel row (each holding it across its WAL flush); under 0024 the
-        // shared advisory key admits them all. Join with a timeout so a
-        // regression fails fast instead of hanging the suite.
-        let commits = txs
-            .into_iter()
-            .map(|tx| tokio::spawn(async move { tx.commit().await }))
-            .collect::<Vec<_>>();
-        for c in commits {
-            tokio::time::timeout(std::time::Duration::from_secs(10), c)
+        // An external FOR SHARE holder conflicts with any FOR UPDATE / UPDATE
+        // row lock on the channel, so a refresh that locks the permanent row
+        // cannot complete while it is held.
+        let mut holder = pool.begin().await.expect("begin FOR SHARE holder");
+        sqlx::query("SELECT 1 FROM channels WHERE community_id = $1 AND id = $2 FOR SHARE")
+            .bind(community_uuid)
+            .bind(channel)
+            .execute(&mut *holder)
+            .await
+            .expect("holder takes FOR SHARE on the channel row");
+
+        // Release all commits concurrently while the holder is open. Join with
+        // a timeout so a regression fails fast instead of hanging the suite.
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            let commits = futures_util::future::join_all(txs.into_iter().map(AdmittedTx::commit));
+            for result in tokio::time::timeout(std::time::Duration::from_secs(10), commits)
                 .await
-                .expect("concurrent permanent-channel commits must not block")
-                .expect("join commit task")
-                .expect("commit succeeds");
+                .expect("permanent-channel commits must not wait on the channel row")
+            {
+                result.expect("commit succeeds");
+            }
         }
+        holder.rollback().await.expect("release FOR SHARE holder");
+
+        let refresh_failures: Vec<_> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(key, ..)| key.key().name() == "buzz_db_channel_ttl_refresh_failures_total")
+            .collect();
+        assert!(
+            refresh_failures.is_empty(),
+            "permanent-channel refreshes must not fail: {refresh_failures:?}"
+        );
 
         let deadline: Option<DateTime<Utc>> = sqlx::query_scalar(
             "SELECT ttl_deadline FROM channels WHERE community_id = $1 AND id = $2",

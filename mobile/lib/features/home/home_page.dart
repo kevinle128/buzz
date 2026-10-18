@@ -9,6 +9,7 @@ import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:buzz/shared/theme/buzz_icons.dart';
 
 import '../../shared/theme/theme.dart';
+import '../../shared/widgets/bottom_up_page_route.dart';
 import '../../shared/widgets/concentric_sheet_surface.dart';
 import '../../shared/widgets/directional_transition_scope.dart';
 import '../../shared/widgets/mobile_tab_footer_backdrop.dart';
@@ -20,12 +21,18 @@ class HomePage extends HookConsumerWidget {
   const HomePage({
     required this.settingsPageBuilder,
     this.communityInvitePageBuilder,
+    this.mePageBuilder,
     this.communityAppearancePageBuilder,
     required this.hasUnreadInbox,
+    this.hasUnreadSolo = false,
     super.key,
   });
 
   final WidgetBuilder settingsPageBuilder;
+
+  /// Personal chat workspace supplied by the app composition root.
+  final Widget Function(BuildContext, ValueNotifier<VoidCallback?>)?
+  mePageBuilder;
 
   /// Builds the invite destination opened from the community sheet.
   final WidgetBuilder? communityInvitePageBuilder;
@@ -33,6 +40,9 @@ class HomePage extends HookConsumerWidget {
   /// Builds the appearance destination opened from the community sheet.
   final WidgetBuilder? communityAppearancePageBuilder;
   final bool hasUnreadInbox;
+
+  /// Whether a visible Solo chat has unread activity.
+  final bool hasUnreadSolo;
 
   static const double _tabBarHeight = mobileTabBarHeight;
   static const double _tabBarRadius = _tabBarHeight / 2;
@@ -60,14 +70,9 @@ class HomePage extends HookConsumerWidget {
       label: 'Home',
     ),
     _HomeDestination(
-      icon: BuzzIcons.inbox300,
-      selectedIcon: BuzzIcons.inbox500,
-      label: 'Activity',
-    ),
-    _HomeDestination(
-      icon: BuzzIcons.search300,
-      selectedIcon: BuzzIcons.search500,
-      label: 'Search',
+      icon: BuzzIcons.messageSquare,
+      selectedIcon: BuzzIcons.messageSquare,
+      label: 'Solo',
     ),
   ];
 
@@ -84,22 +89,34 @@ class HomePage extends HookConsumerWidget {
       tabContentTransitionController,
     );
     final homeReselection = useValueNotifier(0);
-    final activityReselection = useValueNotifier(0);
-    final searchReselection = useValueNotifier(0);
+    final newChatAction = useValueNotifier<VoidCallback?>(null);
     final settingsTransitionProgress = useValueNotifier(0.0);
     final reducedMotion = MediaQuery.of(context).disableAnimations;
     final tabContentTransitionProgress = reducedMotion
         ? 1.0
         : _tabContentTransitionCurve.transform(tabContentTransitionValue);
-    final systemBottomInset = MediaQuery.paddingOf(context).bottom;
+    // Keyboard dismissal must not retarget the floating compose animation.
+    final systemBottomInset = MediaQuery.viewPaddingOf(context).bottom;
     final navigationBarWidth = _floatingTabBarWidth(
       MediaQuery.sizeOf(context).width,
       _destinations.length,
     );
-
     final pages = [
       ChannelsPage(
         settingsPageBuilder: settingsPageBuilder,
+        hasUnreadInbox: hasUnreadInbox,
+        onInbox: () => Navigator.of(context).push(
+          BottomUpPageRoute<void>(
+            builder: (_) => const ActivityPage(),
+            reducedMotion: reducedMotion,
+          ),
+        ),
+        onSearch: () => Navigator.of(context).push(
+          BottomUpPageRoute<void>(
+            builder: (_) => const SearchPage(),
+            reducedMotion: reducedMotion,
+          ),
+        ),
         communityInvitePageBuilder: communityInvitePageBuilder,
         communityAppearancePageBuilder: communityAppearancePageBuilder,
         tabReselection: homeReselection,
@@ -110,11 +127,7 @@ class HomePage extends HookConsumerWidget {
         },
       ),
       if (visitedTabs.value.contains(1))
-        ActivityPage(tabReselection: activityReselection)
-      else
-        const SizedBox.shrink(),
-      if (visitedTabs.value.contains(2))
-        SearchPage(tabReselection: searchReselection)
+        mePageBuilder?.call(context, newChatAction) ?? const SizedBox.shrink()
       else
         const SizedBox.shrink(),
     ];
@@ -182,18 +195,25 @@ class HomePage extends HookConsumerWidget {
                     child: IgnorePointer(
                       child: MobileTabFooterBackdrop(
                         height: mobileTabFooterBackdropHeight(context),
-                        tint: context.colors.primaryContainer,
+                        tint: context.controlSurface,
                       ),
                     ),
                   ),
                   Positioned.fill(
-                    child: ChannelQuickActionsLauncher(
-                      visible: tabIndex.value == 0,
-                      navigationBarHeight: HomePage._tabBarHeight,
-                      navigationBarBottomGap: HomePage._tabBarBottomGap,
-                      navigationBarWidth: navigationBarWidth,
-                      systemBottomInset: systemBottomInset,
-                      rightInset: Grid.sm,
+                    child: ValueListenableBuilder<VoidCallback?>(
+                      valueListenable: newChatAction,
+                      builder: (context, onNewChat, _) =>
+                          ChannelQuickActionsLauncher(
+                            visible: true,
+                            newChatMode: tabIndex.value == 1,
+                            onNewChat: onNewChat,
+                            navigationBarHeight: HomePage._tabBarHeight,
+                            navigationBarBottomGap: HomePage._tabBarBottomGap,
+                            navigationBarWidth: navigationBarWidth,
+                            systemBottomInset: systemBottomInset,
+                            rightInset: Grid.gutter,
+                            navigationBarLeft: Grid.gutter,
+                          ),
                     ),
                   ),
                 ],
@@ -201,17 +221,10 @@ class HomePage extends HookConsumerWidget {
             ),
             bottomNavigationBar: _FloatingTabBar(
               selectedIndex: tabIndex.value,
-              hasUnreadInbox: hasUnreadInbox,
+              hasUnreadSolo: hasUnreadSolo,
               onDestinationSelected: (i) {
                 if (i == tabIndex.value) {
-                  switch (i) {
-                    case 0:
-                      homeReselection.value++;
-                    case 1:
-                      activityReselection.value++;
-                    case 2:
-                      searchReselection.value++;
-                  }
+                  if (i == 0) homeReselection.value++;
                   return;
                 }
                 tabContentTransitionDirection.value = i > tabIndex.value
@@ -301,13 +314,13 @@ class _HomeDestination {
 
 class _FloatingTabBar extends StatelessWidget {
   final int selectedIndex;
-  final bool hasUnreadInbox;
+  final bool hasUnreadSolo;
   final ValueChanged<int> onDestinationSelected;
   final List<_HomeDestination> destinations;
 
   const _FloatingTabBar({
     required this.selectedIndex,
-    required this.hasUnreadInbox,
+    this.hasUnreadSolo = false,
     required this.onDestinationSelected,
     required this.destinations,
   });
@@ -353,10 +366,10 @@ class _FloatingTabBar extends StatelessWidget {
                   decoration: BoxDecoration(
                     color: defaultTargetPlatform == TargetPlatform.iOS
                         ? Color.alphaBlend(
-                            colorScheme.primary.withValues(alpha: 0.06),
-                            colorScheme.primaryContainer,
+                            Colors.black.withValues(alpha: 0.05),
+                            context.controlSurface,
                           )
-                        : colorScheme.primaryContainer,
+                        : context.controlSurface,
                     borderRadius: BorderRadius.circular(
                       HomePage._selectedTabRadius,
                     ),
@@ -373,7 +386,7 @@ class _FloatingTabBar extends StatelessWidget {
                     child: _FloatingTabDestination(
                       destination: destinations[i],
                       selected: i == safeSelectedIndex,
-                      showUnreadBadge: i == 1 && hasUnreadInbox,
+                      showUnreadBadge: i == 1 && hasUnreadSolo,
                       onTap: () => onDestinationSelected(i),
                     ),
                   ),
@@ -387,6 +400,7 @@ class _FloatingTabBar extends StatelessWidget {
     final surface = defaultTargetPlatform == TargetPlatform.iOS
         ? ConcentricSheetSurface(
             key: const ValueKey('home-ios-glass-tabs'),
+            color: Colors.transparent,
             enabled: true,
             usesGlass: true,
             providesSheetSurface: false,
@@ -419,6 +433,7 @@ class _FloatingTabBar extends StatelessWidget {
           );
 
     return SafeArea(
+      maintainBottomViewPadding: true,
       minimum: const EdgeInsets.fromLTRB(
         HomePage._tabBarHorizontalMargin,
         0,
@@ -426,7 +441,7 @@ class _FloatingTabBar extends StatelessWidget {
         HomePage._tabBarBottomGap,
       ),
       child: Align(
-        alignment: Alignment.bottomCenter,
+        alignment: Alignment.bottomLeft,
         heightFactor: 1,
         child: DecoratedBox(
           decoration: BoxDecoration(
@@ -522,7 +537,9 @@ class _FloatingTabDestination extends StatelessWidget {
                         top: 0,
                         right: 0,
                         child: AnimatedScale(
-                          key: const ValueKey('activity-tab-unread-dot-scale'),
+                          key: ValueKey(
+                            '${destination.label.toLowerCase()}-tab-unread-dot-scale',
+                          ),
                           scale: selected ? 0 : 1,
                           alignment: const Alignment(-0.5, 0.5),
                           duration: reducedMotion
@@ -530,7 +547,9 @@ class _FloatingTabDestination extends StatelessWidget {
                               : HomePage._tabUnreadBadgeDuration,
                           curve: Curves.easeOutCubic,
                           child: Container(
-                            key: const ValueKey('activity-tab-unread-dot'),
+                            key: ValueKey(
+                              '${destination.label.toLowerCase()}-tab-unread-dot',
+                            ),
                             width: 12,
                             height: 12,
                             padding: const EdgeInsets.all(2),

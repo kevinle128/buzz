@@ -87,6 +87,12 @@ run_unit_tests() {
   run_test_step "buzz-auth unit tests" \
     cargo test -p buzz-auth --lib -- --nocapture
 
+  # Mesh JWKS proxy-bypass regression: infra-free loopback I/O with
+  # child-process environment isolation. --lib does not select its binary.
+  # Keep this fallback in step with `just test-unit`.
+  run_test_step "buzz-auth mesh JWKS proxy regression" \
+    cargo test -p buzz-auth --test mesh_jwks_proxy -- --nocapture
+
   # Cross-pod disconnect payload tests (NIP-FI and community archive fence;
   # infra-free). Mirrors `just test-unit`.
   run_test_step "buzz-pubsub conn_control tests" \
@@ -138,6 +144,12 @@ run_unit_tests() {
   run_test_step "buzz-admin community archive command tests" \
     cargo test -p buzz-admin communities -- --nocapture
 
+  run_test_step "buzz-admin partition audit outcome contract test" \
+    cargo test -p buzz-admin tests::partition_audit_outcomes_keep_their_json_names_and_exit_codes -- --exact --nocapture
+
+  run_test_step "buzz-admin NIP-FI binding command tests" \
+    cargo test -p buzz-admin nip_fi::tests -- --nocapture
+
   # Multi-tenant conformance gate: independent replay checker + golden
   # fixtures (buzz-conformance). Pure in-process trace replay, no infra.
   run_test_step "buzz-conformance tests" \
@@ -178,6 +190,9 @@ run_unit_tests() {
   run_test_step "buzz-relay push runtime tests" \
     cargo test -p buzz-relay --lib push_runtime:: -- --nocapture
 
+  run_test_step "buzz-relay operator listener tests" \
+    cargo test -p buzz-relay --lib operator_listener::tests:: -- --nocapture
+
   run_test_step "buzz-relay channel authorization tests" \
     cargo test -p buzz-relay --lib handlers::channel_authz:: -- --nocapture
 
@@ -186,6 +201,12 @@ run_unit_tests() {
 
   run_test_step "buzz-relay side-effects helper tests" \
     cargo test -p buzz-relay --lib handlers::side_effects::tests:: -- --nocapture
+
+  run_test_step "buzz-relay system channel scope tests" \
+    cargo test -p buzz-relay --lib handlers::system_channels::tests:: -- --nocapture
+
+  run_test_step "buzz-relay NIP-11 document tests" \
+    cargo test -p buzz-relay --lib nip11::tests:: -- --nocapture
 
   run_test_step "buzz-relay storage snapshot tests" \
     cargo test -p buzz-relay --lib storage_sweep::tests:: -- --nocapture
@@ -242,7 +263,16 @@ run_unit_tests() {
       handlers::req::tests::revoke_then_replacement_keeps_replacement_whole \
       handlers::req::tests::claims_after_connection_cleanup_are_refused \
       handlers::req::tests::dropped_terminal_frame_cancels_connection \
-      handlers::req::tests::revoke_dropped_terminal_frame_cancels_connection
+      handlers::req::tests::revoke_dropped_terminal_frame_cancels_connection \
+      handlers::req::tests::count_fallback_covers_filters_that_can_match_private_deletions \
+      handlers::req::tests::group_state_t_and_creator_tags_reach_sql_only_for_group_state_kinds
+
+  # Infra-free bridge search extension parser tests, by exact name: the rest of
+  # api::bridge::postgres_tests needs a database.
+  run_test_step "buzz-relay bridge search extension tests" \
+    cargo test -p buzz-relay --lib -- --exact --nocapture \
+      api::bridge::postgres_tests::bridge_search_mode_extension_accepts_prefix_snake_or_camel_case \
+      api::bridge::postgres_tests::bridge_search_sort_extension_selects_newest_only_when_named
 
   run_test_step "buzz-relay readiness tests" \
     cargo test -p buzz-relay --lib readiness::tests:: -- --nocapture
@@ -277,6 +307,9 @@ run_unit_tests() {
   run_test_step "buzz-relay API query parsing tests" \
     cargo test -p buzz-relay --lib api::parse_query_tests:: -- --nocapture
 
+  run_test_step "buzz-relay profile search request tests" \
+    cargo test -p buzz-relay --lib api::profiles:: -- --nocapture
+
   run_test_step "buzz-relay Git transport Off-mode precedence tests" \
     cargo test -p buzz-relay --lib api::git::transport::off_mode_precedence_tests:: -- --nocapture
 
@@ -288,6 +321,9 @@ run_unit_tests() {
 
   run_test_step "buzz-relay auth metrics contract tests" \
     cargo test -p buzz-relay --lib metrics::contract_tests:: -- --nocapture
+
+  run_test_step "buzz-relay partition alert series tests" \
+    cargo test -p buzz-relay --lib metrics::partition_alert_tests:: -- --nocapture
 
   local nip_fi_exact_tests=(
     audio::room::tests::roster_revisions_are_ordered_and_snapshot_is_authoritative
