@@ -471,13 +471,15 @@ export type SwitchManagedAgentModelStatus =
   | "failure";
 
 export type ControlResultFrame = {
-  type: "cancel_turn" | "switch_model";
+  type: "cancel_turn" | "switch_model" | "permission_decision";
   status: string;
   modelId?: string;
   /** Opaque per-pick id echoed from the request; correlates late frames. */
   requestId?: string;
   /** Buzz channel UUID from the observer envelope; disambiguates channels. */
   channelId?: string | null;
+  /** Present on `permission_decision` results — identifies the request card to retire. */
+  requestNonce?: string;
 };
 
 export type GitBashPrerequisite = {

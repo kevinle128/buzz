@@ -24,13 +24,14 @@ async function openBuzzProject(page: import("@playwright/test").Page) {
     .first();
   await expect(entry).toBeVisible({ timeout: 10_000 });
   await entry.click();
+  await page.getByTestId("project-home-context-repo-buzz").click();
 }
 
 async function openGithubPullRequests(page: import("@playwright/test").Page) {
   await enableProjectsFeature(page);
   await installMockBridge(page);
   await openBuzzProject(page);
-  await page.getByRole("tab", { name: "Pull Request", exact: true }).click();
+  await page.getByRole("tab", { name: "Review", exact: true }).click();
 }
 
 test("GitHub pull requests list, open read-only detail, and create #N", async ({
@@ -88,9 +89,12 @@ test("GitHub pull requests list, open read-only detail, and create #N", async ({
 
   await page
     .getByRole("navigation", { name: "Project breadcrumb" })
-    .getByRole("button", { name: "Pull Request", exact: true })
+    .getByRole("button", { name: "Review", exact: true })
     .click();
-  await page.getByRole("button", { name: "New pull request" }).click();
+  await page
+    .getByTestId("project-context-card")
+    .getByRole("button", { name: "Create review" })
+    .click();
   await page.getByTestId("create-pull-request-title").fill("New GitHub PR");
   await page.getByTestId("create-pull-request-body").fill("Created from Buzz");
   await page
@@ -100,10 +104,11 @@ test("GitHub pull requests list, open read-only detail, and create #N", async ({
     .getByTestId("create-pull-request-compare-branch")
     .selectOption("main");
   await page.getByTestId("create-pull-request-submit").click();
-  await expect(page.getByText("New GitHub PR", { exact: true })).toBeVisible({
-    timeout: 10_000,
-  });
-  await expect(page.getByText("#43", { exact: true })).toBeVisible();
+  const workspace = page.getByTestId("project-workspace-panel");
+  await expect(
+    workspace.getByRole("heading", { name: /New GitHub PR/ }),
+  ).toBeVisible({ timeout: 10_000 });
+  await expect(workspace.getByText("#43", { exact: true })).toBeVisible();
 
   const commands = await page.evaluate(
     () => window.__BUZZ_E2E_COMMANDS__ ?? [],

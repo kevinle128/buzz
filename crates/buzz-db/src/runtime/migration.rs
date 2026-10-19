@@ -710,8 +710,8 @@ mod postgres_tests {
         migrations.sort_by_key(|migration| migration.version);
 
         assert_eq!(migrations.len(), 68);
-        assert_eq!(migrations[66].version, 65);
-        let retire_ttl = strip_sql_comments(migrations[66].sql.as_str());
+        assert_eq!(migrations[64].version, 65);
+        let retire_ttl = strip_sql_comments(migrations[64].sql.as_str());
         for statement in [
             "SET LOCAL lock_timeout = '5s';",
             "DROP TRIGGER events_refresh_channel_ttl ON events;",
@@ -731,21 +731,31 @@ mod postgres_tests {
             .contains("ALTER TABLE push_leases DROP COLUMN app_profile"));
         assert_eq!(migrations[60].version, 61);
         assert!(migrations[60].sql.as_str().contains("ADD COLUMN labels"));
-        assert_eq!(migrations[63].version, 62);
-        assert!(migrations[63]
+        assert_eq!(migrations[61].version, 62);
+        assert!(migrations[61]
             .sql
             .as_str()
             .contains("ALTER TYPE channel_type ADD VALUE IF NOT EXISTS 'system'"));
-        assert_eq!(migrations[65].version, 64);
-        assert!(migrations[65]
+        assert_eq!(migrations[63].version, 64);
+        assert!(migrations[63]
             .sql
             .as_str()
             .contains("CREATE FUNCTION profile_name_fields"));
-        assert_eq!(migrations[67].version, 66);
-        assert!(migrations[67]
+        assert_eq!(migrations[65].version, 66);
+        assert!(migrations[65]
             .sql
             .as_str()
             .contains("CREATE TABLE community_nip_fi_issuers"));
+        // Fork-only migrations sit after the newest upstream version. When an
+        // upstream sync adds versions, move them past upstream again.
+        assert_eq!(migrations[66].version, 67);
+        assert_eq!(
+            &*migrations[66].description,
+            "workflow run route idempotency"
+        );
+        assert_eq!(migrations[67].version, 68);
+        assert_eq!(&*migrations[67].description, "app callback notifications");
+        assert!(migrations[67].sql.as_str().contains("CREATE TABLE apps"));
         assert_eq!(migrations[55].version, 56);
         assert!(migrations[55]
             .sql

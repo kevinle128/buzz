@@ -1532,25 +1532,25 @@ test("reduced motion removes addressed agents without spatial animation", async 
 test("post-send restore keeps a trailing space so typing does not collapse the mention", async ({
   page,
 }) => {
-  await seedAudience(page, [AGENT_A]);
   await installAudienceFixtures(page);
   await openThread(page);
 
   const composer = threadComposer(page);
   const input = composer.getByTestId("message-input");
+  await automaticallyMention(composer, "Morgarita");
   await expect(input).toHaveText("@Morgarita ");
 
   await input.pressSequentially("hello");
   await expect(input).toHaveText("@Morgarita hello");
   await expect(input.locator(".agent-mention-highlight")).toHaveCount(1);
 
-  await composer.getByTestId("send-message").click();
+  await input.press("Enter");
   await expect(input).toHaveText("@Morgarita ");
   await expect(input.locator(".agent-mention-highlight")).toHaveCount(1);
 
   // Regression for #4979: without the trailing space, the next keystroke
   // extends `@Morgarita` into `@Morgaritah` and drops the mention chip.
-  await input.pressSequentially("again");
+  await page.keyboard.type("again");
   await expect(input).toHaveText("@Morgarita again");
   await expect(input.locator(".agent-mention-highlight")).toHaveCount(1);
 });

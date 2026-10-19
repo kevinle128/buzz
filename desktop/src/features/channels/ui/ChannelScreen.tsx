@@ -415,9 +415,11 @@ export function ChannelScreen({
         respondToLookup,
         relaySelfPubkey,
         messageOwnerProfiles,
+        apps,
       ),
     [
       activeChannel,
+      apps,
       channelMembers,
       currentProfile?.avatarUrl,
       currentPubkey,

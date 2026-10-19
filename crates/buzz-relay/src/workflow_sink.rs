@@ -1504,6 +1504,7 @@ mod postgres_tests {
                     "reply",
                     &author_hex,
                     Some(&parent),
+                    None,
                 )
                 .await
             }

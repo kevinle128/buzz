@@ -6731,9 +6731,10 @@ sleep 1"#,
         // Setup: ask policy, observer + owner active, permission_decision channel installed.
         // A Pending entry is pre-planted with a known nonce so we can deliver a matching
         // decision without needing access to nonce generation inside the loop.
-        // The script immediately emits the terminal id=999 response (simulating the
-        // adapter continuing after the permission response was written to its stdin).
-        let script = r#"echo '{"jsonrpc":"2.0","id":999,"result":{"done":true}}'"#;
+        // The script reads the permission response from its stdin, then emits the
+        // terminal id=999 response, like an adapter that continues only after the
+        // response arrives. Staying alive until then keeps stdin open for the write.
+        let script = r#"IFS= read -r _; echo '{"jsonrpc":"2.0","id":999,"result":{"done":true}}'"#;
         let mut client = spawn_script(script).await;
 
         let config = ResolvedPermissionConfig::resolve(PermissionPolicy::Ask, None).unwrap();
@@ -6976,10 +6977,13 @@ sleep 1"#,
     /// Paused-time test: the permission deadline fires at exactly 300 seconds,
     /// idle is suspended while a Pending entry exists, and capacity recovers
     /// after more than eight sequential requests.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn ask_permission_deadline_idle_suspension_and_capacity_recovery() {
         // Script that emits nothing (simulates an agent waiting for permission response).
+        // Spawn on the real clock: spawn_script waits for the child's ready line
+        // under a timeout that a paused clock would expire before startup ends.
         let mut client = spawn_script("sleep 600").await;
+        tokio::time::pause();
         let config = ResolvedPermissionConfig::resolve(PermissionPolicy::Ask, None).unwrap();
         client.set_permission_config(config);
         client.set_owner_pubkey_known(true);
@@ -7044,7 +7048,9 @@ sleep 1"#,
         // ── Part 2: capacity recovery after 8 sequential requests ───────────
         // Clear any stale entries and verify 8+ sequential requests can succeed
         // when previous resolved entries are drained between turns.
+        tokio::time::resume();
         let mut client2 = spawn_script("sleep 600").await;
+        tokio::time::pause();
         client2.set_permission_config(
             ResolvedPermissionConfig::resolve(PermissionPolicy::Ask, None).unwrap(),
         );

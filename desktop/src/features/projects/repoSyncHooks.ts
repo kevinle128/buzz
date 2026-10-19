@@ -138,8 +138,11 @@ export function usePushProjectLocalRepositoryMutation(
         | { status: "skipped" | "unchanged" | "updated" }
         | { status: "failed"; error: string } = { status: "skipped" };
       if (
-        shouldPublishPullRequestUpdateAfterPush(project.cloneUrls[0]) &&
         pullRequest &&
+        shouldPublishPullRequestUpdateAfterPush(
+          project.cloneUrls[0],
+          pullRequest.id,
+        ) &&
         (pullRequest.status === "Open" || pullRequest.status === "Draft")
       ) {
         try {
