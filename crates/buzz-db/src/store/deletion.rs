@@ -4399,7 +4399,7 @@ mod postgres_tests {
         })
         .await
         .expect("connect isolated migration DB");
-        crate::migration::run_migrations_through(&db.pool, 66)
+        crate::migration::run_migrations_through(&db.pool, 68)
             .await
             .expect("migrate with fence objects present");
         let store = db.deletion_store();
@@ -4414,6 +4414,8 @@ mod postgres_tests {
                 // will; this change itself ships no schema changes.
                 sqlx::raw_sql(r#"
 DROP TRIGGER IF EXISTS community_write_fence_api_tokens ON api_tokens;
+DROP TRIGGER IF EXISTS community_write_fence_app_callback_deliveries ON app_callback_deliveries;
+DROP TRIGGER IF EXISTS community_write_fence_apps ON apps;
 DROP TRIGGER IF EXISTS community_write_fence_archived_identities ON archived_identities;
 DROP TRIGGER IF EXISTS community_write_fence_artifact_heads ON artifact_heads;
 DROP TRIGGER IF EXISTS community_write_fence_artifact_revisions ON artifact_revisions;
