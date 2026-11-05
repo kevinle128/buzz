@@ -1,3 +1,4 @@
+import 'message_swipe_reply.dart';
 import 'agent_reply_handoff.dart';
 import 'huddle_timeline.dart';
 import '../../shared/widgets/modal_presentation.dart';
@@ -10,7 +11,7 @@ import 'dart:ui' show ImageFilter, lerpDouble;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/rendering.dart' show ScrollDirection;
+import 'package:flutter/rendering.dart' show ScrollCacheExtent, ScrollDirection;
 import 'package:flutter/services.dart';
 import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
@@ -55,8 +56,8 @@ import 'channel_management_provider.dart';
 import 'channel_sections/channel_sections_provider.dart';
 import 'channel_messages_provider.dart';
 import 'channel_typing_provider.dart';
-import 'channel_typing_indicator.dart';
 import 'inline_agent_typing.dart';
+import 'channel_ids_by_name_provider.dart';
 import 'channels_provider.dart';
 import 'unread_badge/observed_unread_event.dart';
 import 'compose_bar.dart';
@@ -138,7 +139,7 @@ Future<bool> _preloadMembers(
     final members = await ref.read(channelMembersProvider(channelId).future);
     await notifier.preload(members.map((member) => member.pubkey).toList());
     if (refreshDmParticipants) {
-      return notifier.refresh(participantPubkeys);
+      return await notifier.refresh(participantPubkeys);
     }
     return true;
   } catch (_) {
@@ -306,7 +307,14 @@ class _ResolvedChannelDetailPage extends HookConsumerWidget {
     );
     final mePlacement = personalChat ? ref.watch(meGroupsProvider) : null;
     final detailsAsync = ref.watch(channelDetailsProvider(channel.id));
-    final channelsAsync = ref.watch(channelsProvider);
+    // Only this channel's entry: the list republishes on every live event.
+    final listedChannel = ref.watch(
+      channelsProvider.select(
+        (channels) => channels.value
+            ?.where((candidate) => candidate.id == channel.id)
+            .firstOrNull,
+      ),
+    );
     final huddleLifecycle =
         ref.watch(huddleLifecycleProvider(channel.id)).value ?? const [];
     final sessionStatus = ref.watch(relaySessionProvider).status;
@@ -364,16 +372,7 @@ class _ResolvedChannelDetailPage extends HookConsumerWidget {
               e.pubkey.toLowerCase() != currentPubkey.toLowerCase(),
         )
         .toList();
-    final baseChannel =
-        channelsAsync
-            .whenData(
-              (channels) => channels.firstWhere(
-                (candidate) => candidate.id == channel.id,
-                orElse: () => channel,
-              ),
-            )
-            .value ??
-        channel;
+    final baseChannel = listedChannel ?? channel;
     final resolvedChannel =
         detailsAsync.whenData(baseChannel.mergeDetails).value ?? baseChannel;
     final participantCount = resolvedChannel.participantPubkeys
@@ -817,9 +816,7 @@ class _ResolvedChannelDetailPage extends HookConsumerWidget {
                           data: (events) {
                             return _MessageList(
                               notifier: ref.watch(messagesProvider.notifier),
-                              inlineTyping: personalChat
-                                  ? typingEntries
-                                  : const [],
+                              inlineTyping: typingEntries,
                               stickyDateHeaderState: stickyDateHeaderState,
                               entries: timelineEntries,
                               allMessages: timelineMessages,
@@ -869,19 +866,6 @@ class _ResolvedChannelDetailPage extends HookConsumerWidget {
               if (!resolvedChannel.isForum &&
                   (!resolvedChannel.isMember ||
                       resolvedChannel.isArchived)) ...[
-                AnimatedSize(
-                  duration: MediaQuery.disableAnimationsOf(context)
-                      ? Duration.zero
-                      : const Duration(milliseconds: 180),
-                  curve: Curves.easeOutCubic,
-                  alignment: Alignment.bottomCenter,
-                  child: personalChat || typingEntries.isEmpty
-                      ? const SizedBox.shrink()
-                      : ChannelTypingIndicator(
-                          channelId: resolvedChannel.id,
-                          entries: typingEntries,
-                        ),
-                ),
                 if (!resolvedChannel.isDm)
                   _ReadOnlyNotice(channel: resolvedChannel),
               ],
@@ -900,19 +884,6 @@ class _ResolvedChannelDetailPage extends HookConsumerWidget {
                   child: Column(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      AnimatedSize(
-                        duration: MediaQuery.disableAnimationsOf(context)
-                            ? Duration.zero
-                            : const Duration(milliseconds: 180),
-                        curve: Curves.easeOutCubic,
-                        alignment: Alignment.bottomCenter,
-                        child: personalChat || typingEntries.isEmpty
-                            ? const SizedBox.shrink()
-                            : ChannelTypingIndicator(
-                                channelId: resolvedChannel.id,
-                                entries: typingEntries,
-                              ),
-                      ),
                       ?assistant.pendingNotice,
                       ComposeBar(
                         channelId: channel.id,
@@ -936,9 +907,11 @@ class _ResolvedChannelDetailPage extends HookConsumerWidget {
                               }
                               var recipients = mentionPubkeys;
                               if (personalChat) {
-                                if (mePlacement?.asData?.value.channels
-                                        .contains(channel.id) !=
-                                    true) {
+                                if (!resolvedChannel.isPersonalChat(
+                                  ref.read(myPubkeyProvider),
+                                  mePlacement?.asData?.value.channels ??
+                                      const [],
+                                )) {
                                   throw StateError(
                                     'Refresh Solo before sending to this chat.',
                                   );

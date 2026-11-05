@@ -91,6 +91,10 @@ class _MessageList extends HookConsumerWidget {
     final oldestUnreadMessageId = useState<String?>(null);
     final unreadBoundaryLoadFailed = useState(false);
     final unreadBoundaryFetchCount = useRef(0);
+    // Reaching the oldest page publishes no messages, so nothing else
+    // rebuilds this list to re-run the unread effect below. A count, not a
+    // flag: a reconnect can reset the notifier and reach the oldest page again.
+    final unreadBoundaryReachedOldestCount = useState(0);
     final hasUnreadDeepLink =
         initialMessageId != null || initialThreadRootId != null;
     final dayTimestampByReversedIndex = <int, int>{};
@@ -172,7 +176,10 @@ class _MessageList extends HookConsumerWidget {
           unawaited(
             Future<void>(() async {
               final loaded = await notifier.fetchOlder();
-              if (!cancelled && !loaded && !notifier.reachedOldest) {
+              if (cancelled || loaded) return;
+              if (notifier.reachedOldest) {
+                unreadBoundaryReachedOldestCount.value += 1;
+              } else {
                 unreadBoundaryLoadFailed.value = true;
               }
             }),
@@ -810,14 +817,7 @@ class _MessageList extends HookConsumerWidget {
     }
     if (entries.isEmpty) return const _EmptyMessages();
 
-    // Build channel names map once for all message bubbles.
-    final channelsAsync = ref.watch(channelsProvider);
-    final channelNamesMap = <String, String>{};
-    channelsAsync.whenData((channels) {
-      for (final ch in channels) {
-        channelNamesMap[ch.name.toLowerCase()] = ch.id;
-      }
-    });
+    final channelNamesMap = ref.watch(channelIdsByNameProvider);
 
     return Stack(
       children: [
@@ -962,6 +962,13 @@ class _MessageList extends HookConsumerWidget {
                         if (message.isSystem)
                           _SystemMessageRow(
                             message: message,
+                            startsDay: showDayDivider,
+                            endsDay:
+                                nextMessage != null &&
+                                !isSameDay(
+                                  message.createdAt,
+                                  nextMessage.createdAt,
+                                ),
                             groupedMessages: entryGroup.length > 1
                                 ? entryGroup
                                       .map((entry) => entry.message)
@@ -976,6 +983,13 @@ class _MessageList extends HookConsumerWidget {
                         else ...[
                           _MessageBubble(
                             message: message,
+                            startsDay: showDayDivider,
+                            endsDay:
+                                nextMessage != null &&
+                                !isSameDay(
+                                  message.createdAt,
+                                  nextMessage.createdAt,
+                                ),
                             showAuthor:
                                 showAuthor ||
                                 isRecentAgentReplyHandoff(

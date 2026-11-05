@@ -346,7 +346,8 @@ pub(crate) async fn upload_blob(
         let strict = BlossomStrictness::Strict;
         buzz_media::auth::verify_blossom_auth_event(&event, Some(&tenant_host), strict)
             .map_err(drop)
-    });
+    })
+    .await;
     let headers_clone = headers.clone();
     let admission = match admit_nip_fi_http_on_state(&state, &headers, move || {
         let auth_event = extract_blossom_auth(&headers_clone).map_err(|e| e.into_response())?;
@@ -356,7 +357,9 @@ pub(crate) async fn upload_blob(
             .map_err(|e| e.into_response())?;
         let pubkey = auth_event.pubkey;
         Ok(Nip98Proof::new(pubkey, auth_event))
-    }) {
+    })
+    .await
+    {
         Ok(a) => a,
         Err(resp) => return resp,
     };
@@ -880,11 +883,14 @@ pub(crate) async fn get_blob(
             BlossomStrictness::Strict,
         )
         .map(drop)
-    });
+    })
+    .await;
     let admission = match admit_nip_fi_http_on_state(&state, &req_headers, move || {
         extract_blossom_read_proof(&headers_clone, &sha256, &tenant_host, strictness)
             .map_err(|e| e.into_response())
-    }) {
+    })
+    .await
+    {
         Ok(a) => a,
         Err(resp) => return Ok(resp),
     };
@@ -1159,6 +1165,7 @@ pub(crate) async fn head_blob(
     Query(query): Query<MediaReadQuery>,
 ) -> Result<Response, MediaDenial> {
     validate_media_path(&sha256_ext)?;
+<<<<<<< HEAD
     let (tenant, public_share) = if let Some(share_event) = query.share.as_deref() {
         let tenant = bind_media_read_tenant(&state, &headers).await?;
         authorize_public_share(&state, &tenant, share_event, &sha256_ext).await?;
@@ -1191,6 +1198,34 @@ pub(crate) async fn head_blob(
         let auth_event = admission.into_extra();
         enforce_blossom_read_membership(&state, &tenant, &auth_event, &headers, strictness).await?;
         (tenant, false)
+=======
+    // Row zero: bind tenant. Blossom auth extraction and NIP-FI admission follow
+    // so that in Enforce mode a missing/malformed Authorization header produces
+    // NIP-FI denial bytes (not legacy MediaError JSON). [FI-TRACE-AUTHORITY-UNIFORM]
+    let tenant = bind_media_read_tenant(&state, &headers).await?;
+    let sha256 = sha256_ext
+        .split('.')
+        .next()
+        .unwrap_or(&sha256_ext)
+        .to_owned();
+    let strictness = blossom_strictness_from_state(&state);
+    let tenant_host = tenant.host().to_owned();
+    let headers_clone = headers.clone();
+    use crate::nip_fi_http::admit_nip_fi_http_on_state;
+    crate::nip_fi_shadow::observe_strict_proof(&state, &headers, "blossom", || {
+        extract_blossom_read_proof(&headers, &sha256, &tenant_host, BlossomStrictness::Strict)
+            .map(drop)
+    })
+    .await;
+    let admission = match admit_nip_fi_http_on_state(&state, &headers, move || {
+        extract_blossom_read_proof(&headers_clone, &sha256, &tenant_host, strictness)
+            .map_err(|e| e.into_response())
+    })
+    .await
+    {
+        Ok(a) => a,
+        Err(resp) => return Ok(resp),
+>>>>>>> upstream/main
     };
     let cache_control = blob_cache_control();
 
@@ -4504,7 +4539,9 @@ mod tests {
                 &keys.public_key().to_hex(),
                 "member",
                 None,
+                &nostr::Keys::generate(),
             ))
+            .map(|write| write.outcome)
             .expect("add relay member");
             let assertion = signed_assertion(&keys.public_key().to_hex());
             let proof = blossom_get_auth_value(&keys, &host, &"a".repeat(64));

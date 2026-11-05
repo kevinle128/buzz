@@ -115,9 +115,7 @@ class _CustomSectionHeader extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final sectionColor = context.colors.brightness == Brightness.dark
-        ? const Color(0xFF595959)
-        : const Color(0xFF959595);
+    final sectionColor = navigationMetadataForeground(context);
     return GestureDetector(
       onTap: onToggle,
       behavior: HitTestBehavior.opaque,
@@ -138,14 +136,13 @@ class _CustomSectionHeader extends StatelessWidget {
               ),
             ),
             Builder(
-              builder: (buttonContext) => IconButton(
+              builder: (buttonContext) => _SectionOptionsButton(
                 key: ValueKey('section-menu-${section.id}'),
                 tooltip: '${section.name} options',
-                visualDensity: VisualDensity.compact,
                 icon: Icon(
                   BuzzIcons.ellipsisVertical,
                   size: _kChannelIconSize,
-                  color: sectionColor,
+                  color: navigationSecondaryForeground(context),
                 ),
                 onPressed: () async {
                   final value = await showAnchoredPopover<String>(
@@ -209,7 +206,6 @@ class _CustomSectionHeader extends StatelessWidget {
                 },
               ),
             ),
-            const SizedBox(width: Grid.quarter),
           ],
         ),
       ),
@@ -470,9 +466,7 @@ class _SectionHeader extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final sectionColor = context.colors.brightness == Brightness.dark
-        ? const Color(0xFF595959)
-        : const Color(0xFF959595);
+    final sectionColor = navigationMetadataForeground(context);
 
     return GestureDetector(
       onTap: onToggle,
@@ -495,29 +489,19 @@ class _SectionHeader extends StatelessWidget {
             ),
             if (sortMode case final mode?) ...[
               Builder(
-                builder: (buttonContext) => IconButton(
+                builder: (buttonContext) => _SectionOptionsButton(
                   key: ValueKey('sort-menu-$label'),
                   tooltip: '$label options',
-                  visualDensity: VisualDensity.compact,
                   icon: Icon(
                     BuzzIcons.ellipsisVertical,
                     size: _kChannelIconSize,
-                    color: sectionColor,
+                    color: navigationSecondaryForeground(context),
                   ),
                   onPressed: () async {
                     final value = await showAnchoredPopover<String>(
                       context: buttonContext,
                       width: 216,
                       alignment: AnchoredPopoverAlignment.end,
-                      color: context.colors.surface,
-                      elevation: 4,
-                      shadowColor: context.colors.shadow.withValues(
-                        alpha: 0.18,
-                      ),
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(Radii.md),
-                        side: BorderSide(color: context.colors.outline),
-                      ),
                       surfaceKey: ValueKey('sort-popover-$label'),
                       items: _sortMenuItems(mode, showDivider: false),
                     );
@@ -529,7 +513,6 @@ class _SectionHeader extends StatelessWidget {
                   },
                 ),
               ),
-              const SizedBox(width: Grid.quarter),
             ],
           ],
         ),
@@ -564,7 +547,10 @@ class _SectionLabel extends StatelessWidget {
         ),
       ),
       const SizedBox(width: Grid.quarter),
-      _SectionChevron(expanded: expanded, color: color),
+      _SectionChevron(
+        expanded: expanded,
+        color: navigationSecondaryForeground(context),
+      ),
     ],
   );
 }
@@ -586,4 +572,36 @@ class _SectionChevron extends StatelessWidget {
       child: Icon(BuzzIcons.chevronDown, size: _kChannelIconSize, color: color),
     );
   }
+}
+
+class _SectionOptionsButton extends StatelessWidget {
+  const _SectionOptionsButton({
+    super.key,
+    required this.tooltip,
+    required this.icon,
+    required this.onPressed,
+  });
+
+  final String tooltip;
+  final Widget icon;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) => Semantics(
+    button: true,
+    label: tooltip,
+    onTap: onPressed,
+    excludeSemantics: true,
+    child: Tooltip(
+      message: tooltip,
+      child: SizedBox.square(
+        dimension: 40,
+        child: InkWell(
+          onTap: onPressed,
+          borderRadius: BorderRadius.circular(Radii.full),
+          child: Align(alignment: Alignment.centerRight, child: icon),
+        ),
+      ),
+    ),
+  );
 }

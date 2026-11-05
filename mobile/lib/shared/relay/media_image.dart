@@ -6,13 +6,14 @@ import 'package:flutter/material.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:http/http.dart' as http;
 
+import '../hosted/hosted_relay_auth.dart';
 import 'media_auth.dart';
 
 /// Shared, keep-alive HTTP client for media fetches. One client per container
 /// so TLS connections are reused across images instead of re-handshaking per
 /// fetch. Override in tests to stub the network.
 final mediaHttpClientProvider = Provider<http.Client>((ref) {
-  final client = http.Client();
+  final client = ref.watch(hostedHttpClientFactoryProvider)();
   ref.onDispose(client.close);
   return client;
 });
@@ -132,7 +133,7 @@ class MediaImageProvider extends ImageProvider<MediaImageProvider> {
       }
       onBytesLoaded?.call(bytes);
       final buffer = await ui.ImmutableBuffer.fromUint8List(bytes);
-      return decode(buffer);
+      return await decode(buffer);
     } catch (_) {
       // Match NetworkImage: make sure an errored key is not retained in the
       // cache. The cooldown map (not the cache) throttles retries.
