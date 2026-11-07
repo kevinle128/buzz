@@ -32,7 +32,7 @@ pub enum ConfigError {
 /// # Role resolution (nip98 mode only)
 ///
 /// In `nip98` mode the authenticated pubkey is resolved to an
-/// `AdminPrincipal` at request time via [`crate::api::admin::auth::resolve_admin_principal`]:
+/// `AdminPrincipal` at request time via [`crate::api::admin::auth::lookup_admin_principal`]:
 /// - `Operator/Config` if pubkey ∈ `RELAY_OPERATOR_PUBKEYS`
 /// - `Operator/OwnerFallback` if pubkey == `RELAY_OWNER_PUBKEY` **and**
 ///   `RELAY_OPERATOR_PUBKEYS` is empty (evaluated from config, never runtime rows)
@@ -127,10 +127,6 @@ pub struct Config {
     /// `0` (the default) disables bounded-staleness replica routing; see
     /// [`buzz_db::DbConfig::replica_read_max_age_ms`].
     pub replica_read_max_age_ms: u64,
-    /// Replica freshness budget for fleet usage telemetry
-    /// (`BUZZ_USAGE_METRICS_REPLICA_MAX_AGE_MS`). Independent of serving-read
-    /// routing; defaults to 30 seconds and `0` disables telemetry DB queries.
-    pub usage_metrics_replica_max_age_ms: u64,
 
     /// Upper bound, in milliseconds, of the per-connection random delay applied
     /// when sending the `1012 Service Restart` close frame during graceful
@@ -180,6 +176,9 @@ pub struct Config {
     pub max_frame_bytes: usize,
     /// Number of consecutive buffer-full events tolerated before cancelling a slow client.
     pub slow_client_grace_limit: u8,
+    /// `BUZZ_CLIENT_IP_HEADER`: the request header whose IP access lines log
+    /// as `client_ip`. `None` logs only the TCP `peer_addr`.
+    pub client_ip_header: Option<axum::http::HeaderName>,
     /// Authentication provider configuration.
     pub auth: buzz_auth::AuthConfig,
     /// Whether REST API requests must present a valid token. Independent of
@@ -292,6 +291,10 @@ pub struct Config {
     /// Configured operator-listener identities and their HTTP(S) delivery URLs.
     pub operator_listener_delivery_urls: HashMap<String, url::Url>,
 
+    /// Endpoint receiving each new per-community storage snapshot
+    /// (`BUZZ_STORAGE_USAGE_URL`). Unset disables storage-usage delivery.
+    pub storage_usage_delivery_url: Option<url::Url>,
+
     /// Allow NIP-OA owner attestation for relay membership.
     ///
     /// When `true` and `require_relay_membership` is also `true`, agents
@@ -379,6 +382,9 @@ pub struct Config {
     /// documents or age attestation are configured.
     pub join_policy: Option<JoinPolicyConfig>,
 
+    /// Absolute UTC Unix-second cutoff for legacy v1 invites; unset drains naturally.
+    pub invite_v1_invalid_after: Option<u64>,
+
     /// Deployment-admin API and SPA configuration. Absent means the surface is disabled.
     pub admin: Option<AdminConfig>,
 
@@ -404,6 +410,10 @@ pub struct Config {
     /// Parsed whatever the NIP-FI mode, since creation happens in every mode.
     pub nip_fi_provision_binding: Option<buzz_auth::ProvisionBindingPolicy>,
 
+    /// Permit new irreversible FI upgrade acceptances. Default off; receipt
+    /// recovery/status remain available (`BUZZ_NIP_FI_UPGRADES_ENABLED`).
+    pub nip_fi_upgrades_enabled: bool,
+
     /// Database resolver bounds (`BUZZ_NIP_FI_RESOLVER_*`,
     /// `BUZZ_NIP_FI_SNAPSHOT_*`). Validated in every mode, so a bad value
     /// fails the deploy that sets it, not the later switch to shadow.
@@ -413,6 +423,41 @@ pub struct Config {
 fn parse_bind_addr(raw: &str) -> Result<SocketAddr, ConfigError> {
     raw.parse::<SocketAddr>()
         .map_err(|e| ConfigError::InvalidBindAddr(e.to_string()))
+}
+
+fn parse_invite_v1_cutoff(raw: Option<&str>) -> Result<Option<u64>, ConfigError> {
+    raw.map(|value| {
+        chrono::DateTime::parse_from_rfc3339(value)
+            .ok()
+            .filter(|time| time.offset().local_minus_utc() == 0 && time.timestamp_subsec_nanos() == 0)
+            .and_then(|time| u64::try_from(time.timestamp()).ok())
+            .ok_or_else(|| ConfigError::InvalidValue(
+                "BUZZ_INVITE_V1_INVALID_AFTER must be a UTC RFC3339 timestamp with whole seconds".into(),
+            ))
+    }).transpose()
+}
+
+fn invite_v1_cutoff_from_env() -> Result<Option<u64>, ConfigError> {
+    match std::env::var("BUZZ_INVITE_V1_INVALID_AFTER") {
+        Ok(raw) => parse_invite_v1_cutoff(Some(&raw)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(ConfigError::InvalidValue(
+            "BUZZ_INVITE_V1_INVALID_AFTER must be valid Unicode".into(),
+        )),
+    }
+}
+
+/// An empty value turns the setting off; header names match case-insensitively.
+fn parse_client_ip_header(raw: &str) -> Result<Option<axum::http::HeaderName>, ConfigError> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    axum::http::HeaderName::from_bytes(raw.to_ascii_lowercase().as_bytes())
+        .map(Some)
+        .map_err(|_| {
+            ConfigError::InvalidValue(format!("BUZZ_CLIENT_IP_HEADER is not a header name: {raw}"))
+        })
 }
 
 fn positive_u64_from_env(name: &str, default: u64) -> Result<u64, ConfigError> {
@@ -663,16 +708,6 @@ impl Config {
             })?,
             Err(_) => 0,
         };
-        let usage_metrics_replica_max_age_ms =
-            match std::env::var("BUZZ_USAGE_METRICS_REPLICA_MAX_AGE_MS") {
-                Ok(raw) => raw.trim().parse::<u64>().map_err(|_| {
-                    ConfigError::InvalidValue(
-                        "BUZZ_USAGE_METRICS_REPLICA_MAX_AGE_MS must be a non-negative integer"
-                            .to_string(),
-                    )
-                })?,
-                Err(_) => 30_000,
-            };
 
         // Drain jitter: 0 = off (default). Clamp oversized values so every
         // delayed close is initiated with ten seconds left in the relay's
@@ -760,6 +795,9 @@ impl Config {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(15);
+
+        let client_ip_header =
+            parse_client_ip_header(&std::env::var("BUZZ_CLIENT_IP_HEADER").unwrap_or_default())?;
 
         let require_auth_token = std::env::var("BUZZ_REQUIRE_AUTH_TOKEN")
             .map(|v| v == "true" || v == "1")
@@ -901,6 +939,18 @@ impl Config {
                 )));
             }
         };
+        let storage_usage_delivery_url = match std::env::var("BUZZ_STORAGE_USAGE_URL") {
+            Ok(raw) => Some(
+                crate::storage_usage_delivery::parse_delivery_url(&raw)
+                    .map_err(ConfigError::InvalidValue)?,
+            ),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(error) => {
+                return Err(ConfigError::InvalidValue(format!(
+                    "BUZZ_STORAGE_USAGE_URL must be valid UTF-8: {error}"
+                )));
+            }
+        };
         if !operator_listener_delivery_urls.is_empty() && relay_operator_api_origin.is_none() {
             error!(
                 "BUZZ_OPERATOR_LISTENERS is set but RELAY_OPERATOR_API_ORIGIN is not — operator-listener registration requests will reject every request until RELAY_OPERATOR_API_ORIGIN is set"
@@ -976,15 +1026,7 @@ impl Config {
             s3_secret_key: std::env::var("BUZZ_S3_SECRET_KEY")
                 .unwrap_or_else(|_| "buzz_dev_secret".to_string()),
             s3_bucket: std::env::var("BUZZ_S3_BUCKET").unwrap_or_else(|_| "buzz-media".to_string()),
-            s3_prefix: match std::env::var("BUZZ_S3_PREFIX") {
-                Ok(value) => value,
-                Err(std::env::VarError::NotPresent) => String::new(),
-                Err(_) => {
-                    return Err(ConfigError::InvalidValue(
-                        "BUZZ_S3_PREFIX must be valid Unicode".to_string(),
-                    ))
-                }
-            },
+            s3_prefix: std::env::var("BUZZ_S3_PREFIX").unwrap_or_default(),
             s3_region: std::env::var("BUZZ_S3_REGION")
                 .or_else(|_| std::env::var("AWS_REGION"))
                 .unwrap_or_else(|_| "us-east-1".to_string()),
@@ -1022,8 +1064,6 @@ impl Config {
                 .map(|s| s.trim().to_lowercase())
                 .filter(|s| !s.is_empty()),
         };
-        buzz_media::config::normalize_s3_prefix(&media.s3_prefix)
-            .map_err(ConfigError::InvalidValue)?;
         let media_max_concurrent_uploads: usize =
             std::env::var("BUZZ_MEDIA_MAX_CONCURRENT_UPLOADS")
                 .ok()
@@ -1411,7 +1451,6 @@ impl Config {
             database_url,
             read_database_url,
             replica_read_max_age_ms,
-            usage_metrics_replica_max_age_ms,
             drain_jitter_ms,
             redis_url,
             redis_pool_size,
@@ -1424,6 +1463,7 @@ impl Config {
             send_buffer_size,
             max_frame_bytes,
             slow_client_grace_limit,
+            client_ip_header,
             auth,
             require_auth_token,
             buzz_v1_enabled,
@@ -1445,6 +1485,7 @@ impl Config {
             relay_operator_api_origin,
             relay_operator_pubkeys,
             operator_listener_delivery_urls,
+            storage_usage_delivery_url,
             allow_nip_oa_auth,
             klipy,
             media,
@@ -1468,10 +1509,12 @@ impl Config {
             push_gateway_timeout,
             operator_listener_timeout,
             join_policy,
+            invite_v1_invalid_after: invite_v1_cutoff_from_env()?,
             admin,
             web_dir,
             serve_git_web_gui,
             nip_fi_provision_binding,
+            nip_fi_upgrades_enabled: parse_bool("BUZZ_NIP_FI_UPGRADES_ENABLED", false)?,
             nip_fi_resolver_bounds,
             nip_fi,
         })
@@ -1542,6 +1585,37 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let cfg = ENV_MUTEX.lock().unwrap();
         (fi, cfg)
+    }
+
+    #[test]
+    fn nip_fi_upgrade_acceptance_is_explicitly_default_off() {
+        let (_fi, _cfg) = env_guards();
+        let before = std::env::var("BUZZ_NIP_FI_UPGRADES_ENABLED").ok();
+        std::env::remove_var("BUZZ_NIP_FI_UPGRADES_ENABLED");
+        assert!(!Config::from_env().unwrap().nip_fi_upgrades_enabled);
+        for value in ["true", "TRUE", "1", "on", " On "] {
+            std::env::set_var("BUZZ_NIP_FI_UPGRADES_ENABLED", value);
+            assert!(
+                Config::from_env().unwrap().nip_fi_upgrades_enabled,
+                "{value}"
+            );
+        }
+        for value in ["false", "FALSE", "0", "off", "", " Off "] {
+            std::env::set_var("BUZZ_NIP_FI_UPGRADES_ENABLED", value);
+            assert!(
+                !Config::from_env().unwrap().nip_fi_upgrades_enabled,
+                "{value}"
+            );
+        }
+        std::env::set_var("BUZZ_NIP_FI_UPGRADES_ENABLED", "treu");
+        assert!(
+            matches!(Config::from_env(), Err(ConfigError::InvalidValue(message))
+            if message.contains("BUZZ_NIP_FI_UPGRADES_ENABLED must be true or false"))
+        );
+        match before {
+            Some(value) => std::env::set_var("BUZZ_NIP_FI_UPGRADES_ENABLED", value),
+            None => std::env::remove_var("BUZZ_NIP_FI_UPGRADES_ENABLED"),
+        }
     }
 
     // The three `source=database` startup guards. Mutation: dropping any one
@@ -2194,52 +2268,7 @@ mod tests {
     }
 
     #[test]
-<<<<<<< HEAD
-    fn s3_prefix_env_defaults_empty_and_rejects_unsafe_values() {
-        let _guards = env_guards();
-        let previous = std::env::var_os("BUZZ_S3_PREFIX");
-        std::env::remove_var("BUZZ_S3_PREFIX");
-        let default = Config::from_env();
-        std::env::set_var("BUZZ_S3_PREFIX", "buzz-media");
-        let configured = Config::from_env();
-        std::env::set_var("BUZZ_S3_PREFIX", "../other");
-        let invalid = Config::from_env();
-        match previous {
-            Some(value) => std::env::set_var("BUZZ_S3_PREFIX", value),
-            None => std::env::remove_var("BUZZ_S3_PREFIX"),
-        }
-        assert_eq!(default.expect("default prefix").media.s3_prefix, "");
-        assert_eq!(
-            configured.expect("configured prefix").media.s3_prefix,
-            "buzz-media"
-        );
-        assert!(
-            matches!(invalid, Err(ConfigError::InvalidValue(ref message)) if message.contains("BUZZ_S3_PREFIX"))
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn s3_prefix_env_rejects_non_unicode_values() {
-        use std::os::unix::ffi::OsStringExt;
-        let _guards = env_guards();
-        let previous = std::env::var_os("BUZZ_S3_PREFIX");
-        std::env::set_var("BUZZ_S3_PREFIX", std::ffi::OsString::from_vec(vec![0xff]));
-        let invalid = Config::from_env();
-        match previous {
-            Some(value) => std::env::set_var("BUZZ_S3_PREFIX", value),
-            None => std::env::remove_var("BUZZ_S3_PREFIX"),
-        }
-        assert!(
-            matches!(invalid, Err(ConfigError::InvalidValue(ref message)) if message.contains("BUZZ_S3_PREFIX must be valid Unicode"))
-        );
-    }
-
-    #[test]
-    fn partition_manager_advance_is_opt_in_and_parses_strictly() {
-=======
     fn partition_manager_advance_defaults_on_and_parses_strictly() {
->>>>>>> upstream/main
         let _guards = env_guards();
         let previous = std::env::var_os("BUZZ_PARTITION_MANAGER_ADVANCE_ENABLED");
 
@@ -2480,35 +2509,6 @@ mod tests {
             ),
             other => panic!("old env name must hard-fail startup, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn usage_metrics_replica_budget_defaults_on_independently_of_serving_reads() {
-        let _guard = ENV_MUTEX.lock().unwrap();
-        let previous_usage = std::env::var_os("BUZZ_USAGE_METRICS_REPLICA_MAX_AGE_MS");
-        let previous_serving = std::env::var_os("BUZZ_REPLICA_READ_MAX_AGE_MS");
-
-        std::env::remove_var("BUZZ_USAGE_METRICS_REPLICA_MAX_AGE_MS");
-        std::env::remove_var("BUZZ_REPLICA_READ_MAX_AGE_MS");
-        let defaults = Config::from_env().expect("config");
-
-        std::env::set_var("BUZZ_USAGE_METRICS_REPLICA_MAX_AGE_MS", "0");
-        let disabled = Config::from_env().expect("config");
-
-        if let Some(value) = previous_usage {
-            std::env::set_var("BUZZ_USAGE_METRICS_REPLICA_MAX_AGE_MS", value);
-        } else {
-            std::env::remove_var("BUZZ_USAGE_METRICS_REPLICA_MAX_AGE_MS");
-        }
-        if let Some(value) = previous_serving {
-            std::env::set_var("BUZZ_REPLICA_READ_MAX_AGE_MS", value);
-        } else {
-            std::env::remove_var("BUZZ_REPLICA_READ_MAX_AGE_MS");
-        }
-
-        assert_eq!(defaults.replica_read_max_age_ms, 0);
-        assert_eq!(defaults.usage_metrics_replica_max_age_ms, 30_000);
-        assert_eq!(disabled.usage_metrics_replica_max_age_ms, 0);
     }
 
     #[test]
@@ -2968,6 +2968,17 @@ mod tests {
     }
 
     #[test]
+    fn client_ip_header_is_off_when_empty_and_case_insensitive() {
+        assert_eq!(parse_client_ip_header("").unwrap(), None);
+        assert_eq!(parse_client_ip_header("  ").unwrap(), None);
+        assert_eq!(
+            parse_client_ip_header(" CF-Connecting-IP ").unwrap(),
+            Some(axum::http::HeaderName::from_static("cf-connecting-ip"))
+        );
+        assert!(parse_client_ip_header("not a header").is_err());
+    }
+
+    #[test]
     fn invalid_bind_addr_returns_error() {
         assert!(matches!(
             parse_bind_addr("not-an-addr"),
@@ -3044,5 +3055,29 @@ mod tests {
             matches!(result, Err(ConfigError::InvalidValue(ref msg)) if msg.contains("BUZZ_GIT_REPO_PATH")),
             "expected InvalidValue mentioning BUZZ_GIT_REPO_PATH, got {result:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod invite_cutoff_tests {
+    use super::*;
+
+    #[test]
+    fn cutoff_configuration_is_optional_and_strict() {
+        assert_eq!(parse_invite_v1_cutoff(None).unwrap(), None);
+        assert_eq!(
+            parse_invite_v1_cutoff(Some("1970-01-01T00:01:40Z")).unwrap(),
+            Some(100)
+        );
+        for raw in [
+            "",
+            "tomorrow",
+            "100",
+            "2026-10-10T00:00:00+01:00",
+            "1969-12-31T23:59:59Z",
+            "2026-10-10T00:00:00.1Z",
+        ] {
+            assert!(parse_invite_v1_cutoff(Some(raw)).is_err(), "{raw}");
+        }
     }
 }

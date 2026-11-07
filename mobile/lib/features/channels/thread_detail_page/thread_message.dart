@@ -48,18 +48,14 @@ class _ThreadMessage extends HookConsumerWidget {
     final profile =
         ref.watch(userCacheProvider.select((cache) => cache[pk])) ??
         ref.read(userCacheProvider.notifier).get(pk);
-    final displayName = message.isApp
-        ? message.appDisplayName ?? 'App'
-        : watchChannelIdentityLabel(ref, channelId, pk);
+    final displayName = watchChannelIdentityLabel(ref, channelId, pk);
     final isAgent =
-        !message.isApp &&
-        (ref.watch(agentMentionPubkeysProvider(channelId)).contains(pk) ||
-            profile?.ownerPubkey != null);
+        ref.watch(agentMentionPubkeysProvider(channelId)).contains(pk) ||
+        profile?.ownerPubkey != null;
     final canManageMessage =
-        !message.isApp &&
-        (currentPubkey?.toLowerCase() == pk ||
-            (profile?.ownerPubkey != null &&
-                profile?.ownerPubkey == currentPubkey?.toLowerCase()));
+        currentPubkey?.toLowerCase() == pk ||
+        (profile?.ownerPubkey != null &&
+            profile?.ownerPubkey == currentPubkey?.toLowerCase());
 
     final userCache = ref.watch(userCacheProvider);
     final knownAgentPubkeys = agentPubkeysWithProfileOwners(
@@ -240,6 +236,14 @@ class _ThreadMessage extends HookConsumerWidget {
                                           children: [
                                             Expanded(
                                               child: MessageAuthorMeta(
+                                                timestampGap: Grid.half,
+                                                showIdentity:
+                                                    showMessageAuthorName(
+                                                      ref,
+                                                      channelId,
+                                                      message.pubkey,
+                                                      currentPubkey,
+                                                    ),
                                                 showTimestamp: true,
                                                 reversed: false,
                                                 alignment: ownMessage
@@ -248,14 +252,16 @@ class _ThreadMessage extends HookConsumerWidget {
                                                 nameStyle:
                                                     messageUsernameTextStyle
                                                         .copyWith(
-                                                          fontSize: 13.1,
-                                                          height: 17 / 13.1,
+                                                          fontWeight:
+                                                              FontWeight.w500,
+                                                          fontSize: 11,
+                                                          height: 17 / 11,
                                                         ),
                                                 metadataStyle:
                                                     messageMetadataTextStyle
                                                         .copyWith(
-                                                          fontSize: 13.1,
-                                                          height: 17 / 13.1,
+                                                          fontSize: 11,
+                                                          height: 17 / 11,
                                                         ),
                                                 timestampStyle:
                                                     messageTimestampTextStyle
@@ -263,31 +269,30 @@ class _ThreadMessage extends HookConsumerWidget {
                                                           fontSize: 11,
                                                           height: 17 / 11,
                                                         ),
-                                                displayName: displayName,
-                                                username: message.isApp
+                                                displayName: ownMessage
+                                                    ? 'You'
+                                                    : displayName,
+                                                username: ownMessage
                                                     ? null
-                                                    : messageUsernameLabel(profile),
-                                                badge: message.isApp
-                                                    ? const AppBadge()
-                                                    : null,
+                                                    : messageUsernameLabel(
+                                                        profile,
+                                                      ),
                                                 timestamp: formatMessageTime(
                                                   message.createdAt,
                                                 ),
                                                 nameColor:
-                                                    context.colors.onSurface,
-                                                metadataColor: context
-                                                    .colors
-                                                    .onSurfaceVariant,
-                                                onAuthorTap: message.isApp
-                                                    ? null
-                                                    : () => showUserProfileSheet(
-                                                        context,
-                                                        message.pubkey,
-                                                        names:
-                                                            channelIdentityNamesProvider(
-                                                              channelId,
-                                                            ),
-                                                      ),
+                                                    context.tertiaryTextColor,
+                                                metadataColor:
+                                                    context.tertiaryTextColor,
+                                                onAuthorTap: () =>
+                                                    showUserProfileSheet(
+                                                      context,
+                                                      message.pubkey,
+                                                      names:
+                                                          channelIdentityNamesProvider(
+                                                            channelId,
+                                                          ),
+                                                    ),
                                                 displayNameKey: ValueKey(
                                                   'thread-message-author-${message.id}',
                                                 ),
@@ -327,7 +332,7 @@ class _ThreadMessage extends HookConsumerWidget {
                                       bubbleEnd: showAvatar,
                                       bubbleStart: showAuthor,
                                       ownMessage: ownMessage,
-                                      trimTrailingSpacing: endsDay,
+                                      trimTrailingSpacing: true,
                                       mentionNames: resolvedMentionNames,
                                       mentionLabels: mentionLabels,
                                       agentMentionPubkeys: agentMentionPubkeys,
@@ -376,11 +381,13 @@ class _ThreadMessage extends HookConsumerWidget {
                                             },
                                           ),
                                       onChannelTap: (targetChannelId) {
-                                        openChannelLink(
-                                          context: context,
-                                          ref: ref,
-                                          channelId: targetChannelId,
-                                          currentChannelId: channelId,
+                                        unawaited(
+                                          openChannelLink(
+                                            context: context,
+                                            ref: ref,
+                                            channelId: targetChannelId,
+                                            currentChannelId: channelId,
+                                          ),
                                         );
                                       },
                                       onMentionTap: (pubkey) =>
@@ -418,18 +425,16 @@ class _ThreadMessage extends HookConsumerWidget {
                                   ),
                                 ),
                                 child: GestureDetector(
-                                  onTap: message.isApp
-                                      ? null
-                                      : () => showUserProfileSheet(
-                                          context,
-                                          message.pubkey,
-                                          names: channelIdentityNamesProvider(
-                                            channelId,
-                                          ),
-                                        ),
+                                  onTap: () => showUserProfileSheet(
+                                    context,
+                                    message.pubkey,
+                                    names: channelIdentityNamesProvider(
+                                      channelId,
+                                    ),
+                                  ),
                                   child: _Avatar(
                                     profile: profile,
-                                    message: message,
+                                    pubkey: message.pubkey,
                                     isAgent: isAgent,
                                   ),
                                 ),

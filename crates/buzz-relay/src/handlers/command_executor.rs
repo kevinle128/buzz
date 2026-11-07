@@ -156,7 +156,7 @@ async fn persist_command_event(
             )
             .await
             .map_err(|e| {
-                IngestError::Internal(format!("error: replace parameterized event: {e}"))
+                IngestError::Internal(format!("error: replace parameterized event: {}", e.kind()))
             })?;
 
         return match result.status {
@@ -187,7 +187,7 @@ async fn persist_command_event(
 
     let (_, was_inserted) = buzz_db::event::insert_event_in_transaction(&mut tx, event, channel_id)
         .await
-        .map_err(|e| IngestError::Internal(format!("error: insert event: {e}")))?;
+        .map_err(|e| IngestError::Internal(format!("error: insert event: {}", e.kind())))?;
     if was_inserted {
         Ok(PersistResult::Inserted(tx))
     } else {
@@ -665,6 +665,21 @@ async fn handle_workflow_def(
     if !is_member {
         return Err(IngestError::Rejected(
             "forbidden: not a member of this channel".into(),
+        ));
+    }
+    // A workflow acts as its owner in this channel, so saving one is a write:
+    // a guest may not. Every run-creation door rechecks the same rule
+    // (`check_owner_authority`), so a later demotion also stops the runs.
+    let may_write = state
+        .db
+        .get_member_role(tenant.community(), channel_id, &self_bytes)
+        .await
+        .map_err(|e| IngestError::Internal(format!("error: role check: {e}")))?
+        .and_then(|r| r.parse::<buzz_db::channel::MemberRole>().ok())
+        .is_some_and(|r| r.can_post());
+    if !may_write {
+        return Err(IngestError::Rejected(
+            "restricted: only members can post in this channel".into(),
         ));
     }
 
@@ -1460,6 +1475,7 @@ mod postgres_tests {
             }
             Err(IngestError::AuthFailed(message)) => panic!("unexpected auth failure: {message}"),
             Err(IngestError::Internal(message)) => panic!("unexpected internal failure: {message}"),
+            Err(error @ IngestError::Ban { .. }) => panic!("unexpected ban refusal: {error:?}"),
             Ok(_) => panic!("expected revision parsing to fail"),
         }
     }

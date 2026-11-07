@@ -130,7 +130,7 @@ crates/
   buzz-test-client    # Integration test client and E2E test suite
   sprig               # All-in-one harness bundling ACP, agent, and dev MCP
 
-desktop/              # Tauri 2 + React 19 desktop app
+desktop/              # Legacy Tauri 2 + React 19 desktop app (being replaced by block/buzz-app)
 web/                  # Browser web client (repo browser, served by the relay)
 mobile/               # Flutter mobile app
 migrations/           # SQL migrations (run at relay startup when BUZZ_AUTO_MIGRATE is on: binary default off, Helm default on; deployments at scale apply them out of band — see docs/database.md)
@@ -613,11 +613,15 @@ description. See [PR #803](https://github.com/block/buzz/pull/803).
 4. **Worktrees: `cd` in the same command** — shell CWD doesn't persist between tool calls. Use `cd /path && cargo build` as one command.
 5. **Desktop crate excluded from root workspace** — `cargo test` at repo root does NOT run desktop tests. Use `cargo test --manifest-path desktop/src-tauri/Cargo.toml` explicitly.
 6. **React render perf: `React.memo` is all-or-nothing** — it only skips a re-render when *every* prop is reference-stable; one unstable prop (inline arrow/JSX, or a hook returning a fresh `{}`/`[]`/`Map` each render) defeats it. Two repeat offenders: (a) React Query results (`useMutation`/`useQuery`) are a **new object each render** — depend on the stable method (`mutation.mutateAsync`), not the object; (b) derived `Map`/array state that recomputes on a version bump — wrap in a content-equality ref cache (`shared/hooks/useStableReference.ts`). When chasing interaction lag, **measure with DevTools closed and no perf probes** (an open Web Inspector + per-keystroke `console.log` inflate the numbers), and isolate by removing one suspect at a time rather than guessing.
-7. **`pgschema` omits seed DML and some storage parameters** — `schema/schema.sql` is an ordered `\i` manifest: `schema/tables/public/<table>.sql` holds only that table's `CREATE TABLE` and `CREATE INDEX` statements (one table per file, the shape out-of-band schema tools read), and types, functions, partitions, triggers, and seed rows live in the sibling `schema/` directories. Fresh desired-state bootstraps use `./bin/pgschema apply`, which does not execute `INSERT` statements or preserve every table storage parameter from `schema/schema.sql`. Put each unsupported invariant in `scripts/reconcile-schema-after-pgschema.sql` as an idempotent convergence statement plus a live catalog or data assertion. Every `pgschema apply` caller must run that script. A string assertion against `schema.sql` alone does not prove the pgschema-created database has the intended state.
+7. **`pgschema` omits seed DML and some storage parameters** — `schema/schema.sql` is an ordered `\i` manifest: `schema/tables/public/<table>.sql` holds only that table's `CREATE TABLE` and `CREATE INDEX` statements (one table per file, the shape out-of-band schema tools read), and types, functions, partitions, triggers, and seed rows live in the sibling `schema/` directories. Fresh desired-state bootstraps use `./bin/pgschema apply`, which does not execute `INSERT` statements or preserve every table storage parameter from `schema/schema.sql`. Put each unsupported invariant in `scripts/reconcile-schema-after-pgschema.sql` as an idempotent convergence statement plus a live catalog or data assertion. Every `pgschema apply` caller must run that script, and must run pgschema from the repository root so it reads `.pgschemaignore`; from any other directory a re-apply plans to drop the partitions the relay created at runtime. A string assertion against `schema.sql` alone does not prove the pgschema-created database has the intended state.
 
 ---
 
 ## Desktop App
+
+> **Legacy.** `desktop/` will soon be superseded by
+> [block/buzz-app](https://github.com/block/buzz-app). Never use it as an
+> implementation or design reference for the mobile app, which is current.
 
 The desktop app is Tauri 2 + React 19 + Vite + Tailwind CSS. Features are
 organized under `desktop/src/features/`. Biome handles linting and formatting.
@@ -699,13 +703,20 @@ Key files:
 
 The mobile app lives in `mobile/` — a Flutter app using Riverpod + Hooks.
 
+The mobile app is current. Do not use the legacy `desktop/` app as an
+implementation or design reference for it: `desktop/` will soon be superseded
+by [block/buzz-app](https://github.com/block/buzz-app). This does not relax
+cross-client wire compatibility: mobile must keep reading and writing the same
+event payloads as other clients (for example the `channel-sort` NIP-78 payload,
+which buzz-app also uses), even where a payload is documented only in code.
+
 ### Architecture
 
 - **State management:** Riverpod + `flutter_hooks` (`HookConsumerWidget`)
-- **Theme:** Catppuccin Latte (light) / Macchiato (dark) — matches desktop
+- **Theme:** Catppuccin Latte (light) / Macchiato (dark)
 - **Features:** Isolated under `lib/features/`, shared code in `lib/shared/`
 - **Nostr models:** `lib/shared/relay/nostr_models.dart` — event kinds must
-  stay in sync with `desktop/src/shared/constants/kinds.ts`
+  stay in sync with `crates/buzz-core/src/kind.rs`
 
 ### Rules
 

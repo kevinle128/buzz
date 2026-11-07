@@ -2,9 +2,14 @@
 #![warn(missing_docs)]
 //! NIP-01 WebSocket relay for Buzz private team communication.
 
+/// Stdout access log: reads, auth attempts, and connection lifecycle.
+pub(crate) mod access;
 mod admission;
+mod app_sink;
+mod message_mentions;
+mod project_route;
 mod build_info;
-mod observer;
+mod host_cache;
 mod rejection;
 
 /// Shared NIP-FI assertion evaluation, denial rendering, and key pairing.
@@ -22,8 +27,6 @@ pub(crate) mod nip_fi_upgrade;
 
 /// REST API route handlers.
 pub mod api;
-/// Authenticated App callback sink — HTTP admission to a relay-signed kind 9.
-pub mod app_sink;
 /// WebSocket audio relay for huddle voice channels.
 pub mod audio;
 /// Relay configuration from environment variables.
@@ -45,8 +48,6 @@ pub mod invite_token;
 pub mod lifecycle;
 /// Inter-relay mesh startup wiring (`BUZZ_MESH` seam).
 pub mod mesh_boot;
-/// Shared `@Name` mention resolver for relay-signed messages.
-mod message_mentions;
 /// Prometheus metrics: recorder, upkeep, HTTP middleware.
 pub mod metrics;
 /// NIP-11 relay information document.
@@ -57,11 +58,10 @@ pub mod nip_fi_config;
 /// NIP-FI HTTP ingress enforcement: assertion extraction, verification,
 /// key-pairing check, and deny-map gate for every protected HTTP surface.
 pub(crate) mod nip_fi_http;
+pub(crate) mod nip_fi_policy;
 pub mod nip_fi_resolver;
 /// Deployment-global operator-listener mention delivery worker.
 pub mod operator_listener;
-/// Repository identity resolution and project claim authorization.
-pub mod project_route;
 /// NIP-01 client/relay message parsing.
 pub mod protocol;
 /// Durable NIP-PL matcher and delivery worker.
@@ -70,11 +70,15 @@ pub mod push_runtime;
 pub mod readiness;
 /// Axum router construction.
 pub mod router;
+/// Per-key gates that let concurrent cache misses share one database read.
+mod shared_reads;
 /// Timing for startup work between metrics bind and serving.
 pub mod startup_steps;
 /// Shared application state.
 pub mod state;
 pub mod storage_sweep;
+/// Push each new per-community storage snapshot to an operator endpoint.
+pub mod storage_usage_delivery;
 /// Subscription registry with (channel, kind) fan-out index.
 pub mod subscription;
 /// OpenTelemetry tracing initialisation (tracer provider + OTLP exporter).
@@ -87,11 +91,14 @@ mod test_support;
 pub mod tunnel;
 /// Webhook secret generation and constant-time comparison.
 pub mod webhook_secret;
-/// Serialized webhook admission for project-channel routing.
-mod workflow_admission;
 /// Workflow action sink — relay-side implementation of [`buzz_workflow::ActionSink`].
 pub mod workflow_sink;
 
 pub use config::Config;
 pub use error::{RelayError, Result};
 pub use state::AppState;
+
+/// Optional relay-signed verified profiles.
+pub mod verified_profiles;
+
+mod observer;

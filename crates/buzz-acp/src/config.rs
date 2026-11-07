@@ -119,10 +119,6 @@ impl std::fmt::Display for RespondTo {
 /// `configId: "mode"` (e.g. `claude-agent-acp`).
 ///
 /// - `default` — agent's built-in behaviour (permission requests per tool call).
-/// - `auto` — autonomous execution; model-gated (requires `supportsAutoMode`).
-///   The adapter degrades to `default` when the active model does not support it.
-///   The adapter normally approves tool calls internally, but it can forward a
-///   residual manual approval request to ACP.
 /// - `acceptEdits` — auto-approve file edits, still ask for other tools.
 /// - `bypassPermissions` — skip the permission flow entirely.
 /// - `dontAsk` — never prompt; reject anything that would require permission.
@@ -132,20 +128,9 @@ pub enum PermissionMode {
     /// Agent default — permission requests per tool call.
     #[value(alias = "default")]
     Default,
-    /// Fully autonomous execution; model-gated (requires `supportsAutoMode`).
-    ///
-    /// `auto` is a model-gated classifier — the adapter self-approves most tool
-    /// calls internally, but can fall back to forwarding residual
-    /// `session/request_permission` requests to ACP when the model chooses manual
-    /// approval for a specific call. It is therefore **not** a hard bypass.
-    ///
-    /// Policy compatibility:
-    /// - `allow + auto` — compatible; both want unattended approval.
-    /// - `ask + auto` — compatible with a startup warning; residual escalations
-    ///   still surface permission cards, but internally approved calls bypass the
-    ///   ask flow silently.
-    /// - `reject + auto` — startup contradiction; adapter auto-approves
-    ///   internally while the policy intends to deny — inverted-security worst case.
+    /// Auto mode — fully autonomous execution; model-gated (requires a model
+    /// that supports `supportsAutoMode`).  Degrades gracefully to `default`
+    /// when the session's active model does not support it.
     #[value(alias = "auto")]
     Auto,
     /// Auto-approve file edits, still ask for other tools.
@@ -178,7 +163,6 @@ impl PermissionMode {
 
     /// Returns `true` when the mode is the agent's built-in default and
     /// therefore doesn't need to be explicitly set.
-    #[cfg(test)]
     pub fn is_default(&self) -> bool {
         matches!(self, Self::Default)
     }
@@ -187,181 +171,6 @@ impl PermissionMode {
 impl std::fmt::Display for PermissionMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_wire_str())
-    }
-}
-
-/// How Buzz responds to an ACP `session/request_permission` request.
-///
-/// Injected as `BUZZ_ACP_PERMISSION_POLICY`. Desktop injects the resolved
-/// per-agent or fleet-wide value; headless defaults to `reject`.
-///
-/// - `allow` — auto-select the unique `allow_once` option; fail closed if zero or
-///   multiple `allow_once` candidates, malformed options, or any validation error.
-/// - `ask` — surface the request as an actionable card for the owner; fail closed
-///   on timeout (300 s) or if the observer / owner is unavailable.
-/// - `reject` — deny every request (today's behaviour, headless default).
-#[derive(Debug, Clone, Copy, PartialEq, clap::ValueEnum)]
-pub enum PermissionPolicy {
-    /// Auto-approve via the unique `allow_once` option; fail closed otherwise.
-    #[value(alias = "allow")]
-    Allow,
-    /// Surface as an actionable card; fail closed on timeout or unavailability.
-    #[value(alias = "ask")]
-    Ask,
-    /// Deny all requests — headless default, byte-for-byte today's behaviour.
-    #[value(alias = "reject")]
-    Reject,
-}
-
-impl std::fmt::Display for PermissionPolicy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Allow => "allow",
-            Self::Ask => "ask",
-            Self::Reject => "reject",
-        })
-    }
-}
-
-/// Whether an effective `PermissionMode` was derived by the harness or
-/// supplied explicitly by the operator.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ModeSource {
-    /// No `--permission-mode` was supplied; the harness derived the mode from
-    /// the active `PermissionPolicy`.
-    Derived,
-    /// An explicit `--permission-mode` / `BUZZ_ACP_PERMISSION_MODE` value was
-    /// supplied by the operator.
-    Explicit,
-}
-
-impl std::fmt::Display for ModeSource {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Derived => "derived",
-            Self::Explicit => "explicit",
-        })
-    }
-}
-
-/// Resolved, immutable per-startup permission configuration.
-///
-/// Computed once in `Config::from_args` from `policy` + optional `mode` and
-/// carried through `PromptContext` (via `Arc`) so every task reads the same
-/// value without re-deriving it.
-///
-/// `transmit_mode` — set `session/set_config_option` for this mode whenever
-/// the agent advertises it. **Always set** (including for `PermissionMode::Default`);
-/// the caller decides whether to skip based on advertisement, not derivation.
-#[derive(Debug, Clone)]
-pub struct ResolvedPermissionConfig {
-    /// The high-level policy governing how permission requests are answered.
-    pub policy: PermissionPolicy,
-    /// The ACP mode that will be sent to the agent after session creation.
-    pub effective_mode: PermissionMode,
-    /// Whether `effective_mode` was derived or supplied explicitly.
-    pub mode_source: ModeSource,
-    /// `true` when the effective mode should be transmitted to the agent via
-    /// `session/set_config_option`, i.e. whenever the agent advertises it.
-    pub transmit_mode: bool,
-}
-
-impl ResolvedPermissionConfig {
-    /// Derive the config from a `policy` and an optional explicit `mode`.
-    ///
-    /// Returns `Err` for contradictory combinations:
-    /// - `ask`  + explicit `dontAsk` — harness would want the agent to
-    ///   escalate, but `dontAsk` makes the agent self-deny internally.
-    /// - `allow` + explicit `dontAsk` — same contradiction.
-    /// - `reject` + explicit `auto` or `bypassPermissions` — the adapter
-    ///   auto-approves internally while the policy intends to deny.
-    /// - `ask` + explicit `bypassPermissions` — the adapter never sends requests
-    ///   for Buzz to surface.
-    ///
-    /// Emits a warning (not an error) for `ask + auto`: internally-approved tool
-    /// calls bypass the ask flow silently, but residual escalations still surface
-    /// cards — the combination works, with the caveat that not all requests are seen.
-    pub fn resolve(
-        policy: PermissionPolicy,
-        explicit_mode: Option<PermissionMode>,
-    ) -> Result<Self, ConfigError> {
-        // Fail on contradictory ask/allow + dontAsk combinations.
-        if matches!(policy, PermissionPolicy::Ask | PermissionPolicy::Allow)
-            && explicit_mode == Some(PermissionMode::DontAsk)
-        {
-            return Err(ConfigError::ConfigFile(format!(
-                "permission_policy={policy} conflicts with permission_mode=dontAsk: \
-                 dontAsk makes the agent self-deny internally before Buzz can answer"
-            )));
-        }
-        // Fail on reject + auto: inverted-security worst case — policy says "deny"
-        // but the adapter auto-approves everything internally.
-        // `ask` + auto is a warning-only case: the adapter MAY still forward residual
-        // permission requests to ACP (auto is a model classifier, not bypass mode);
-        // warn and transmit rather than fail startup.
-        // `allow` + auto is compatible: both policies want unattended approval.
-        if policy == PermissionPolicy::Reject && explicit_mode == Some(PermissionMode::Auto) {
-            return Err(ConfigError::ConfigFile(format!(
-                "permission_policy={policy} conflicts with permission_mode=auto: \
-                 auto makes the adapter self-approve internally, which bypasses the \
-                 reject policy — inverted-security worst case"
-            )));
-        }
-        if matches!(policy, PermissionPolicy::Reject | PermissionPolicy::Ask)
-            && explicit_mode == Some(PermissionMode::BypassPermissions)
-        {
-            return Err(ConfigError::ConfigFile(format!(
-                "permission_policy={policy} conflicts with permission_mode=bypassPermissions: \
-                 bypassPermissions prevents Buzz from enforcing or surfacing permission requests"
-            )));
-        }
-        // Warn on ask + auto: residual permission requests may still reach ACP
-        // (auto is a model classifier, not bypass mode) so ask can still surface
-        // cards — but internally-approved calls will bypass the ask flow silently.
-        if policy == PermissionPolicy::Ask && explicit_mode == Some(PermissionMode::Auto) {
-            tracing::warn!(
-                "permission_policy=ask with permission_mode=auto: internally-approved \
-                 tool calls bypass Buzz ask flow; residual escalations will still \
-                 surface cards. Consider policy=allow if unattended approval is intended."
-            );
-        }
-
-        let (effective_mode, mode_source) = match explicit_mode {
-            Some(m) => (m, ModeSource::Explicit),
-            None => {
-                // Mode matrix — derived from policy when no explicit mode given:
-                //   reject → dontAsk  (harness rejects; adapter also self-denies for
-                //                      consistency — byte-for-byte today's behaviour)
-                //   ask    → default  (keep the adapter escalating to Buzz)
-                //   allow  → default  (keep the adapter escalating to Buzz;
-                //                      dontAsk would silently self-deny before we
-                //                      could auto-select allow_once)
-                let derived = match policy {
-                    PermissionPolicy::Reject => PermissionMode::DontAsk,
-                    PermissionPolicy::Ask | PermissionPolicy::Allow => PermissionMode::Default,
-                };
-                (derived, ModeSource::Derived)
-            }
-        };
-
-        Ok(Self {
-            policy,
-            effective_mode,
-            mode_source,
-            // Always transmit — the caller skips based on agent advertisement,
-            // not on whether the mode is the default.
-            transmit_mode: true,
-        })
-    }
-}
-
-impl std::fmt::Display for ResolvedPermissionConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "policy={} mode={}({})",
-            self.policy, self.effective_mode, self.mode_source
-        )
     }
 }
 
@@ -652,32 +461,19 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_SESSION_TITLE")]
     pub session_title: Option<String>,
 
-    /// How Buzz responds to ACP `session/request_permission` requests.
+    /// Permission mode for agents that support `session/set_config_option`
+    /// with `configId: "mode"` (e.g. `claude-agent-acp`).
     ///
-    /// - `reject` (headless default) — deny all permission requests.
-    /// - `ask` — surface as an actionable card; auto-deny on timeout (300 s) or
-    ///   when the observer / owner is unavailable.
-    /// - `allow` — auto-approve via the unique `allow_once` option; fail closed
-    ///   if zero or multiple `allow_once` candidates.
-    ///
-    /// Desktop injects the resolved per-agent or fleet-wide value.
-    /// Headless installations should leave this unset (defaults to `reject`).
+    /// Defaults to `bypassPermissions` which skips the per-tool-call
+    /// permission flow. Set to `default` to restore the agent's built-in
+    /// behaviour.
     #[arg(
         long,
-        env = "BUZZ_ACP_PERMISSION_POLICY",
-        default_value = "reject",
+        env = "BUZZ_ACP_PERMISSION_MODE",
+        default_value = "bypass-permissions",
         value_enum
     )]
-    pub permission_policy: PermissionPolicy,
-
-    /// ACP permission mode sent to the agent via `session/set_config_option`.
-    ///
-    /// When unset the harness derives a sensible default from `permission_policy`:
-    ///   `reject` → `dontAsk`, `ask` / `allow` → `default`.
-    /// Explicit values are validated: `ask` or `allow` + `dontAsk` is a startup
-    /// error because `dontAsk` makes the agent self-deny before Buzz can answer.
-    #[arg(long, env = "BUZZ_ACP_PERMISSION_MODE", value_enum)]
-    pub permission_mode: Option<PermissionMode>,
+    pub permission_mode: PermissionMode,
 
     /// Inbound author gate: which authors' events the harness forwards.
     /// Modes: owner-only (default), allowlist, anyone, nobody.
@@ -798,10 +594,8 @@ pub struct Config {
     /// Sanitized session title, sent as `_meta.sessionTitle` on `session/new`.
     /// `None` when unset or when the configured value sanitized to empty.
     pub session_title: Option<String>,
-    /// Resolved permission configuration — policy, effective ACP mode, and
-    /// how to transmit it. Computed once from `PermissionPolicy` + optional
-    /// explicit `PermissionMode` in `from_args`.
-    pub permission_config: ResolvedPermissionConfig,
+    /// Permission mode to apply after session creation. `Default` = skip.
+    pub permission_mode: PermissionMode,
     /// Inbound author gate mode.
     pub respond_to: RespondTo,
     /// Validated allowlist of pubkey hex strings (used when respond_to == Allowlist).
@@ -1004,9 +798,7 @@ fn default_agent_args(command: &str) -> Option<Vec<String>> {
     match normalize_agent_command_identity(command).as_str() {
         "goose" => Some(vec!["acp".to_string()]),
         "codex" | "codex-acp" | "claude-agent-acp" | "claude-code-acp" | "claude-code"
-        | "claudecode" | "buzz-agent" | "hermes" | "hermes-agent" | "hermes-acp" => {
-            Some(Vec::new())
-        }
+        | "claudecode" | "buzz-agent" => Some(Vec::new()),
         _ => None,
     }
 }
@@ -1037,16 +829,6 @@ pub(crate) fn default_agent_env(command: &str) -> &'static [(&'static str, &'sta
     }
 }
 
-<<<<<<< HEAD
-/// Session MCP server used when the operator/desktop left `BUZZ_ACP_MCP_COMMAND`
-/// empty. Hermes tool subprocesses do not reliably inherit Buzz identity env,
-/// so an empty command would leave the session with no authenticated `buzz`.
-fn default_mcp_command(command: &str) -> Option<&'static str> {
-    match normalize_agent_command_identity(command).as_str() {
-        "hermes" | "hermes-agent" | "hermes-acp" => Some("buzz-dev-mcp"),
-        _ => None,
-    }
-=======
 const AGENT_OUTPUT_FORMAT_ENV: (&str, &str) = ("BUZZ_OUTPUT_FORMAT", "agent");
 
 /// Resolve the CLI format for MCP servers that filter inherited environment.
@@ -1064,7 +846,6 @@ pub(crate) fn agent_output_format(extra_env: &[(String, String)]) -> String {
                 .map(|(_, value)| value.clone())
         })
         .unwrap_or_else(|| default.into())
->>>>>>> upstream/main
 }
 
 /// Build the `CODEX_CONFIG` environment variable that enables full outbound
@@ -1402,23 +1183,12 @@ impl Config {
 
         validate_multiple_event_handling(args.multiple_event_handling, args.dedup)?;
 
-        let permission_config =
-            ResolvedPermissionConfig::resolve(args.permission_policy, args.permission_mode)?;
-
-        let mcp_command = if args.mcp_command.is_empty() {
-            default_mcp_command(&agent_command)
-                .unwrap_or("")
-                .to_string()
-        } else {
-            args.mcp_command
-        };
-
         let config = Config {
             keys,
             relay_url: args.relay_url,
             agent_command,
             agent_args,
-            mcp_command,
+            mcp_command: args.mcp_command,
             idle_timeout_secs,
             max_turn_duration_secs,
             agents: args.agents,
@@ -1453,7 +1223,7 @@ impl Config {
                 .session_title
                 .as_deref()
                 .and_then(sanitize_session_title),
-            permission_config,
+            permission_mode: args.permission_mode,
             respond_to: args.respond_to,
             respond_to_allowlist,
             allowed_respond_to,
@@ -1488,7 +1258,7 @@ impl Config {
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} session_policy={} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={}({}) {}{}",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} session_policy={} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
             self.relay_url,
             self.keys.public_key().to_hex(),
             self.agent_command,
@@ -1509,8 +1279,7 @@ impl Config {
             self.typing_enabled,
             self.memory_enabled,
             self.model.as_deref().unwrap_or("(agent default)"),
-            self.permission_config.effective_mode,
-            self.permission_config.mode_source,
+            self.permission_mode,
             respond_to_detail,
             allowed_respond_to_detail,
         )
@@ -1832,11 +1601,7 @@ mod tests {
             model: None,
             effort_level: None,
             session_title: None,
-            permission_config: ResolvedPermissionConfig::resolve(
-                PermissionPolicy::Reject,
-                Some(PermissionMode::DontAsk),
-            )
-            .expect("test config"),
+            permission_mode: PermissionMode::BypassPermissions,
             respond_to: RespondTo::Anyone,
             respond_to_allowlist: HashSet::new(),
             allowed_respond_to: Vec::new(),
@@ -2024,67 +1789,6 @@ mod tests {
         assert_eq!(normalize_agent_command_identity("   "), "");
         assert_eq!(normalize_agent_command_identity("/"), "");
         assert_eq!(normalize_agent_command_identity("///"), "");
-    }
-
-    #[test]
-    fn default_mcp_command_is_buzz_dev_mcp_for_hermes() {
-        for command in [
-            "hermes",
-            "hermes-agent",
-            "hermes-acp",
-            "/opt/hermes/bin/hermes-acp",
-            r"C:\Users\test\AppData\Roaming\npm\hermes-acp.cmd",
-        ] {
-            assert_eq!(
-                default_mcp_command(command),
-                Some("buzz-dev-mcp"),
-                "Hermes must default to buzz-dev-mcp: {command}"
-            );
-        }
-        for command in ["goose", "codex-acp", "claude-agent-acp", "buzz-agent"] {
-            assert_eq!(
-                default_mcp_command(command),
-                None,
-                "non-Hermes command must not invent an MCP default: {command}"
-            );
-        }
-    }
-
-    #[test]
-    fn from_args_defaults_empty_hermes_mcp_command() {
-        let previous = std::env::var("BUZZ_ACP_MCP_COMMAND").ok();
-        std::env::remove_var("BUZZ_ACP_MCP_COMMAND");
-        let args = CliArgs::try_parse_from([
-            "buzz-acp",
-            "--private-key",
-            "0000000000000000000000000000000000000000000000000000000000000001",
-            "--agent-command",
-            "hermes-acp",
-        ]);
-        match previous {
-            Some(value) => std::env::set_var("BUZZ_ACP_MCP_COMMAND", value),
-            None => std::env::remove_var("BUZZ_ACP_MCP_COMMAND"),
-        }
-        let args = args.expect("clap should parse args");
-        let config = Config::from_args(args).expect("hermes config");
-        assert_eq!(config.mcp_command, "buzz-dev-mcp");
-        assert!(config.agent_args.is_empty(), "hermes is a zero-arg runtime");
-    }
-
-    #[test]
-    fn from_args_preserves_explicit_hermes_mcp_command() {
-        let args = CliArgs::try_parse_from([
-            "buzz-acp",
-            "--private-key",
-            "0000000000000000000000000000000000000000000000000000000000000001",
-            "--agent-command",
-            "hermes-acp",
-            "--mcp-command",
-            "/opt/custom-mcp",
-        ])
-        .expect("clap should parse args");
-        let config = Config::from_args(args).expect("hermes config");
-        assert_eq!(config.mcp_command, "/opt/custom-mcp");
     }
 
     #[test]
@@ -2780,11 +2484,7 @@ channels = "ALL"
     #[test]
     fn test_summary_includes_permission_mode() {
         let mut config = test_config(SubscribeMode::Mentions);
-        config.permission_config = ResolvedPermissionConfig::resolve(
-            PermissionPolicy::Allow,
-            Some(PermissionMode::BypassPermissions),
-        )
-        .expect("test config");
+        config.permission_mode = PermissionMode::BypassPermissions;
         let s = config.summary();
         assert!(
             s.contains("permission_mode=bypassPermissions"),
@@ -2795,8 +2495,7 @@ channels = "ALL"
     #[test]
     fn test_summary_permission_mode_default() {
         let mut config = test_config(SubscribeMode::Mentions);
-        config.permission_config =
-            ResolvedPermissionConfig::resolve(PermissionPolicy::Ask, None).expect("test config");
+        config.permission_mode = PermissionMode::Default;
         let s = config.summary();
         assert!(
             s.contains("permission_mode=default"),
@@ -2805,28 +2504,9 @@ channels = "ALL"
     }
 
     #[test]
-    fn test_default_config_rejects_interactive_permissions() {
+    fn test_default_config_uses_bypass_permissions() {
         let config = test_config(SubscribeMode::Mentions);
-        assert_eq!(
-            config.permission_config.effective_mode,
-            PermissionMode::DontAsk
-        );
-    }
-
-    #[test]
-    fn test_bypass_permissions_requires_allow_policy() {
-        assert!(ResolvedPermissionConfig::resolve(
-            PermissionPolicy::Allow,
-            Some(PermissionMode::BypassPermissions),
-        )
-        .is_ok());
-        for policy in [PermissionPolicy::Ask, PermissionPolicy::Reject] {
-            assert!(ResolvedPermissionConfig::resolve(
-                policy,
-                Some(PermissionMode::BypassPermissions),
-            )
-            .is_err());
-        }
+        assert_eq!(config.permission_mode, PermissionMode::BypassPermissions);
     }
 
     #[test]
