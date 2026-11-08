@@ -8,12 +8,13 @@
 //! 4. [`AcpClient::session_prompt_with_idle_timeout`] — send prompt with idle/hard deadline, return stop reason
 //! 5. [`AcpClient::session_cancel`] / [`AcpClient::cancel_with_cleanup`] — cancel in-flight turn
 
+pub(crate) mod child_io;
 pub(crate) mod elicitation;
 mod launch;
+pub(crate) mod wake;
 
-use futures_util::StreamExt;
-use tokio::process::{Child, ChildStdin, ChildStdout};
-use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
+use tokio::process::Child;
+use tokio_util::codec::LinesCodecError;
 
 use crate::config::{PermissionMode, PermissionPolicy, ResolvedPermissionConfig};
 use crate::observer::{AuthorizationEnvelope, ObserverContext, ObserverEvent, ObserverHandle};
@@ -226,12 +227,23 @@ struct PendingElicitation {
 pub struct AcpClient {
     /// The agent child process (kept alive to prevent zombie).
     child: Child,
-    /// Sole stdin writer; None after an interrupted/failed frame closes it.
-    stdin: Option<ChildStdin>,
-    /// Framed reader over the agent's stdout pipe (line-oriented, bounded).
-    /// Uses `LinesCodec::new_with_max_length` to enforce MAX_LINE_SIZE at the
-    /// read level — prevents OOM from rogue agents writing infinite non-newline bytes.
-    reader: FramedRead<ChildStdout, LinesCodec>,
+    /// Handle to the sole stdin writer task. A frame write that is
+    /// interrupted or fails closes stdin; later writes then fail.
+    writer: child_io::StdinWriter,
+    /// The agent's stdout lines from the reader task. The task reads the pipe
+    /// with `LinesCodec::new_with_max_length` (MAX_LINE_SIZE), so a rogue agent
+    /// writing endless bytes without a newline cannot exhaust memory. It sends
+    /// `_buzz/wake` requests to the pool instead of this receiver.
+    reader: child_io::LineReceiver,
+    /// Wake state shared with the reader task.
+    wake: std::sync::Arc<child_io::WakeLink>,
+    /// The thread of the current turn. Sent as `_meta["buzz.thread"]` on
+    /// `session/new` and `session/prompt` to an agent that advertised
+    /// `buzz.wake` version 1. Set per turn; cleared when the turn returns its
+    /// agent.
+    turn_thread: Option<wake::WakeThread>,
+    /// Ends the reader and writer tasks and retires the child on drop.
+    _io_guard: child_io::ChildIoGuard,
     /// Monotonically increasing JSON-RPC request id counter.
     /// Harness-generated IDs are always numeric.
     next_id: u64,
@@ -542,7 +554,10 @@ fn build_client_capabilities() -> serde_json::Value {
             // Non-standard extension used by claude-agent-acp to advertise the
             // exact terminal login argv for subscription auth. Unknown `_meta`
             // keys are ignored by other adapters.
-            "terminal-auth": true
+            "terminal-auth": true,
+            // Buzz answers the agent request `_buzz/wake` at any time and
+            // opens a turn in the thread it names.
+            wake::WAKE_CAPABILITY: wake::capability_value()
         }
     })
 }
@@ -561,6 +576,8 @@ impl AcpClient {
     /// Call this when you need guaranteed cleanup — e.g., in `run_models`
     /// before process exit.
     pub async fn shutdown(&mut self) {
+        // A wake request from this child must open no turn from now on.
+        self.wake.retire();
         // Kill the entire process group when possible. The child was spawned
         // with process_group(0), so its PID == its PGID. Killing the group
         // ensures subprocesses (MCP servers, tool processes) are cleaned up
@@ -749,10 +766,14 @@ impl AcpClient {
             .take()
             .ok_or_else(|| AcpError::Protocol("failed to open agent stdout".into()))?;
 
+        let io = child_io::start(stdout, stdin);
         Ok(Self {
             child,
-            stdin: Some(stdin),
-            reader: FramedRead::new(stdout, LinesCodec::new_with_max_length(MAX_LINE_SIZE)),
+            writer: io.writer,
+            reader: io.lines,
+            wake: io.link,
+            turn_thread: None,
+            _io_guard: io.guard,
             next_id: 0,
             pending_permission_id: None,
             permission_responded: false,
@@ -879,6 +900,7 @@ impl AcpClient {
             .pointer("/_meta/steering/supported")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        self.wake.set_supported(wake::advertised_v1(&result));
         tracing::debug!(target: "acp::init", "initialize response: {result}");
         Ok(result)
     }
@@ -945,6 +967,10 @@ impl AcpClient {
             // Merge — claude-agent-acp spreads these into the CLI's argv.
             params["_meta"]["claudeCode"]["options"]["extraArgs"]["thinking-display"] =
                 serde_json::Value::String("summarized".to_owned());
+        }
+        if let Some(thread) = self.thread_meta() {
+            // Merge — the agent echoes this value in its wake requests.
+            params["_meta"][wake::THREAD_META] = thread;
         }
         let result = self.send_request("session/new", params).await?;
         let session_id = result["sessionId"]
@@ -1058,7 +1084,10 @@ impl AcpClient {
         // cancel path still gets its `cancel` before the next turn starts.
         self.drain_elicitation(elicitation::CloseReason::Ended)
             .await;
-        let params = build_prompt_params(session_id, prompt_blocks);
+        let mut params = build_prompt_params(session_id, prompt_blocks);
+        if let Some(thread) = self.thread_meta() {
+            params["_meta"][wake::THREAD_META] = thread;
+        }
         let hard_deadline = tokio::time::Instant::now() + max_duration;
         self.current_hard_deadline = Some(hard_deadline);
 
@@ -1163,6 +1192,39 @@ impl AcpClient {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn active_run_id(&self) -> Option<&str> {
         self.active_run_id.as_deref()
+    }
+
+    /// Set the thread of the current turn, or clear it with `None`.
+    ///
+    /// While set, `session/new` and `session/prompt` carry it as
+    /// `_meta["buzz.thread"]` if the agent advertised `buzz.wake` version 1.
+    pub(crate) fn set_turn_thread(&mut self, thread: Option<wake::WakeThread>) {
+        self.turn_thread = thread;
+    }
+
+    /// The `buzz.thread` value for the next request, if any.
+    fn thread_meta(&self) -> Option<serde_json::Value> {
+        if !self.wake.supported() {
+            return None;
+        }
+        self.turn_thread.as_ref().map(wake::WakeThread::meta_value)
+    }
+
+    /// Whether the agent advertised `buzz.wake` version 1 at `initialize`.
+    pub(crate) fn wake_supported(&self) -> bool {
+        self.wake.supported()
+    }
+
+    /// Wake state of this child, shared with its reader task.
+    pub(crate) fn wake_link(&self) -> &std::sync::Arc<child_io::WakeLink> {
+        &self.wake
+    }
+
+    /// Notification lines that the reader task dropped while no read loop
+    /// ran.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn dropped_idle_notifications(&self) -> u64 {
+        self.reader.dropped_notifications()
     }
 
     /// Whether the agent advertised the [`ACP_STEER_METHOD`] extension at
@@ -1593,13 +1655,10 @@ impl AcpClient {
     ) -> Result<(), AcpError> {
         const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
         let line = serde_json::to_string(value)?;
-        tokio::time::timeout(
-            WRITE_TIMEOUT,
-            frame_writer::write_frame(&mut self.stdin, line.as_bytes()),
-        )
-        .await
-        .map_err(|_| AcpError::WriteTimeout(WRITE_TIMEOUT))?
-        .map_err(AcpError::Io)?;
+        tokio::time::timeout(WRITE_TIMEOUT, self.writer.write_line(line))
+            .await
+            .map_err(|_| AcpError::WriteTimeout(WRITE_TIMEOUT))?
+            .map_err(AcpError::Io)?;
         if emit_observe {
             self.observe("acp_write", value.clone());
         }
@@ -1663,6 +1722,8 @@ impl AcpClient {
     /// `drain_timeout` elapses, whichever comes first. Errors are ignored.
     #[allow(dead_code)] // Scaffolding for future model-switch timeout cleanup; not yet wired.
     pub async fn drain_stale_responses(&mut self, drain_timeout: std::time::Duration) {
+        // While a read loop runs, the reader task keeps every line for it.
+        let _reading = self.reader.reading();
         let deadline = tokio::time::Instant::now() + drain_timeout;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -1717,6 +1778,8 @@ impl AcpClient {
         &mut self,
         expected_id: u64,
     ) -> Result<serde_json::Value, AcpError> {
+        // While a read loop runs, the reader task keeps every line for it.
+        let _reading = self.reader.reading();
         loop {
             // LinesCodec::new_with_max_length enforces MAX_LINE_SIZE at the
             // read level — the buffer never grows beyond the limit, preventing
@@ -1878,6 +1941,9 @@ impl AcpClient {
         max_duration: std::time::Duration,
     ) -> Result<serde_json::Value, AcpError> {
         use tokio::time::Instant;
+
+        // While a read loop runs, the reader task keeps every line for it.
+        let _reading = self.reader.reading();
 
         // Take the per-turn steer receiver into a local so it can be
         // borrowed independently of `self.reader` inside `select!`.
@@ -4617,11 +4683,11 @@ mod tests {
     /// each notification is observed, so OS scheduling cannot consume the idle
     /// window. Each update must extend the deadline; silence must still expire.
     async fn assert_activity_resets_idle(update: serde_json::Value) {
-        use tokio::io::AsyncWriteExt;
-
         let mut client =
             spawn_script(r#"while IFS= read -r line; do printf '%s\n' "$line"; done"#).await;
-        let mut stdin = client.stdin.take().expect("test stdin");
+        // A second handle to the stdin writer task, usable while the read
+        // loop below borrows the client.
+        let stdin = client.writer.clone();
         let observer = ObserverHandle::in_process();
         let mut events = observer.subscribe();
         client.set_observer(Some(observer), 0);
@@ -4635,11 +4701,10 @@ mod tests {
         let idle = std::time::Duration::from_secs(1);
         let hard = std::time::Duration::from_secs(10);
         let hard_deadline = tokio::time::Instant::now() + hard;
-        let mut frame = serde_json::json!({
+        let frame = serde_json::json!({
             "jsonrpc": "2.0", "method": "session/update", "params": { "update": update }
         })
         .to_string();
-        frame.push('\n');
         {
             let read = client.read_until_response_with_idle_timeout(
                 "test",
@@ -4653,7 +4718,7 @@ mod tests {
             for _ in 0..3 {
                 tokio::time::advance(std::time::Duration::from_millis(750)).await;
                 stdin
-                    .write_all(frame.as_bytes())
+                    .write_line(frame.clone())
                     .await
                     .expect("write activity");
                 let watchdog = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -5215,6 +5280,10 @@ sleep 1"#,
     // ── elicitation/create in the read loops ───────────────────────────────
 
     include!("acp/elicitation_read_loop_tests.rs");
+
+    // ── stdio tasks and buzz.wake metadata ──────────────────────────────────
+
+    include!("acp/wake_client_tests.rs");
 
     #[tokio::test]
     async fn active_run_id_sets_on_string() {
