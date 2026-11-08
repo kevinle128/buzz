@@ -11589,6 +11589,7 @@ mod error_outcome_emission_tests {
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                permission_decision_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );

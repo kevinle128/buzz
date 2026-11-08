@@ -4149,6 +4149,30 @@ mod tests {
         client
     }
 
+    /// Like [`spawn_script`], for tests that run with paused time.
+    ///
+    /// Under `start_paused` the 10 s ready-line timeout in `spawn_script`
+    /// elapses at once, because the clock auto-advances while the runtime
+    /// waits on process I/O. This variant waits for the ready line with no
+    /// timer.
+    async fn spawn_script_paused_time(script: &str) -> AcpClient {
+        const READY: &str = "buzz-acp-test-script-ready";
+        let mut client = AcpClient::spawn(
+            "bash",
+            &["-c".into(), format!("echo {READY}; {script}")],
+            &[],
+            false,
+        )
+        .await
+        .expect("failed to spawn test script");
+        let ready = client.reader.next().await;
+        assert!(
+            matches!(&ready, Some(Ok(line)) if line == READY),
+            "expected ready line, got {ready:?}"
+        );
+        client
+    }
+
     #[cfg(unix)]
     async fn spawn_named_script(name: &str, script: &str) -> (AcpClient, std::path::PathBuf) {
         use std::os::unix::fs::PermissionsExt;
@@ -6733,7 +6757,9 @@ sleep 1"#,
         // decision without needing access to nonce generation inside the loop.
         // The script immediately emits the terminal id=999 response (simulating the
         // adapter continuing after the permission response was written to its stdin).
-        let script = r#"echo '{"jsonrpc":"2.0","id":999,"result":{"done":true}}'"#;
+        // The script keeps its stdin open after the terminal response, so the
+        // permission response write cannot race the child's exit.
+        let script = r#"echo '{"jsonrpc":"2.0","id":999,"result":{"done":true}}'; sleep 5"#;
         let mut client = spawn_script(script).await;
 
         let config = ResolvedPermissionConfig::resolve(PermissionPolicy::Ask, None).unwrap();
@@ -6979,7 +7005,7 @@ sleep 1"#,
     #[tokio::test(start_paused = true)]
     async fn ask_permission_deadline_idle_suspension_and_capacity_recovery() {
         // Script that emits nothing (simulates an agent waiting for permission response).
-        let mut client = spawn_script("sleep 600").await;
+        let mut client = spawn_script_paused_time("sleep 600").await;
         let config = ResolvedPermissionConfig::resolve(PermissionPolicy::Ask, None).unwrap();
         client.set_permission_config(config);
         client.set_owner_pubkey_known(true);
@@ -7044,7 +7070,7 @@ sleep 1"#,
         // ── Part 2: capacity recovery after 8 sequential requests ───────────
         // Clear any stale entries and verify 8+ sequential requests can succeed
         // when previous resolved entries are drained between turns.
-        let mut client2 = spawn_script("sleep 600").await;
+        let mut client2 = spawn_script_paused_time("sleep 600").await;
         client2.set_permission_config(
             ResolvedPermissionConfig::resolve(PermissionPolicy::Ask, None).unwrap(),
         );
