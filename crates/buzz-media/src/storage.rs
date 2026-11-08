@@ -496,7 +496,11 @@ impl MediaStorage {
         sha256: &str,
     ) -> Result<BlobMeta, MediaError> {
         let key = Self::ctx_sidecar_key(ctx, sha256);
-        let resp = self.bucket.get_object(&self.physical_key(&key)).await?;
+        let resp = match self.bucket.get_object(&self.physical_key(&key)).await {
+            Ok(response) => response,
+            Err(s3::error::S3Error::HttpFailWithBody(404, _)) => return Err(MediaError::NotFound),
+            Err(error) => return Err(error.into()),
+        };
         let meta: BlobMeta = serde_json::from_slice(&resp.to_vec())?;
         Ok(meta)
     }

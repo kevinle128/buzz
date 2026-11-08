@@ -4,6 +4,7 @@ import 'channel_unread.dart';
 import '../../shared/widgets/collapsible_section_body.dart';
 import '../../shared/me/me_sync.dart';
 import '../../shared/hosted/hosted_relay_auth.dart';
+import '../../shared/hosted/organization_environment.dart';
 import '../../shared/hosted/organization_sign_in.dart';
 
 import 'dart:async';
@@ -129,7 +130,7 @@ class ChannelsPage extends HookConsumerWidget {
   });
 
   final WidgetBuilder settingsPageBuilder;
-  final Widget? messagesFilters;
+  final Widget Function(bool isCollapsed)? messagesFilters;
   final List<Widget> Function(VoidCallback openSwitcher, GlobalKey avatarKey)?
   messagesActionsBuilder;
   final Widget? soloSliver;
@@ -738,7 +739,9 @@ class ChannelsPage extends HookConsumerWidget {
                 padding: EdgeInsets.only(
                   right: 60 * headerCollapse.value / filterContentHeight,
                 ),
-                child: messagesFilters,
+                child: messagesFilters!(
+                  headerCollapse.value >= filterContentHeight,
+                ),
               ),
       ),
       body: _ChannelsBody(

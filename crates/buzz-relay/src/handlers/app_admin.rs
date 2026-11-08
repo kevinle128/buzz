@@ -922,7 +922,7 @@ mod tests {
         assert_eq!(
             metadata.pubkey,
             state.relay_keypair.public_key(),
-            "kind 39008 must be relay-signed"
+            "kind 39010 must be relay-signed"
         );
         assert_eq!(metadata.kind.as_u16() as u32, KIND_APP_METADATA);
         assert_eq!(metadata.content, "CI notifications");
