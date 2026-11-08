@@ -8,6 +8,7 @@ mod git_runtime_tests;
 mod acp;
 mod config;
 mod edit_routing;
+mod elicitation_intake;
 mod engram_fetch;
 mod filter;
 mod isolated_execution;
@@ -855,6 +856,15 @@ impl QueuedNormalListenerEvent {
         if !self.accepted || !queue.is_scope_in_flight(&self.scope) {
             return;
         }
+        // Any stop signal would cancel the turn that waits for a human answer
+        // and lose the question. The event stays queued for the next turn.
+        if pool.elicitations().is_pending(&self.scope) {
+            tracing::info!(
+                scope = %self.scope.telemetry_label(),
+                "question waits for an answer — event queued without steer or interrupt"
+            );
+            return;
+        }
         let Some(signal) = mode_gate_signal(handling, &self.effective_author, owner) else {
             return;
         };
@@ -885,6 +895,32 @@ impl QueuedNormalListenerEvent {
 }
 
 impl NormalListenerIngress {
+    /// Use this event as the answer to the open ACP form question of `scope`
+    /// when it is a reply in the question thread.
+    ///
+    /// Returns `None` when the event was consumed: it is not queued, gets no
+    /// 👀 reaction, and never steers or interrupts the waiting turn. The
+    /// caller runs this after the author gate, which decides who may answer.
+    fn answer_open_question(
+        self,
+        scope: &scope::SessionScope,
+        pool: &mut AgentPool,
+        poster: &elicitation_intake::ThreadPoster,
+    ) -> Option<Self> {
+        match pool
+            .elicitations_mut()
+            .intake(scope, &self.buzz_event.event, &self.effective_author)
+        {
+            elicitation_intake::Intake::NotForQuestion => Some(self),
+            elicitation_intake::Intake::Consumed { reply } => {
+                if let Some(reply) = reply {
+                    poster.post(reply);
+                }
+                None
+            }
+        }
+    }
+
     /// Resolve an admitted edit's original message once, before its session
     /// scope is derived, so scope, reactions, prompt, typing, steering, and
     /// failure notices all share one routing authority. The lookup is bounded
@@ -3359,6 +3395,13 @@ async fn run_harness(
     //      `IN_FLIGHT_DEADLINE_SECS` expires.
     let (steer_ack_tx, mut steer_ack_rx) = mpsc::unbounded_channel::<SteerAckEvent>();
 
+    // ACP form questions from prompt-task read loops and from the posting
+    // tasks. Unbounded because every producer is bounded: one open question
+    // per in-flight turn, and one post result per question. A dropped event
+    // would leave a question record that no turn owns.
+    let (elicitation_tx, mut elicitation_rx) =
+        mpsc::unbounded_channel::<acp::elicitation::ElicitationEvent>();
+
     // Startup is complete; the main loop now owns graceful shutdown.
     let _ = startup_ready.send(());
 
@@ -3415,12 +3458,16 @@ async fn run_harness(
         Result(Box<PromptResult>),
         Panic(tokio::task::JoinError),
         SteerAck(SteerAckEvent),
+        Elicitation(acp::elicitation::ElicitationEvent),
         Wake(u32, Result<AgentPool, String>),
         HoldDeadline,
         Recovery(recovery_wake::RecoveryWake),
     }
 
     loop {
+        // Every pool (also one that replaced a slept pool) routes ACP form
+        // questions to this loop.
+        pool.elicitations_mut().ensure_events_tx(&elicitation_tx);
         // Whether buffered work is waiting on a lazy pool. Also gates the
         // retry-deadline sleep arm below: a `Failed` lifecycle keeps its
         // (possibly past) `retry_at` until the next wake, so sleeping on it
@@ -3559,6 +3606,9 @@ async fn run_harness(
                 // locked semantics (Eva + Max + Perci).
                 Some(ack_event) = steer_ack_rx.recv() => {
                     Some(PoolEvent::SteerAck(ack_event))
+                }
+                Some(event) = elicitation_rx.recv() => {
+                    Some(PoolEvent::Elicitation(event))
                 }
                 Some((attempt, result)) = wake_rx.recv(), if config.lazy_pool && !pool_ready => {
                     Some(PoolEvent::Wake(attempt, result))
@@ -3946,6 +3996,22 @@ async fn run_harness(
                                 policy = %config.session_policy,
                                 "admitted event — resolved session scope"
                             );
+                            // A reply in the thread of an open ACP form
+                            // question answers it and is not queued. This
+                            // runs after the author gate on purpose: the gate
+                            // decides who may answer.
+                            let poster = elicitation_intake::ThreadPoster::new(
+                                config.keys.clone(),
+                                relay.event_publisher(),
+                                owner_cache.get().map(str::to_string),
+                                Some(ctx.rest_client.clone()),
+                                elicitation_tx.clone(),
+                            );
+                            let Some(ingress) =
+                                ingress.answer_open_question(&session_scope, &mut pool, &poster)
+                            else {
+                                continue; // consumed — do NOT push to queue
+                            };
                             let queued = ingress.push(&mut queue, session_scope, channel_is_dm);
                             // 👀 — immediate "seen" reaction, only if the event
                             // was actually queued (not dropped by DedupMode::Drop).
@@ -4388,7 +4454,7 @@ async fn run_harness(
                     // agent. Scope-exact so the fallback cancels the
                     // steered event's OWN thread, not a sibling thread
                     // in the same channel.
-                    signal_in_flight_task_for_scope(&mut pool, &scope, ControlSignal::Steer);
+                    signal_steer_fallback(&mut pool, &scope);
                 }
                 // After releasing a withheld event, give dispatch a chance
                 // to re-flush. If the prompt is still in flight, the
@@ -4406,6 +4472,16 @@ async fn run_harness(
                 ) {
                     typing_channels.insert(scope, thread_tags);
                 }
+            }
+            Some(PoolEvent::Elicitation(event)) => {
+                let poster = elicitation_intake::ThreadPoster::new(
+                    config.keys.clone(),
+                    relay.event_publisher(),
+                    owner_cache.get().map(str::to_string),
+                    Some(ctx.rest_client.clone()),
+                    elicitation_tx.clone(),
+                );
+                elicitation_intake::handle_event(&mut pool, &poster, event);
             }
             Some(PoolEvent::Wake(attempt, result)) => {
                 let completion = result.as_ref().map(|_| ()).map_err(|error| error.clone());
@@ -4672,14 +4748,18 @@ fn signal_in_flight_task(
         .values_mut()
         .find(|m| m.channel_id == Some(channel_id));
 
-    if let Some(meta) = entry {
-        if let Some(tx) = meta.control_tx.take() {
-            tracing::info!(channel = %channel_id, ?mode, "control signal sent to in-flight task");
-            let _ = tx.send(mode);
-            return true;
-        }
-    }
-    false
+    let Some(meta) = entry else {
+        return false;
+    };
+    let Some(tx) = meta.control_tx.take() else {
+        return false;
+    };
+    tracing::info!(channel = %channel_id, ?mode, "control signal sent to in-flight task");
+    let _ = tx.send(mode);
+    // Every control signal stops the turn, so its question is gone too.
+    let turn_id = meta.turn_id.clone();
+    pool.elicitations_mut().clear_turn(&turn_id);
+    true
 }
 
 /// Send a control signal to the in-flight task for one exact session scope.
@@ -4700,19 +4780,40 @@ fn signal_in_flight_task_for_scope(
         .values_mut()
         .find(|m| m.scope.as_ref() == Some(scope));
 
-    if let Some(meta) = entry {
-        if let Some(tx) = meta.control_tx.take() {
-            tracing::info!(
-                channel = %scope.channel_id(),
-                scope = %scope.telemetry_label(),
-                ?mode,
-                "control signal sent to in-flight task (scope-exact)"
-            );
-            let _ = tx.send(mode);
-            return true;
-        }
+    let Some(meta) = entry else {
+        return false;
+    };
+    let Some(tx) = meta.control_tx.take() else {
+        return false;
+    };
+    tracing::info!(
+        channel = %scope.channel_id(),
+        scope = %scope.telemetry_label(),
+        ?mode,
+        "control signal sent to in-flight task (scope-exact)"
+    );
+    let _ = tx.send(mode);
+    // Every control signal stops the turn, so its question is gone too.
+    let turn_id = meta.turn_id.clone();
+    pool.elicitations_mut().clear_turn(&turn_id);
+    true
+}
+
+/// Send the cancel+merge fallback of a failed native steer to the turn of
+/// `scope`, unless that turn waits for a human answer to an ACP form
+/// question: cancelling it would lose the question. The released event then
+/// stays queued and is dispatched after the turn ends.
+///
+/// Returns `true` if a signal was sent.
+fn signal_steer_fallback(pool: &mut AgentPool, scope: &scope::SessionScope) -> bool {
+    if pool.elicitations().is_pending(scope) {
+        tracing::info!(
+            scope = %scope.telemetry_label(),
+            "question waits for an answer — steer fallback not signalled"
+        );
+        return false;
     }
-    false
+    signal_in_flight_task_for_scope(pool, scope, ControlSignal::Steer)
 }
 
 /// Attempt the non-cancelling (ACP) steer for a freshly-queued event.
@@ -5288,6 +5389,19 @@ fn dispatch_pending(
         let turn_id = Uuid::new_v4().to_string();
         let task_turn_id = turn_id.clone();
 
+        if let Some(anchor_event_id) = elicitation_anchor(&batch) {
+            if let Some(sink) = pool
+                .elicitations()
+                .sink_for(acp::elicitation::ElicitationTurn {
+                    turn_id: turn_id.clone(),
+                    scope: scope.clone(),
+                    anchor_event_id,
+                })
+            {
+                agent.acp.install_elicitation_sink(sink);
+            }
+        }
+
         // Assign ownership before moving the worker into the task. If this is
         // a bounded-hold fork, the new generation immediately invalidates the
         // prior busy worker's copy when that worker eventually returns.
@@ -5345,6 +5459,23 @@ fn dispatch_pending(
         "dispatch_pending"
     );
     dispatched_channels
+}
+
+/// The thread an ACP form question of `batch`'s turn is posted in: the thread
+/// root of a thread scope, otherwise the thread of the newest event, which is
+/// where the turn replies. Lowercase hex.
+fn elicitation_anchor(batch: &FlushBatch) -> Option<String> {
+    batch
+        .scope
+        .root_event_id()
+        .map(str::to_ascii_lowercase)
+        .or_else(|| {
+            batch
+                .events
+                .last()
+                .or(batch.cancelled_events.last())
+                .map(queue::BatchEvent::reply_thread)
+        })
 }
 
 /// Returns `true` when `error` is a non-retryable authentication failure.
@@ -5481,6 +5612,8 @@ fn handle_prompt_result(
     pool.task_map_mut()
         .retain(|_, meta| meta.agent_index != agent_index);
     debug_assert_eq!(before, pool.task_map().len() + 1);
+    // The turn is over; its question (answered or not) is gone with it.
+    pool.elicitations_mut().clear_turn(&result.turn_id);
     if let PromptSource::Channel(scope) = &result.source {
         // The task may have invalidated this session before returning. Never
         // resurrect delivery state for a dead session; its replacement must
@@ -5889,6 +6022,7 @@ fn recover_panicked_agent(
         return;
     };
     let i = meta.agent_index;
+    pool.elicitations_mut().clear_turn(&meta.turn_id);
 
     // Requeue BEFORE mark_complete (same rationale as handle_prompt_result).
     if let Some(batch) = meta.recoverable_batch {
@@ -11538,7 +11672,7 @@ mod error_outcome_emission_tests {
     /// Spawn a real but inert agent subprocess (`cat`) so the error paths have
     /// an `OwnedAgent` to move into respawn or return to the pool. The error
     /// branches never talk to the subprocess.
-    async fn dummy_agent(index: usize) -> OwnedAgent {
+    pub(super) async fn dummy_agent(index: usize) -> OwnedAgent {
         OwnedAgent {
             index,
             acp: AcpClient::spawn("cat", &[], &[], false)
@@ -13944,3 +14078,6 @@ mod observer_payload_trim_tests {
 #[cfg(test)]
 #[path = "observer_audience_tests.rs"]
 mod observer_audience_tests;
+
+#[cfg(test)]
+mod elicitation_intake_tests;

@@ -8,6 +8,7 @@
 //! 4. [`AcpClient::session_prompt_with_idle_timeout`] — send prompt with idle/hard deadline, return stop reason
 //! 5. [`AcpClient::session_cancel`] / [`AcpClient::cancel_with_cleanup`] — cancel in-flight turn
 
+pub(crate) mod elicitation;
 mod launch;
 
 use futures_util::StreamExt;
@@ -206,6 +207,18 @@ struct PermissionEntry {
     deadline: tokio::time::Instant,
 }
 
+/// An `elicitation/create` request that waits for a reply from the thread.
+#[derive(Debug)]
+struct PendingElicitation {
+    /// JSON-RPC id as received, for the response.
+    id: serde_json::Value,
+    /// Serialized id, the key the main loop uses for this question.
+    id_key: String,
+    /// The route of the turn that asked, kept so that a late drain reports
+    /// to that turn and never to a later one.
+    sink: elicitation::ElicitationSink,
+}
+
 /// ACP client that owns an agent subprocess and communicates over its stdio.
 ///
 /// One `AcpClient` per agent process. Multiple sessions can be created on the
@@ -308,6 +321,17 @@ pub struct AcpClient {
     /// outside of a goose-native turn — the read loop's steer arm is
     /// disabled in that case.
     steer_rx: Option<tokio::sync::mpsc::Receiver<crate::pool::SteerRequest>>,
+    /// Per-turn route that takes `elicitation/create` questions to the main
+    /// loop. Installed by the dispatcher with
+    /// [`install_elicitation_sink`](Self::install_elicitation_sink) and
+    /// cleared when the prompt task returns its agent. `None` refuses every
+    /// question with `cancel`.
+    elicitation_sink: Option<elicitation::ElicitationSink>,
+    /// The one `elicitation/create` request of this turn that waits for a
+    /// human reply. Every turn exit path answers it `cancel` (see
+    /// [`drain_elicitation`](Self::drain_elicitation)), so it never survives
+    /// a turn.
+    pending_elicitation: Option<PendingElicitation>,
     /// Usage tracker for goose/buzz-agent's cumulative notification format.
     goose_usage: UsageTracker,
     /// Per-turn prompt-response usage and Claude's optional cumulative cost.
@@ -496,6 +520,12 @@ enum SteerTransport {
 
 fn build_client_capabilities() -> serde_json::Value {
     serde_json::json!({
+        // Buzz can show a flat form question as a thread message and read the
+        // answer from a thread reply. URL mode is not declared: it needs a
+        // secure browser context that a thread message cannot give.
+        "elicitation": {
+            "form": {}
+        },
         // Signal to ACP adapters that Buzz can hand users to terminal-native
         // auth flows. Adapters decide which auth methods to expose; Buzz does
         // not hardcode vendor login commands from this capability.
@@ -744,6 +774,8 @@ impl AcpClient {
             active_run_id: None,
             steering_supported: false,
             steer_rx: None,
+            elicitation_sink: None,
+            pending_elicitation: None,
             goose_usage: UsageTracker::default(),
             standard_usage: StandardUsageTracker::default(),
             standard_adapter,
@@ -1022,6 +1054,10 @@ impl AcpClient {
         idle_timeout: std::time::Duration,
         max_duration: std::time::Duration,
     ) -> Result<StopReason, AcpError> {
+        // A question left by a turn whose read loop was dropped without the
+        // cancel path still gets its `cancel` before the next turn starts.
+        self.drain_elicitation(elicitation::CloseReason::Ended)
+            .await;
         let params = build_prompt_params(session_id, prompt_blocks);
         let hard_deadline = tokio::time::Instant::now() + max_duration;
         self.current_hard_deadline = Some(hard_deadline);
@@ -1059,6 +1095,14 @@ impl AcpClient {
                 max_duration,
             )
             .await;
+        // No question survives its turn: answer `cancel` on every outcome
+        // before the caller sees it. At the hard deadline the thread also gets
+        // the expiry notice.
+        let close_reason = match &result {
+            Err(AcpError::HardTimeout { .. }) => elicitation::CloseReason::Expired,
+            _ => elicitation::CloseReason::Ended,
+        };
+        self.drain_elicitation(close_reason).await;
 
         // On timeout errors, leave current_hard_deadline set so cancel_with_cleanup
         // can inherit the remaining budget. Clear it on all other outcomes.
@@ -1180,6 +1224,133 @@ impl AcpClient {
     /// Idempotent — safe to call when `steer_rx` is already `None`.
     pub fn clear_steer_rx(&mut self) {
         self.steer_rx = None;
+    }
+
+    /// Install the per-turn route for `elicitation/create` questions.
+    ///
+    /// Called by the dispatcher before the prompt task starts. A previous
+    /// turn's route is replaced; [`clear_elicitation_sink`](Self::clear_elicitation_sink)
+    /// removes it when the task returns its agent.
+    pub fn install_elicitation_sink(&mut self, sink: elicitation::ElicitationSink) {
+        self.elicitation_sink = Some(sink);
+    }
+
+    /// Remove the per-turn question route. Idempotent.
+    pub fn clear_elicitation_sink(&mut self) {
+        self.elicitation_sink = None;
+    }
+
+    /// Whether a question of this turn waits for a reply.
+    #[cfg(test)]
+    pub(crate) fn has_pending_elicitation(&self) -> bool {
+        self.pending_elicitation.is_some()
+    }
+
+    /// Answer an in-turn `elicitation/create` request, or register it.
+    ///
+    /// Returns the receiver of the human reply when the question is open.
+    /// Every other outcome writes its response at once: `-32602` for a mode
+    /// Buzz did not declare, otherwise `{"action":"cancel"}`.
+    async fn handle_elicitation_request(
+        &mut self,
+        msg: &serde_json::Value,
+        session_id: &str,
+    ) -> Result<Option<tokio::sync::oneshot::Receiver<elicitation::ElicitationReply>>, AcpError>
+    {
+        let Some(id) = msg.get("id").cloned() else {
+            tracing::warn!(target: "acp::elicitation", "elicitation/create without id — ignoring");
+            return Ok(None);
+        };
+        let open = match elicitation::check_request(&msg["params"], session_id) {
+            elicitation::RequestCheck::InvalidParams(why) => {
+                tracing::warn!(target: "acp::elicitation", "elicitation id={id} invalid: {why}");
+                self.write_ndjson(&elicitation::invalid_params_response(&id, &why))
+                    .await?;
+                return Ok(None);
+            }
+            elicitation::RequestCheck::Refuse(why) => {
+                tracing::warn!(target: "acp::elicitation", "elicitation id={id} refused: {why}");
+                self.write_elicitation_cancel(&id).await?;
+                if let Some(sink) = &self.elicitation_sink {
+                    sink.refused();
+                }
+                return Ok(None);
+            }
+            elicitation::RequestCheck::Open(open) => open,
+        };
+        // `cancel_with_cleanup_until` takes `last_prompt_id` before its drain
+        // read, so `None` here means the turn is already stopping.
+        let sink = match (&self.elicitation_sink, &self.pending_elicitation) {
+            _ if self.last_prompt_id.is_none() => Err("the turn is stopping"),
+            (_, Some(_)) => Err("another question of this turn is still open"),
+            (None, None) => Err("this turn has no thread to ask in"),
+            (Some(sink), None) => Ok(sink.clone()),
+        };
+        let sink = match sink {
+            Ok(sink) => sink,
+            Err(why) => {
+                tracing::warn!(target: "acp::elicitation", "elicitation id={id} cancelled: {why}");
+                self.write_elicitation_cancel(&id).await?;
+                return Ok(None);
+            }
+        };
+        let id_key = id.to_string();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        if !sink.opened(&id_key, open.message, open.schema, reply_tx) {
+            tracing::warn!(
+                target: "acp::elicitation",
+                "elicitation id={id} cancelled: the main loop is gone"
+            );
+            self.write_elicitation_cancel(&id).await?;
+            return Ok(None);
+        }
+        tracing::info!(
+            target: "acp::elicitation",
+            "elicitation id={id} opened (toolCallId={:?})",
+            open.tool_call_id
+        );
+        self.pending_elicitation = Some(PendingElicitation { id, id_key, sink });
+        Ok(Some(reply_rx))
+    }
+
+    async fn write_elicitation_cancel(&mut self, id: &serde_json::Value) -> Result<(), AcpError> {
+        self.write_ndjson(&elicitation::reply_response(
+            id,
+            &elicitation::ElicitationReply::Cancel,
+        ))
+        .await
+    }
+
+    /// Write `reply` for the pending question and report it closed.
+    async fn finish_elicitation(
+        &mut self,
+        reply: &elicitation::ElicitationReply,
+        reason: elicitation::CloseReason,
+    ) -> Result<(), AcpError> {
+        let Some(pending) = self.pending_elicitation.take() else {
+            return Ok(());
+        };
+        let written = self
+            .write_ndjson(&elicitation::reply_response(&pending.id, reply))
+            .await;
+        pending.sink.closed(&pending.id_key, reason);
+        written
+    }
+
+    /// Answer the pending question `cancel` on a turn exit path.
+    ///
+    /// Best effort: the turn is already ending, so a failed write is logged
+    /// and the exit path continues.
+    async fn drain_elicitation(&mut self, reason: elicitation::CloseReason) {
+        if let Err(error) = self
+            .finish_elicitation(&elicitation::ElicitationReply::Cancel, reason)
+            .await
+        {
+            tracing::warn!(
+                target: "acp::elicitation",
+                "could not answer cancel to the pending question: {error}"
+            );
+        }
     }
 
     /// Returns `true` if no steer receiver is currently installed.
@@ -1360,6 +1531,11 @@ impl AcpClient {
             self.permission_responded = false;
         }
 
+        // A question of the stopping turn gets `cancel` before the turn
+        // itself is cancelled.
+        self.drain_elicitation(elicitation::CloseReason::Ended)
+            .await;
+
         // Step 2: send session/cancel notification (no id)
         self.session_cancel(session_id).await?;
         tracing::info!(target: "acp::cancel", "sent session/cancel for {session_id}");
@@ -1379,7 +1555,12 @@ impl AcpClient {
                 hard_deadline,
                 remaining,
             )
-            .await?;
+            .await;
+        // The drain read answers new questions `cancel` at once, so this is a
+        // backstop that keeps the invariant on every outcome.
+        self.drain_elicitation(elicitation::CloseReason::Ended)
+            .await;
+        let result = result?;
         // Cancel completed — drain any remaining permission entries (they were
         // answered with cancelled above, but drain Resolved ones to free capacity).
         self.pending_permissions.clear();
@@ -1623,6 +1804,19 @@ impl AcpClient {
                             self.handle_permission_request(&msg, true, deadline).await?;
                         }
                     }
+                    elicitation::ELICITATION_METHOD => {
+                        // Outside a prompt turn there is no thread to ask in.
+                        // `cancel` tells the agent that no human saw the
+                        // question; `-32601` would claim the method is absent
+                        // although the client declares it.
+                        if let Some(id) = msg.get("id") {
+                            tracing::warn!(
+                                target: "acp::elicitation",
+                                "elicitation id={id} outside a turn — answering cancel"
+                            );
+                            self.write_elicitation_cancel(id).await?;
+                        }
+                    }
                     other => {
                         // If the unknown message has an id, it's a request expecting a reply.
                         // Silence would cause the agent to hang waiting for a response.
@@ -1709,6 +1903,14 @@ impl AcpClient {
             tokio::sync::oneshot::Sender<crate::pool::SteerAck>,
         )> = None;
 
+        // Receiver of the human reply to this turn's open question. Local, so
+        // that `self.reader` and the reply can both be polled in `select!`.
+        // Dropping it (the read loop returns or is dropped) closes the route;
+        // the question itself stays on `self` until a drain answers it.
+        let mut elicitation_reply_rx: Option<
+            tokio::sync::oneshot::Receiver<elicitation::ElicitationReply>,
+        > = None;
+
         let now = Instant::now();
         let mut idle_deadline = now + idle_timeout;
         let mut hard_deadline = hard_deadline;
@@ -1736,9 +1938,12 @@ impl AcpClient {
                 .pending_permissions
                 .values()
                 .any(|e| matches!(e.state, PermissionEntryState::Pending));
+            // A question waits for a human, so agent silence is expected too.
+            // Its deadline is the turn hard deadline.
+            let has_pending_elicitation = self.pending_elicitation.is_some();
             let next_deadline;
             let idle_fires_first;
-            if has_pending_permissions {
+            if has_pending_permissions || has_pending_elicitation {
                 // Suspend idle; find earliest permission deadline (capped by hard).
                 let earliest_perm = self
                     .pending_permissions
@@ -1952,6 +2157,33 @@ impl AcpClient {
                         );
                     }
                     None // loop back; don't set read_result
+                }
+                // Human reply arm, before the reader for the same reason as
+                // the decision arm. Cancel-safe: polling `&mut Receiver`
+                // does not lose the value on drop. A closed route (the main
+                // loop dropped its record) answers `cancel`.
+                reply = async {
+                    match elicitation_reply_rx.as_mut() {
+                        Some(rx) => rx.await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    elicitation_reply_rx = None;
+                    let (reply, reason) = match reply {
+                        Ok(reply) => (reply, elicitation::CloseReason::Replied),
+                        Err(_) => (
+                            elicitation::ElicitationReply::Cancel,
+                            elicitation::CloseReason::Ended,
+                        ),
+                    };
+                    self.finish_elicitation(&reply, reason).await?;
+                    // The idle clock was suspended while the human decided.
+                    // Restart it so that a long wait does not count as agent
+                    // silence.
+                    let activity_now = Instant::now();
+                    idle_deadline = activity_now + idle_timeout;
+                    last_activity_at = activity_now;
+                    None
                 }
                 read_result = self.reader.next() => Some(read_result),
                 // Steer arm: gated off whenever a steer write is already in
@@ -2297,6 +2529,13 @@ impl AcpClient {
                                     hard_deadline,
                                 )
                                 .await?;
+                            }
+                            elicitation::ELICITATION_METHOD => {
+                                if let Some(rx) =
+                                    self.handle_elicitation_request(&msg, session_id).await?
+                                {
+                                    elicitation_reply_rx = Some(rx);
+                                }
                             }
                             other => {
                                 // If the unknown message has an id, it's a request expecting a reply.
@@ -4972,6 +5211,10 @@ sleep 1"#,
     // ── claude-agent-acp _meta.systemPrompt transport ─────────────────────
 
     include!("acp/system_prompt_tests.rs");
+
+    // ── elicitation/create in the read loops ───────────────────────────────
+
+    include!("acp/elicitation_read_loop_tests.rs");
 
     #[tokio::test]
     async fn active_run_id_sets_on_string() {

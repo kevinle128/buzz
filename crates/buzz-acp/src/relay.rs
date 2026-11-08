@@ -768,6 +768,13 @@ impl RelayEventPublisher {
         });
         (Self { cmd_tx }, event_rx)
     }
+
+    /// Test-only publisher whose relay task is gone, so every publish fails.
+    #[cfg(test)]
+    pub(crate) fn closed_for_test() -> Self {
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<RelayCommand>(1);
+        Self { cmd_tx }
+    }
 }
 
 impl HarnessRelay {

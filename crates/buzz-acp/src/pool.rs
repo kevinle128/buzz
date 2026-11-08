@@ -393,6 +393,9 @@ pub struct AgentPool {
     /// `Thread` scopes (the sole variant [`hold_decision`](Self::hold_decision)
     /// stamps).
     held_since: HashMap<SessionScope, tokio::time::Instant>,
+    /// Open ACP form questions, one per scope. Derived state of in-flight
+    /// turns: cleared on every turn-end, stop, invalidation, and respawn path.
+    elicitations: crate::elicitation_intake::ElicitationRegistry,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -966,7 +969,20 @@ impl AgentPool {
             session_owners: HashMap::new(),
             next_scope_owner_generation: 1,
             held_since: HashMap::new(),
+            elicitations: Default::default(),
         }
+    }
+
+    /// Open ACP form questions of in-flight turns.
+    pub(crate) fn elicitations(&self) -> &crate::elicitation_intake::ElicitationRegistry {
+        &self.elicitations
+    }
+
+    /// Mutable access to the open ACP form questions.
+    pub(crate) fn elicitations_mut(
+        &mut self,
+    ) -> &mut crate::elicitation_intake::ElicitationRegistry {
+        &mut self.elicitations
     }
 
     /// Record `agent_index` as the newest owner of `scope`, returning the
@@ -1043,6 +1059,22 @@ impl AgentPool {
             .get(scope)
             .map(|owner| owner.agent_index)
             .unwrap_or_default();
+        // A question waits for a human in this scope. A forked session would
+        // run the thread a second time while the first turn still waits, so
+        // hold without a deadline: the stamp is removed so that the hold
+        // deadline wake does not fire again at once, and the owner's return
+        // wakes the dispatcher.
+        if self.elicitations.is_pending(scope) {
+            let held_for = self
+                .held_since
+                .remove(scope)
+                .map(|first| now.saturating_duration_since(first))
+                .unwrap_or_default();
+            return HoldDecision::Hold {
+                held_for,
+                owner_index,
+            };
+        }
         let first = *self.held_since.entry(scope.clone()).or_insert(now);
         let held_for = now.saturating_duration_since(first);
         if held_for >= timeout {
@@ -1087,6 +1119,9 @@ impl AgentPool {
 
     /// Return an agent to its slot after a task completes.
     pub fn return_agent(&mut self, mut agent: OwnedAgent) {
+        // An idle worker runs no turn, so it can own no open question. This
+        // also covers a respawned worker that takes over the slot.
+        self.elicitations.clear_agent(agent.index);
         let stale_scopes: Vec<SessionScope> = agent
             .state
             .sessions
@@ -1355,6 +1390,8 @@ impl AgentPool {
         // reference a scope whose sessions are gone.
         self.held_since
             .retain(|scope, _| scope.channel_id() != channel_id);
+        // A question in a channel the agent left cannot get an answer.
+        self.elicitations.clear_channel(channel_id);
         count
     }
 
@@ -1377,6 +1414,7 @@ impl AgentPool {
         }
         self.session_owners.remove(scope);
         self.held_since.remove(scope);
+        self.elicitations.clear_scope(scope);
         count
     }
 
@@ -2405,6 +2443,7 @@ fn send_prompt_result(
     batch: Option<FlushBatch>,
 ) {
     agent.acp.clear_steer_rx();
+    agent.acp.clear_elicitation_sink();
     let _ = result_tx.send(PromptResult {
         agent,
         source,

@@ -295,6 +295,51 @@ Forum event kinds:
 
 > **Note:** Without `--no-mention-filter` (or `require_mention = false`), the default `subscribe=mentions` mode filters events that don't @mention the agent — forum posts will be invisible.
 
+## Questions From the Agent (ACP Form Elicitation)
+
+`initialize` declares `clientCapabilities.elicitation.form`. URL mode is not
+declared, so an `elicitation/create` request with `mode: "url"` gets JSON-RPC
+error `-32602`.
+
+During a prompt turn, a form request for that turn's session becomes a plain
+kind 9 reply in the turn's thread, signed by the agent key. The thread is the
+thread root under `--session-policy thread`, else the thread of the message
+that started the turn. The owner is `p`-tagged when known. The message lists
+the answer words from the schema.
+
+A human answers with a reply in that thread that mentions the agent:
+
+```text
+@<agent> approve
+@<agent> reject keep the upstream version of foo.ts
+@<agent> decline
+@<agent> cancel
+```
+
+- After the leading mentions, only the first word counts. An enum value (or
+  `yes`/`no`/`true`/`false` for a boolean) answers `accept` with that value;
+  the rest of the text fills the string property. `decline` and `cancel` give
+  those actions, unless the enum itself has that value.
+- The `respond_to` author gate decides who may answer: anyone whose messages
+  the agent accepts. There is no separate answer list.
+- The first valid answer wins. A later answer gets "Already answered by …"
+  and is not sent. A reply that is not an answer while the question waits gets
+  one hint with the expected words and is not queued.
+- Replies in other threads never answer. While a question waits, other events
+  in that scope are queued, never steered or interrupted into the turn.
+
+Supported schemas: a flat object with at most one enum-or-boolean property and
+at most one string property. Other schemas, a request for another session, or
+a request outside a turn get `{"action":"cancel"}` at once (with one thread
+notice when a turn is running). The question waits up to the turn hard
+deadline (`--max-turn-duration`); the idle timeout is suspended meanwhile. Every
+turn exit (end, cancel, timeout, error) answers an open question `cancel`. At
+the hard deadline the thread gets "The question expired; mention me in this
+thread to ask again."
+
+Note: under the default `--subscribe mentions` mode only events that `p`-tag
+the agent reach the harness, so an answer must mention the agent.
+
 ## How It Works
 
 1. **Startup** — Spawns N agent subprocesses (default 1), sends ACP `initialize` to each, connects to the relay with NIP-42 auth.
