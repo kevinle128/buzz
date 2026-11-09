@@ -4596,11 +4596,14 @@ mod postgres_tests {
         })
         .await
         .expect("connect isolated migration DB");
-        crate::migration::run_migrations_through(&db.pool, 88)
+        crate::migration::run_migrations_through(&db.pool, 66)
             .await
             .expect("migrate with fence objects present");
         let store = db.deletion_store();
-        let legacy_fenced_tables = store.live_fenced_tables().await.expect("legacy fences");
+        let mut legacy_fenced_tables = store.live_fenced_tables().await.expect("legacy fences");
+        // The fork-only App migration (0088) still attaches the legacy fence to
+        // its two tables. Every other table created after 0066 must not get one.
+        legacy_fenced_tables.extend(["apps", "app_callback_deliveries"].map(str::to_owned));
         // Include current tables without requiring new application-admitted
         // tables to acquire legacy database fence triggers.
         db.migrate()
