@@ -80,6 +80,8 @@ pub const RELAY_ADMIN_TABLES: &[(&str, &str)] = &[
 pub const EXPECTED_SCOPED_TABLES: &[&str] = &[
     "nip_fi_profile_heads",
     "api_tokens",
+    "app_callback_deliveries",
+    "apps",
     "archived_identities",
     "artifact_heads",
     "artifact_revisions",
@@ -145,6 +147,9 @@ pub const PURGE_SCOPED_TABLES: &[&str] = &[
     "moderation_reports",
     "subscriptions",
     "api_tokens",
+    // Callback deliveries reference their App.
+    "app_callback_deliveries",
+    "apps",
     "channel_members",
     "thread_metadata",
     "moderation_actions",
