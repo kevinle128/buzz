@@ -2257,954 +2257,971 @@ pub(crate) mod tests {
         assert_eq!(cloned.status, ApprovalStatus::Granted);
     }
 
-    // -- Scheduled workflow claim confinement ---------------------------------
-    //
-    // RECONCILED spec (supersedes the earlier S1 lock; Eva/Max 2026-06-27).
-    //
-    // The earlier S1 lock asserted "`workflow_id` is globally unique, so the
-    // claim resolves community server-side from `workflow_id` alone and the
-    // caller never names it." The final schema does NOT have that property:
-    // `workflows` PK is `(community_id, id)` and `scheduled_workflow_fires` is
-    // keyed/FK'd by `(community_id, workflow_id, scheduled_for)`. Duplicate
-    // workflow UUIDs across communities are explicitly allowed (and pinned by
-    // the Issue-4 confinement tests below). So resolve-from-id-alone is both
-    // unimplementable and unsafe: `WHERE w.id = $1` matches every community
-    // holding that UUID and fans one claim across all of them.
-    //
-    // The invariant that survives is NOT "the claim never receives community";
-    // it is "the community used for the claim is server provenance, never
-    // client-controlled." For the global scheduler scan that provenance is the
-    // `workflow.community_id` returned by `list_all_enabled_workflows()`. The
-    // claim therefore takes `community_id` and binds
-    // `WHERE w.community_id = $1 AND w.id = $2`, confining the claim row to the
-    // intended tenant.
-    //
-    //   1. `workflows.community_id` is row-owned, NOT NULL, immutable.
-    //   2. The claim binds `(community_id, workflow_id)` of the workflow row.
-    //   3. Claim uniqueness is `(community_id, workflow_id, scheduled_for)`.
-    //   4. `latest_scheduled_workflow_fire` / `attach_scheduled_workflow_run`
-    //      are already community-scoped; `claim` now matches.
-    //
-    // `claim_confined_to_its_community` is the confinement lock: a dup workflow
-    // UUID in A and B must claim independently (claiming A/id leaves B/id
-    // claimable). The other two tests are characterization guards: same-window
-    // race must yield exactly one winner, and pruning below the largest
-    // interval breaks `latest_*` (the §5c retention rule Sami flagged).
+    /// PostgreSQL-backed tests; the CI discovery guard runs them from this module.
+    pub(crate) mod postgres_tests {
+        use super::*;
 
-    use crate::user::ensure_user;
+        // -- Scheduled workflow claim confinement ---------------------------------
+        //
+        // RECONCILED spec (supersedes the earlier S1 lock; Eva/Max 2026-06-27).
+        //
+        // The earlier S1 lock asserted "`workflow_id` is globally unique, so the
+        // claim resolves community server-side from `workflow_id` alone and the
+        // caller never names it." The final schema does NOT have that property:
+        // `workflows` PK is `(community_id, id)` and `scheduled_workflow_fires` is
+        // keyed/FK'd by `(community_id, workflow_id, scheduled_for)`. Duplicate
+        // workflow UUIDs across communities are explicitly allowed (and pinned by
+        // the Issue-4 confinement tests below). So resolve-from-id-alone is both
+        // unimplementable and unsafe: `WHERE w.id = $1` matches every community
+        // holding that UUID and fans one claim across all of them.
+        //
+        // The invariant that survives is NOT "the claim never receives community";
+        // it is "the community used for the claim is server provenance, never
+        // client-controlled." For the global scheduler scan that provenance is the
+        // `workflow.community_id` returned by `list_all_enabled_workflows()`. The
+        // claim therefore takes `community_id` and binds
+        // `WHERE w.community_id = $1 AND w.id = $2`, confining the claim row to the
+        // intended tenant.
+        //
+        //   1. `workflows.community_id` is row-owned, NOT NULL, immutable.
+        //   2. The claim binds `(community_id, workflow_id)` of the workflow row.
+        //   3. Claim uniqueness is `(community_id, workflow_id, scheduled_for)`.
+        //   4. `latest_scheduled_workflow_fire` / `attach_scheduled_workflow_run`
+        //      are already community-scoped; `claim` now matches.
+        //
+        // `claim_confined_to_its_community` is the confinement lock: a dup workflow
+        // UUID in A and B must claim independently (claiming A/id leaves B/id
+        // claimable). The other two tests are characterization guards: same-window
+        // race must yield exactly one winner, and pruning below the largest
+        // interval breaks `latest_*` (the §5c retention rule Sami flagged).
 
-    const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1 -- local test-only credentials
+        use crate::user::ensure_user;
 
-    pub(crate) async fn setup_pool() -> PgPool {
-        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| TEST_DB_URL.to_owned());
+        const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1 -- local test-only credentials
 
-        PgPool::connect(&database_url)
-            .await
-            .expect("connect to test DB")
-    }
+        pub(crate) async fn setup_pool() -> PgPool {
+            let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
+                .or_else(|_| std::env::var("DATABASE_URL"))
+                .unwrap_or_else(|_| TEST_DB_URL.to_owned());
 
-    /// Insert a community with a unique host. Returns its `CommunityId`.
-    pub(crate) async fn make_community(pool: &PgPool) -> CommunityId {
-        let id = Uuid::new_v4();
-        let host = format!("test-{}.example", id.simple());
-        sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+            PgPool::connect(&database_url)
+                .await
+                .expect("connect to test DB")
+        }
+
+        /// Insert a community with a unique host. Returns its `CommunityId`.
+        pub(crate) async fn make_community(pool: &PgPool) -> CommunityId {
+            let id = Uuid::new_v4();
+            let host = format!("test-{}.example", id.simple());
+            sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+                .bind(id)
+                .bind(&host)
+                .execute(pool)
+                .await
+                .expect("insert community");
+            CommunityId::from_uuid(id)
+        }
+
+        /// Insert a channel under a community. Returns the channel id.
+        async fn make_channel(pool: &PgPool, community: CommunityId, owner: &[u8]) -> Uuid {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                r#"
+                INSERT INTO channels (id, community_id, name, created_by)
+                VALUES ($1, $2, $3, $4)
+                "#,
+            )
             .bind(id)
-            .bind(&host)
+            .bind(community.as_uuid())
+            .bind(format!("ch-{}", id.simple()))
+            .bind(owner)
             .execute(pool)
             .await
-            .expect("insert community");
-        CommunityId::from_uuid(id)
-    }
-
-    /// Insert a channel under a community. Returns the channel id.
-    async fn make_channel(pool: &PgPool, community: CommunityId, owner: &[u8]) -> Uuid {
-        let id = Uuid::new_v4();
-        sqlx::query(
-            r#"
-            INSERT INTO channels (id, community_id, name, created_by)
-            VALUES ($1, $2, $3, $4)
-            "#,
-        )
-        .bind(id)
-        .bind(community.as_uuid())
-        .bind(format!("ch-{}", id.simple()))
-        .bind(owner)
-        .execute(pool)
-        .await
-        .expect("insert channel");
-        id
-    }
-
-    /// Insert a workflow whose tenant is `community`'s channel. Returns the
-    /// workflow id and the owning community for callers that want to assert
-    /// the resolved tenant.
-    pub(crate) async fn make_workflow_in(
-        pool: &PgPool,
-        community: CommunityId,
-    ) -> (Uuid, CommunityId) {
-        let owner = vec![0xa1; 32];
-        ensure_user(pool, community, &owner)
-            .await
-            .expect("ensure owner");
-        let channel_id = make_channel(pool, community, &owner).await;
-        let workflow_id = create_workflow(
-            pool,
-            community,
-            Some(channel_id),
-            &owner,
-            "f1-attack-workflow",
-            r#"{"trigger":{"on":"schedule"},"steps":[]}"#,
-            &[0u8; 32],
-        )
-        .await
-        .expect("create workflow");
-        (workflow_id, community)
-    }
-
-    /// Confinement: a duplicate workflow UUID existing in both community A and
-    /// community B must claim independently. Claiming `(A, id, t)` must NOT
-    /// consume `(B, id, t)` — B's identical instant stays claimable, and the
-    /// A-claim's resolved community is A (server provenance), never B.
-    ///
-    /// This is the reconciliation of the old S1 lock with the real
-    /// `(community_id, id)` schema: because `id` is not globally unique, the
-    /// claim binds `WHERE w.community_id = $1 AND w.id = $2`. With the old
-    /// bare-`id` SQL (`WHERE w.id = $1`), a single `INSERT ... SELECT` matched
-    /// BOTH workflow rows and fanned the claim across A and B — this test goes
-    /// RED on that regression (B/id is no longer independently claimable).
-    #[tokio::test]
-    #[ignore = "requires Postgres"]
-    async fn claim_confined_to_its_community() {
-        let pool = setup_pool().await;
-
-        let community_a = make_community(&pool).await;
-        let community_b = make_community(&pool).await;
-
-        // Same workflow UUID + same channel UUID in both communities — the PK
-        // is `(community_id, id)`, so the collision is structurally allowed.
-        let workflow_id = Uuid::new_v4();
-        let channel_id = Uuid::new_v4();
-        insert_workflow_with_ids(&pool, community_a, workflow_id, channel_id, "sched-a").await;
-        insert_workflow_with_ids(&pool, community_b, workflow_id, channel_id, "sched-b").await;
-
-        let scheduled_for = Utc.with_ymd_and_hms(2026, 6, 27, 0, 0, 0).unwrap();
-
-        // Claim A/id/t.
-        let claim_a = claim_scheduled_workflow_fire(&pool, community_a, workflow_id, scheduled_for)
-            .await
-            .expect("claim A should not error")
-            .expect("claim A should win");
-        assert_eq!(
-            claim_a.community_id, community_a,
-            "A-claim must resolve to community A (server provenance)"
-        );
-        assert_eq!(claim_a.workflow_id, workflow_id);
-        assert_eq!(claim_a.scheduled_for, scheduled_for);
-
-        // B/id/t must still be claimable — A's claim did not touch B's row.
-        let claim_b = claim_scheduled_workflow_fire(&pool, community_b, workflow_id, scheduled_for)
-            .await
-            .expect("claim B should not error")
-            .expect("claim B must still win — A's claim must not have consumed B's instant");
-        assert_eq!(
-            claim_b.community_id, community_b,
-            "B-claim must resolve to community B"
-        );
-
-        // And a second A-claim for the same instant must now lose (dedup holds
-        // within the community).
-        let claim_a_again =
-            claim_scheduled_workflow_fire(&pool, community_a, workflow_id, scheduled_for)
-                .await
-                .expect("second A-claim should not error");
-        assert!(
-            claim_a_again.is_none(),
-            "the same (A, id, t) instant must not be claimable twice"
-        );
-    }
-
-    /// Same `(community_id, workflow_id, scheduled_for)` claimed concurrently by
-    /// N tasks must yield exactly one `Some` winner. Post-reconciliation the
-    /// claim key is `(community_id, workflow_id, scheduled_for)`; `community_id`
-    /// is server provenance, not a client-named label. Characterization guard:
-    /// protects the dedup boundary against regressions in the claim SQL.
-    #[tokio::test]
-    #[ignore = "requires Postgres"]
-    async fn concurrent_same_window_claims_exactly_one_wins() {
-        let pool = setup_pool().await;
-
-        let community = make_community(&pool).await;
-        let (workflow_id, _) = make_workflow_in(&pool, community).await;
-        let scheduled_for = Utc.with_ymd_and_hms(2026, 6, 27, 0, 1, 0).unwrap();
-
-        const N: usize = 8;
-        let mut handles = Vec::with_capacity(N);
-        for _ in 0..N {
-            let pool = pool.clone();
-            handles.push(tokio::spawn(async move {
-                claim_scheduled_workflow_fire(&pool, community, workflow_id, scheduled_for).await
-            }));
+            .expect("insert channel");
+            id
         }
 
-        let mut winners = 0usize;
-        for h in handles {
-            let result = h.await.expect("task did not panic").expect("claim ok");
-            if result.is_some() {
-                winners += 1;
-            }
-        }
-        assert_eq!(
-            winners, 1,
-            "exactly one task must win the claim race for (workflow_id, scheduled_for)"
-        );
-    }
-
-    /// `attach_scheduled_workflow_run` links a won claim to the run it created.
-    /// This is the regression for the missing `scheduled_workflow_fires.
-    /// workflow_run_id` column: before the schema added it, the UPDATE failed at
-    /// runtime with `column "workflow_run_id" does not exist`, so the audit link
-    /// silently never populated and the scheduler warned on every fire. This test
-    /// proves the column is present, the attach writes it, and the
-    /// `workflow_run_id IS NULL` guard makes a second attach a no-op. It is RED
-    /// without the migration column.
-    #[tokio::test]
-    #[ignore = "requires Postgres"]
-    async fn attach_links_run_to_claim_and_is_idempotent() {
-        let pool = setup_pool().await;
-
-        let community = make_community(&pool).await;
-        let (workflow_id, _) = make_workflow_in(&pool, community).await;
-        let scheduled_for = Utc.with_ymd_and_hms(2026, 6, 27, 0, 2, 0).unwrap();
-
-        // Win the claim for this instant.
-        claim_scheduled_workflow_fire(&pool, community, workflow_id, scheduled_for)
-            .await
-            .expect("claim ok")
-            .expect("claim wins");
-
-        // Create the run the won claim is responsible for, then attach it.
-        let run_id = create_workflow_run(&pool, community, workflow_id, None, None)
-            .await
-            .expect("create run ok");
-
-        let attached =
-            attach_scheduled_workflow_run(&pool, community, workflow_id, scheduled_for, run_id)
+        /// Insert a workflow whose tenant is `community`'s channel. Returns the
+        /// workflow id and the owning community for callers that want to assert
+        /// the resolved tenant.
+        pub(crate) async fn make_workflow_in(
+            pool: &PgPool,
+            community: CommunityId,
+        ) -> (Uuid, CommunityId) {
+            let owner = vec![0xa1; 32];
+            ensure_user(pool, community, &owner)
                 .await
-                .expect("attach ok");
-        assert!(attached, "first attach must update the claim row");
-
-        // The column is populated with the run id.
-        let linked: Option<Uuid> = sqlx::query_scalar(
-            "SELECT workflow_run_id FROM scheduled_workflow_fires \
-             WHERE community_id = $1 AND workflow_id = $2 AND scheduled_for = $3",
-        )
-        .bind(community.as_uuid())
-        .bind(workflow_id)
-        .bind(scheduled_for)
-        .fetch_one(&pool)
-        .await
-        .expect("row exists");
-        assert_eq!(
-            linked,
-            Some(run_id),
-            "the claim row must now point at the run it created"
-        );
-
-        // A second attach is a no-op: the `workflow_run_id IS NULL` guard means
-        // an already-linked claim is never re-pointed to a different run.
-        let other_run = create_workflow_run(&pool, community, workflow_id, None, None)
-            .await
-            .expect("create second run ok");
-        let reattached =
-            attach_scheduled_workflow_run(&pool, community, workflow_id, scheduled_for, other_run)
-                .await
-                .expect("second attach ok");
-        assert!(
-            !reattached,
-            "attach must not overwrite an already-linked claim row"
-        );
-    }
-
-    /// Documents the retention-vs-interval coupling Sami flagged for §5c:
-    /// pruning every claim below the workflow's interval makes
-    /// `latest_scheduled_workflow_fire` return `None`, which re-introduces the
-    /// per-pod-clock anchor bug F5 was meant to fix. Test is GREEN today and
-    /// MUST stay green — it pins the deployment-config rule that the janitor
-    /// cutoff must exceed `MAX(interval_secs) + safety margin`. If a future
-    /// change makes `latest_*` resilient to pruning (e.g. by reading the most
-    /// recent workflow_run instead, or by retaining a sentinel row), this
-    /// test's assertion encodes the contract that must be updated alongside.
-    ///
-    /// Test isolation: the prune primitive is global (filters only on
-    /// `claimed_at`), so to avoid colliding with parallel claim tests we
-    /// back-date this workflow's `claimed_at` into the deep past and use a
-    /// past cutoff that cannot match any other test's `claimed_at = NOW()`.
-    #[tokio::test]
-    #[ignore = "requires Postgres"]
-    async fn latest_after_prune_below_interval_breaks_anchor() {
-        let pool = setup_pool().await;
-
-        let community = make_community(&pool).await;
-        let (workflow_id, _) = make_workflow_in(&pool, community).await;
-        let scheduled_for = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
-
-        claim_scheduled_workflow_fire(&pool, community, workflow_id, scheduled_for)
-            .await
-            .expect("claim ok")
-            .expect("first claim wins");
-
-        // Backdate this row's `claimed_at` so the global prune below targets
-        // only this workflow's row and cannot race-delete other tests' rows.
-        let backdated_claimed_at = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
-        sqlx::query(
-            "UPDATE scheduled_workflow_fires SET claimed_at = $1 \
-             WHERE community_id = $2 AND workflow_id = $3 AND scheduled_for = $4",
-        )
-        .bind(backdated_claimed_at)
-        .bind(community.as_uuid())
-        .bind(workflow_id)
-        .bind(scheduled_for)
-        .execute(&pool)
-        .await
-        .expect("backdate ok");
-
-        let latest_before = latest_scheduled_workflow_fire(&pool, community, workflow_id)
-            .await
-            .expect("latest ok");
-        assert_eq!(
-            latest_before,
-            Some(scheduled_for),
-            "latest must reflect the claim before pruning",
-        );
-
-        // Janitor cutoff above only the back-dated row: prunes the anchor row
-        // without touching anything claimed at wall-clock NOW.
-        let cutoff = backdated_claimed_at + chrono::Duration::seconds(1);
-        let pruned = prune_scheduled_workflow_fires_before(&pool, cutoff)
-            .await
-            .expect("prune ok");
-        assert!(
-            pruned >= 1,
-            "expected at least one row pruned, got {pruned}"
-        );
-
-        let latest_after = latest_scheduled_workflow_fire(&pool, community, workflow_id)
-            .await
-            .expect("latest ok");
-        assert_eq!(
-            latest_after, None,
-            "pruning below the largest interval breaks the DB anchor; \
-             retention cutoff MUST exceed MAX(interval_secs) + safety margin (§5c)",
-        );
-    }
-
-    // -- Issue 4: workflow / approval community confinement -------------------
-
-    /// Insert a workflow under `community` with a caller-chosen `id` and
-    /// `channel_id`, so two communities can be given the *same* workflow UUID
-    /// and channel UUID (the PK is `(community_id, id)`, which structurally
-    /// allows the collision). Returns nothing; callers already hold the ids.
-    async fn insert_workflow_with_ids(
-        pool: &PgPool,
-        community: CommunityId,
-        id: Uuid,
-        channel_id: Uuid,
-        name: &str,
-    ) {
-        let owner = vec![0xb2; 32];
-        ensure_user(pool, community, &owner)
-            .await
-            .expect("ensure owner");
-        // The channel must exist first: `workflows.channel_id` is a composite FK
-        // to `(community_id, channel_id)`.
-        sqlx::query(
-            r#"
-            INSERT INTO channels (id, community_id, name, created_by)
-            VALUES ($1, $2, $3, $4)
-            "#,
-        )
-        .bind(channel_id)
-        .bind(community.as_uuid())
-        .bind(format!("ch-{}", channel_id.simple()))
-        .bind(&owner)
-        .execute(pool)
-        .await
-        .expect("insert channel");
-        sqlx::query(
-            r#"
-            INSERT INTO workflows
-                (id, community_id, name, owner_pubkey, channel_id, definition, definition_hash, status, enabled)
-            VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, 'active', TRUE)
-            "#,
-        )
-        .bind(id)
-        .bind(community.as_uuid())
-        .bind(name)
-        .bind(&owner)
-        .bind(channel_id)
-        .bind(r#"{"trigger":{"on":"webhook"},"steps":[]}"#)
-        .bind(&[0u8; 32][..])
-        .execute(pool)
-        .await
-        .expect("insert workflow");
-    }
-
-    /// Issue 4 (workflow identity): the same workflow UUID and channel UUID can
-    /// exist in communities A and B (PK `(community_id, id)`). A request-scoped
-    /// `get_workflow` / `list_enabled_channel_workflows` MUST return only the
-    /// row owned by the bound community — never B's colliding row for an
-    /// A-scoped lookup. Pre-fix these bound only `id` / `channel_id`, so a
-    /// B-host request (or a webhook/manual trigger satisfying membership against
-    /// B's colliding channel) could load and drive A's workflow.
-    #[tokio::test]
-    #[ignore = "requires Postgres"]
-    async fn workflow_lookup_is_confined_to_its_community() {
-        let pool = setup_pool().await;
-
-        let community_a = make_community(&pool).await;
-        let community_b = make_community(&pool).await;
-
-        // Same workflow UUID and channel UUID in both communities.
-        let shared_workflow_id = Uuid::new_v4();
-        let shared_channel_id = Uuid::new_v4();
-        insert_workflow_with_ids(
-            &pool,
-            community_a,
-            shared_workflow_id,
-            shared_channel_id,
-            "wf-A",
-        )
-        .await;
-        insert_workflow_with_ids(
-            &pool,
-            community_b,
-            shared_workflow_id,
-            shared_channel_id,
-            "wf-B",
-        )
-        .await;
-
-        // Scoped get returns each community's own row, never the other's.
-        let from_a = get_workflow(&pool, community_a, shared_workflow_id)
-            .await
-            .expect("A's workflow exists");
-        let from_b = get_workflow(&pool, community_b, shared_workflow_id)
-            .await
-            .expect("B's workflow exists");
-        assert_eq!(
-            from_a.community_id, community_a,
-            "A lookup must resolve A's row"
-        );
-        assert_eq!(from_a.name, "wf-A");
-        assert_eq!(
-            from_b.community_id, community_b,
-            "B lookup must resolve B's row"
-        );
-        assert_eq!(from_b.name, "wf-B");
-
-        // A workflow that exists ONLY in B must be NotFound under A.
-        let b_only_id = Uuid::new_v4();
-        let b_only_channel = Uuid::new_v4();
-        insert_workflow_with_ids(&pool, community_b, b_only_id, b_only_channel, "wf-B-only").await;
-        let cross = get_workflow(&pool, community_a, b_only_id).await;
-        assert!(
-            matches!(cross, Err(DbError::NotFound(_))),
-            "A must not see B's workflow by id: {cross:?}"
-        );
-
-        // The channel listing is confined too: A's channel listing yields only
-        // A's workflow even though B has the same channel UUID.
-        let listed_a = list_enabled_channel_workflows(&pool, community_a, shared_channel_id)
-            .await
-            .expect("list A");
-        assert_eq!(
-            listed_a.len(),
-            1,
-            "A's channel listing must contain exactly A's workflow"
-        );
-        assert_eq!(listed_a[0].community_id, community_a);
-        assert_eq!(listed_a[0].name, "wf-A");
-    }
-
-    /// Issue 4 (workflow lifecycle): deleting `A/id` must not delete `B/id`
-    /// when both communities hold the same workflow UUID. Pre-fix the workflow
-    /// delete predicated only on `id`, so a NIP-09 a-tag deletion in one
-    /// community would erase the colliding workflow in every community.
-    #[tokio::test]
-    #[ignore = "requires Postgres"]
-    async fn workflow_delete_is_confined_to_its_community() {
-        let pool = setup_pool().await;
-
-        let community_a = make_community(&pool).await;
-        let community_b = make_community(&pool).await;
-        let shared_workflow_id = Uuid::new_v4();
-        insert_workflow_with_ids(
-            &pool,
-            community_a,
-            shared_workflow_id,
-            Uuid::new_v4(),
-            "wf-A",
-        )
-        .await;
-        insert_workflow_with_ids(
-            &pool,
-            community_b,
-            shared_workflow_id,
-            Uuid::new_v4(),
-            "wf-B",
-        )
-        .await;
-
-        crate::Db::from_pool(pool.clone())
-            .delete_workflow_by_coordinate(
-                community_a,
-                &[0xb2; 32],
-                &shared_workflow_id.to_string(),
-                chrono::Utc::now().timestamp(),
+                .expect("ensure owner");
+            let channel_id = make_channel(pool, community, &owner).await;
+            let workflow_id = create_workflow(
+                pool,
+                community,
+                Some(channel_id),
+                &owner,
+                "f1-attack-workflow",
+                r#"{"trigger":{"on":"schedule"},"steps":[]}"#,
+                &[0u8; 32],
             )
             .await
-            .expect("delete A's workflow");
+            .expect("create workflow");
+            (workflow_id, community)
+        }
 
-        // A's row is gone; B's identical-UUID row survives untouched.
-        assert!(
-            matches!(
-                get_workflow(&pool, community_a, shared_workflow_id).await,
-                Err(DbError::NotFound(_))
-            ),
-            "A's workflow must be deleted"
-        );
-        let surviving_b = get_workflow(&pool, community_b, shared_workflow_id)
-            .await
-            .expect("B's workflow must survive A's delete");
-        assert_eq!(surviving_b.community_id, community_b);
-        assert_eq!(surviving_b.name, "wf-B");
-    }
+        /// Confinement: a duplicate workflow UUID existing in both community A and
+        /// community B must claim independently. Claiming `(A, id, t)` must NOT
+        /// consume `(B, id, t)` — B's identical instant stays claimable, and the
+        /// A-claim's resolved community is A (server provenance), never B.
+        ///
+        /// This is the reconciliation of the old S1 lock with the real
+        /// `(community_id, id)` schema: because `id` is not globally unique, the
+        /// claim binds `WHERE w.community_id = $1 AND w.id = $2`. With the old
+        /// bare-`id` SQL (`WHERE w.id = $1`), a single `INSERT ... SELECT` matched
+        /// BOTH workflow rows and fanned the claim across A and B — this test goes
+        /// RED on that regression (B/id is no longer independently claimable).
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn claim_confined_to_its_community() {
+            let pool = setup_pool().await;
 
-    /// Issue 4 (approval path): the same approval token can hash to the same
-    /// bytes in A and B (PK `(community_id, token)`). A scoped grant/deny acting
-    /// on `A/token` MUST NOT touch `B/token`. Pre-fix the approval helpers
-    /// predicated only on `token`, so granting one community's approval would
-    /// silently resolve another's colliding gate.
-    #[tokio::test]
-    #[ignore = "requires Postgres"]
-    async fn approval_is_confined_to_its_community() {
-        let pool = setup_pool().await;
+            let community_a = make_community(&pool).await;
+            let community_b = make_community(&pool).await;
 
-        let community_a = make_community(&pool).await;
-        let community_b = make_community(&pool).await;
+            // Same workflow UUID + same channel UUID in both communities — the PK
+            // is `(community_id, id)`, so the collision is structurally allowed.
+            let workflow_id = Uuid::new_v4();
+            let channel_id = Uuid::new_v4();
+            insert_workflow_with_ids(&pool, community_a, workflow_id, channel_id, "sched-a").await;
+            insert_workflow_with_ids(&pool, community_b, workflow_id, channel_id, "sched-b").await;
 
-        // Same workflow + run + token in both communities.
-        let workflow_id = Uuid::new_v4();
-        let channel_id = Uuid::new_v4();
-        insert_workflow_with_ids(&pool, community_a, workflow_id, channel_id, "wf-A").await;
-        insert_workflow_with_ids(&pool, community_b, workflow_id, Uuid::new_v4(), "wf-B").await;
+            let scheduled_for = Utc.with_ymd_and_hms(2026, 6, 27, 0, 0, 0).unwrap();
 
-        let run_a = create_workflow_run(&pool, community_a, workflow_id, None, None)
-            .await
-            .expect("run A");
-        let run_b = create_workflow_run(&pool, community_b, workflow_id, None, None)
-            .await
-            .expect("run B");
+            // Claim A/id/t.
+            let claim_a =
+                claim_scheduled_workflow_fire(&pool, community_a, workflow_id, scheduled_for)
+                    .await
+                    .expect("claim A should not error")
+                    .expect("claim A should win");
+            assert_eq!(
+                claim_a.community_id, community_a,
+                "A-claim must resolve to community A (server provenance)"
+            );
+            assert_eq!(claim_a.workflow_id, workflow_id);
+            assert_eq!(claim_a.scheduled_for, scheduled_for);
 
-        let token = "shared-approval-token";
-        let expires = Utc::now() + chrono::Duration::hours(1);
-        create_approval(
-            &pool,
-            CreateApprovalParams {
-                community_id: community_a,
-                token,
-                workflow_id,
-                run_id: run_a,
-                step_id: "gate",
-                step_index: 0,
-                approver_spec: "@anyone",
-                expires_at: expires,
-            },
-        )
-        .await
-        .expect("create approval A");
-        create_approval(
-            &pool,
-            CreateApprovalParams {
-                community_id: community_b,
-                token,
-                workflow_id,
-                run_id: run_b,
-                step_id: "gate",
-                step_index: 0,
-                approver_spec: "@anyone",
-                expires_at: expires,
-            },
-        )
-        .await
-        .expect("create approval B");
+            // B/id/t must still be claimable — A's claim did not touch B's row.
+            let claim_b =
+                claim_scheduled_workflow_fire(&pool, community_b, workflow_id, scheduled_for)
+                    .await
+                    .expect("claim B should not error")
+                    .expect(
+                        "claim B must still win — A's claim must not have consumed B's instant",
+                    );
+            assert_eq!(
+                claim_b.community_id, community_b,
+                "B-claim must resolve to community B"
+            );
 
-        // Scoped read returns each community's own approval (its own run id).
-        let read_a = get_approval(&pool, community_a, token)
-            .await
-            .expect("read A");
-        let read_b = get_approval(&pool, community_b, token)
-            .await
-            .expect("read B");
-        assert_eq!(read_a.run_id, run_a, "A read must resolve A's approval");
-        assert_eq!(read_b.run_id, run_b, "B read must resolve B's approval");
+            // And a second A-claim for the same instant must now lose (dedup holds
+            // within the community).
+            let claim_a_again =
+                claim_scheduled_workflow_fire(&pool, community_a, workflow_id, scheduled_for)
+                    .await
+                    .expect("second A-claim should not error");
+            assert!(
+                claim_a_again.is_none(),
+                "the same (A, id, t) instant must not be claimable twice"
+            );
+        }
 
-        // Granting A/token must NOT act on B/token.
-        let approver = vec![0xc3; 32];
-        let granted = update_approval(
-            &pool,
-            community_a,
-            token,
-            ApprovalStatus::Granted,
-            Some(&approver),
-            None,
-        )
-        .await
-        .expect("grant A");
-        assert!(granted, "A's approval must be granted");
+        /// Same `(community_id, workflow_id, scheduled_for)` claimed concurrently by
+        /// N tasks must yield exactly one `Some` winner. Post-reconciliation the
+        /// claim key is `(community_id, workflow_id, scheduled_for)`; `community_id`
+        /// is server provenance, not a client-named label. Characterization guard:
+        /// protects the dedup boundary against regressions in the claim SQL.
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn concurrent_same_window_claims_exactly_one_wins() {
+            let pool = setup_pool().await;
 
-        let after_a = get_approval(&pool, community_a, token)
-            .await
-            .expect("re-read A");
-        let after_b = get_approval(&pool, community_b, token)
-            .await
-            .expect("re-read B");
-        assert_eq!(after_a.status, ApprovalStatus::Granted, "A is now granted");
-        assert_eq!(
-            after_b.status,
-            ApprovalStatus::Pending,
-            "B's approval must remain pending after A is granted"
-        );
-    }
+            let community = make_community(&pool).await;
+            let (workflow_id, _) = make_workflow_in(&pool, community).await;
+            let scheduled_for = Utc.with_ymd_and_hms(2026, 6, 27, 0, 1, 0).unwrap();
 
-    // -- SEC-006: disable-on-membership-loss primitive -------------------------
+            const N: usize = 8;
+            let mut handles = Vec::with_capacity(N);
+            for _ in 0..N {
+                let pool = pool.clone();
+                handles.push(tokio::spawn(async move {
+                    claim_scheduled_workflow_fire(&pool, community, workflow_id, scheduled_for)
+                        .await
+                }));
+            }
 
-    /// `disable_workflows_for_owner_in_channel` must disable exactly the
-    /// departing owner's enabled workflows in that channel — not other owners'
-    /// workflows, not the same owner's workflows in other channels — and be
-    /// idempotent. Disabled workflows must drop out of the trigger-path list.
-    #[tokio::test]
-    #[ignore = "requires Postgres"]
-    async fn disable_for_owner_scopes_to_owner_and_channel() {
-        let pool = setup_pool().await;
-        let community = make_community(&pool).await;
+            let mut winners = 0usize;
+            for h in handles {
+                let result = h.await.expect("task did not panic").expect("claim ok");
+                if result.is_some() {
+                    winners += 1;
+                }
+            }
+            assert_eq!(
+                winners, 1,
+                "exactly one task must win the claim race for (workflow_id, scheduled_for)"
+            );
+        }
 
-        let departing = vec![0xd1; 32];
-        let staying = vec![0xd2; 32];
-        ensure_user(&pool, community, &departing)
-            .await
-            .expect("ensure departing");
-        ensure_user(&pool, community, &staying)
-            .await
-            .expect("ensure staying");
+        /// `attach_scheduled_workflow_run` links a won claim to the run it created.
+        /// This is the regression for the missing `scheduled_workflow_fires.
+        /// workflow_run_id` column: before the schema added it, the UPDATE failed at
+        /// runtime with `column "workflow_run_id" does not exist`, so the audit link
+        /// silently never populated and the scheduler warned on every fire. This test
+        /// proves the column is present, the attach writes it, and the
+        /// `workflow_run_id IS NULL` guard makes a second attach a no-op. It is RED
+        /// without the migration column.
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn attach_links_run_to_claim_and_is_idempotent() {
+            let pool = setup_pool().await;
 
-        let channel_a = make_channel(&pool, community, &departing).await;
-        let channel_b = make_channel(&pool, community, &departing).await;
+            let community = make_community(&pool).await;
+            let (workflow_id, _) = make_workflow_in(&pool, community).await;
+            let scheduled_for = Utc.with_ymd_and_hms(2026, 6, 27, 0, 2, 0).unwrap();
 
-        let def = r#"{"trigger":{"on":"message_posted"},"steps":[]}"#;
-        let wf_departing_a = create_workflow(
-            &pool,
-            community,
-            Some(channel_a),
-            &departing,
-            "departing-a",
-            def,
-            &[0u8; 32],
-        )
-        .await
-        .expect("wf departing a");
-        let wf_departing_b = create_workflow(
-            &pool,
-            community,
-            Some(channel_b),
-            &departing,
-            "departing-b",
-            def,
-            &[0u8; 32],
-        )
-        .await
-        .expect("wf departing b");
-        let wf_staying_a = create_workflow(
-            &pool,
-            community,
-            Some(channel_a),
-            &staying,
-            "staying-a",
-            def,
-            &[0u8; 32],
-        )
-        .await
-        .expect("wf staying a");
-
-        let disabled =
-            disable_workflows_for_owner_in_channel(&pool, community, channel_a, &departing)
+            // Win the claim for this instant.
+            claim_scheduled_workflow_fire(&pool, community, workflow_id, scheduled_for)
                 .await
-                .expect("disable");
-        assert_eq!(
-            disabled, 1,
-            "exactly the departing owner's channel-A workflow"
-        );
+                .expect("claim ok")
+                .expect("claim wins");
 
-        // Idempotent: second call finds nothing enabled.
-        let again = disable_workflows_for_owner_in_channel(&pool, community, channel_a, &departing)
+            // Create the run the won claim is responsible for, then attach it.
+            let run_id = create_workflow_run(&pool, community, workflow_id, None, None)
+                .await
+                .expect("create run ok");
+
+            let attached =
+                attach_scheduled_workflow_run(&pool, community, workflow_id, scheduled_for, run_id)
+                    .await
+                    .expect("attach ok");
+            assert!(attached, "first attach must update the claim row");
+
+            // The column is populated with the run id.
+            let linked: Option<Uuid> = sqlx::query_scalar(
+                "SELECT workflow_run_id FROM scheduled_workflow_fires \
+                 WHERE community_id = $1 AND workflow_id = $2 AND scheduled_for = $3",
+            )
+            .bind(community.as_uuid())
+            .bind(workflow_id)
+            .bind(scheduled_for)
+            .fetch_one(&pool)
             .await
-            .expect("disable again");
-        assert_eq!(again, 0, "second disable must be a no-op");
+            .expect("row exists");
+            assert_eq!(
+                linked,
+                Some(run_id),
+                "the claim row must now point at the run it created"
+            );
 
-        let enabled_a = list_enabled_channel_workflows(&pool, community, channel_a)
+            // A second attach is a no-op: the `workflow_run_id IS NULL` guard means
+            // an already-linked claim is never re-pointed to a different run.
+            let other_run = create_workflow_run(&pool, community, workflow_id, None, None)
+                .await
+                .expect("create second run ok");
+            let reattached = attach_scheduled_workflow_run(
+                &pool,
+                community,
+                workflow_id,
+                scheduled_for,
+                other_run,
+            )
             .await
-            .expect("list channel a");
-        let enabled_a_ids: Vec<Uuid> = enabled_a.iter().map(|w| w.id).collect();
-        assert!(
-            !enabled_a_ids.contains(&wf_departing_a),
-            "departing owner's workflow must no longer be trigger-eligible"
-        );
-        assert!(
-            enabled_a_ids.contains(&wf_staying_a),
-            "other owners' workflows in the channel must be untouched"
-        );
+            .expect("second attach ok");
+            assert!(
+                !reattached,
+                "attach must not overwrite an already-linked claim row"
+            );
+        }
 
-        let enabled_b = list_enabled_channel_workflows(&pool, community, channel_b)
+        /// Documents the retention-vs-interval coupling Sami flagged for §5c:
+        /// pruning every claim below the workflow's interval makes
+        /// `latest_scheduled_workflow_fire` return `None`, which re-introduces the
+        /// per-pod-clock anchor bug F5 was meant to fix. Test is GREEN today and
+        /// MUST stay green — it pins the deployment-config rule that the janitor
+        /// cutoff must exceed `MAX(interval_secs) + safety margin`. If a future
+        /// change makes `latest_*` resilient to pruning (e.g. by reading the most
+        /// recent workflow_run instead, or by retaining a sentinel row), this
+        /// test's assertion encodes the contract that must be updated alongside.
+        ///
+        /// Test isolation: the prune primitive is global (filters only on
+        /// `claimed_at`), so to avoid colliding with parallel claim tests we
+        /// back-date this workflow's `claimed_at` into the deep past and use a
+        /// past cutoff that cannot match any other test's `claimed_at = NOW()`.
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn latest_after_prune_below_interval_breaks_anchor() {
+            let pool = setup_pool().await;
+
+            let community = make_community(&pool).await;
+            let (workflow_id, _) = make_workflow_in(&pool, community).await;
+            let scheduled_for = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+
+            claim_scheduled_workflow_fire(&pool, community, workflow_id, scheduled_for)
+                .await
+                .expect("claim ok")
+                .expect("first claim wins");
+
+            // Backdate this row's `claimed_at` so the global prune below targets
+            // only this workflow's row and cannot race-delete other tests' rows.
+            let backdated_claimed_at = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+            sqlx::query(
+                "UPDATE scheduled_workflow_fires SET claimed_at = $1 \
+                 WHERE community_id = $2 AND workflow_id = $3 AND scheduled_for = $4",
+            )
+            .bind(backdated_claimed_at)
+            .bind(community.as_uuid())
+            .bind(workflow_id)
+            .bind(scheduled_for)
+            .execute(&pool)
             .await
-            .expect("list channel b");
-        assert!(
-            enabled_b.iter().any(|w| w.id == wf_departing_b),
-            "same owner's workflow in a different channel must be untouched"
-        );
-    }
+            .expect("backdate ok");
 
-    #[tokio::test]
-    #[ignore = "requires Postgres"]
-    async fn admission_same_key_same_payload_returns_existing_row() {
-        let pool = setup_pool().await;
-        let community = make_community(&pool).await;
-        let (workflow_id, _) = make_workflow_in(&pool, community).await;
-        let key = [1_u8; 32];
-        let payload = [9_u8; 32];
+            let latest_before = latest_scheduled_workflow_fire(&pool, community, workflow_id)
+                .await
+                .expect("latest ok");
+            assert_eq!(
+                latest_before,
+                Some(scheduled_for),
+                "latest must reflect the claim before pruning",
+            );
 
-        let first = begin_workflow_admission(&pool, community, workflow_id, &key, &payload)
+            // Janitor cutoff above only the back-dated row: prunes the anchor row
+            // without touching anything claimed at wall-clock NOW.
+            let cutoff = backdated_claimed_at + chrono::Duration::seconds(1);
+            let pruned = prune_scheduled_workflow_fires_before(&pool, cutoff)
+                .await
+                .expect("prune ok");
+            assert!(
+                pruned >= 1,
+                "expected at least one row pruned, got {pruned}"
+            );
+
+            let latest_after = latest_scheduled_workflow_fire(&pool, community, workflow_id)
+                .await
+                .expect("latest ok");
+            assert_eq!(
+                latest_after, None,
+                "pruning below the largest interval breaks the DB anchor; \
+                 retention cutoff MUST exceed MAX(interval_secs) + safety margin (§5c)",
+            );
+        }
+
+        // -- Issue 4: workflow / approval community confinement -------------------
+
+        /// Insert a workflow under `community` with a caller-chosen `id` and
+        /// `channel_id`, so two communities can be given the *same* workflow UUID
+        /// and channel UUID (the PK is `(community_id, id)`, which structurally
+        /// allows the collision). Returns nothing; callers already hold the ids.
+        async fn insert_workflow_with_ids(
+            pool: &PgPool,
+            community: CommunityId,
+            id: Uuid,
+            channel_id: Uuid,
+            name: &str,
+        ) {
+            let owner = vec![0xb2; 32];
+            ensure_user(pool, community, &owner)
+                .await
+                .expect("ensure owner");
+            // The channel must exist first: `workflows.channel_id` is a composite FK
+            // to `(community_id, channel_id)`.
+            sqlx::query(
+                r#"
+                INSERT INTO channels (id, community_id, name, created_by)
+                VALUES ($1, $2, $3, $4)
+                "#,
+            )
+            .bind(channel_id)
+            .bind(community.as_uuid())
+            .bind(format!("ch-{}", channel_id.simple()))
+            .bind(&owner)
+            .execute(pool)
             .await
-            .expect("begin first admission");
-        let BeginWorkflowAdmission::Vacant(guard) = first else {
-            panic!("first admission must be vacant");
-        };
-        let created = guard
-            .reject(
-                &serde_json::json!({"webhook_fields": {}}),
-                WorkflowRunFailure {
-                    code: "repository_missing",
-                    message: "repository could not be resolved",
+            .expect("insert channel");
+            sqlx::query(
+                r#"
+                INSERT INTO workflows
+                    (id, community_id, name, owner_pubkey, channel_id, definition, definition_hash, status, enabled)
+                VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, 'active', TRUE)
+                "#,
+            )
+            .bind(id)
+            .bind(community.as_uuid())
+            .bind(name)
+            .bind(&owner)
+            .bind(channel_id)
+            .bind(r#"{"trigger":{"on":"webhook"},"steps":[]}"#)
+            .bind(&[0u8; 32][..])
+            .execute(pool)
+            .await
+            .expect("insert workflow");
+        }
+
+        /// Issue 4 (workflow identity): the same workflow UUID and channel UUID can
+        /// exist in communities A and B (PK `(community_id, id)`). A request-scoped
+        /// `get_workflow` / `list_enabled_channel_workflows` MUST return only the
+        /// row owned by the bound community — never B's colliding row for an
+        /// A-scoped lookup. Pre-fix these bound only `id` / `channel_id`, so a
+        /// B-host request (or a webhook/manual trigger satisfying membership against
+        /// B's colliding channel) could load and drive A's workflow.
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn workflow_lookup_is_confined_to_its_community() {
+            let pool = setup_pool().await;
+
+            let community_a = make_community(&pool).await;
+            let community_b = make_community(&pool).await;
+
+            // Same workflow UUID and channel UUID in both communities.
+            let shared_workflow_id = Uuid::new_v4();
+            let shared_channel_id = Uuid::new_v4();
+            insert_workflow_with_ids(
+                &pool,
+                community_a,
+                shared_workflow_id,
+                shared_channel_id,
+                "wf-A",
+            )
+            .await;
+            insert_workflow_with_ids(
+                &pool,
+                community_b,
+                shared_workflow_id,
+                shared_channel_id,
+                "wf-B",
+            )
+            .await;
+
+            // Scoped get returns each community's own row, never the other's.
+            let from_a = get_workflow(&pool, community_a, shared_workflow_id)
+                .await
+                .expect("A's workflow exists");
+            let from_b = get_workflow(&pool, community_b, shared_workflow_id)
+                .await
+                .expect("B's workflow exists");
+            assert_eq!(
+                from_a.community_id, community_a,
+                "A lookup must resolve A's row"
+            );
+            assert_eq!(from_a.name, "wf-A");
+            assert_eq!(
+                from_b.community_id, community_b,
+                "B lookup must resolve B's row"
+            );
+            assert_eq!(from_b.name, "wf-B");
+
+            // A workflow that exists ONLY in B must be NotFound under A.
+            let b_only_id = Uuid::new_v4();
+            let b_only_channel = Uuid::new_v4();
+            insert_workflow_with_ids(&pool, community_b, b_only_id, b_only_channel, "wf-B-only")
+                .await;
+            let cross = get_workflow(&pool, community_a, b_only_id).await;
+            assert!(
+                matches!(cross, Err(DbError::NotFound(_))),
+                "A must not see B's workflow by id: {cross:?}"
+            );
+
+            // The channel listing is confined too: A's channel listing yields only
+            // A's workflow even though B has the same channel UUID.
+            let listed_a = list_enabled_channel_workflows(&pool, community_a, shared_channel_id)
+                .await
+                .expect("list A");
+            assert_eq!(
+                listed_a.len(),
+                1,
+                "A's channel listing must contain exactly A's workflow"
+            );
+            assert_eq!(listed_a[0].community_id, community_a);
+            assert_eq!(listed_a[0].name, "wf-A");
+        }
+
+        /// Issue 4 (workflow lifecycle): deleting `A/id` must not delete `B/id`
+        /// when both communities hold the same workflow UUID. Pre-fix the workflow
+        /// delete predicated only on `id`, so a NIP-09 a-tag deletion in one
+        /// community would erase the colliding workflow in every community.
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn workflow_delete_is_confined_to_its_community() {
+            let pool = setup_pool().await;
+
+            let community_a = make_community(&pool).await;
+            let community_b = make_community(&pool).await;
+            let shared_workflow_id = Uuid::new_v4();
+            insert_workflow_with_ids(
+                &pool,
+                community_a,
+                shared_workflow_id,
+                Uuid::new_v4(),
+                "wf-A",
+            )
+            .await;
+            insert_workflow_with_ids(
+                &pool,
+                community_b,
+                shared_workflow_id,
+                Uuid::new_v4(),
+                "wf-B",
+            )
+            .await;
+
+            crate::Db::from_pool(pool.clone())
+                .delete_workflow_by_coordinate(
+                    community_a,
+                    &[0xb2; 32],
+                    &shared_workflow_id.to_string(),
+                    chrono::Utc::now().timestamp(),
+                )
+                .await
+                .expect("delete A's workflow");
+
+            // A's row is gone; B's identical-UUID row survives untouched.
+            assert!(
+                matches!(
+                    get_workflow(&pool, community_a, shared_workflow_id).await,
+                    Err(DbError::NotFound(_))
+                ),
+                "A's workflow must be deleted"
+            );
+            let surviving_b = get_workflow(&pool, community_b, shared_workflow_id)
+                .await
+                .expect("B's workflow must survive A's delete");
+            assert_eq!(surviving_b.community_id, community_b);
+            assert_eq!(surviving_b.name, "wf-B");
+        }
+
+        /// Issue 4 (approval path): the same approval token can hash to the same
+        /// bytes in A and B (PK `(community_id, token)`). A scoped grant/deny acting
+        /// on `A/token` MUST NOT touch `B/token`. Pre-fix the approval helpers
+        /// predicated only on `token`, so granting one community's approval would
+        /// silently resolve another's colliding gate.
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn approval_is_confined_to_its_community() {
+            let pool = setup_pool().await;
+
+            let community_a = make_community(&pool).await;
+            let community_b = make_community(&pool).await;
+
+            // Same workflow + run + token in both communities.
+            let workflow_id = Uuid::new_v4();
+            let channel_id = Uuid::new_v4();
+            insert_workflow_with_ids(&pool, community_a, workflow_id, channel_id, "wf-A").await;
+            insert_workflow_with_ids(&pool, community_b, workflow_id, Uuid::new_v4(), "wf-B").await;
+
+            let run_a = create_workflow_run(&pool, community_a, workflow_id, None, None)
+                .await
+                .expect("run A");
+            let run_b = create_workflow_run(&pool, community_b, workflow_id, None, None)
+                .await
+                .expect("run B");
+
+            let token = "shared-approval-token";
+            let expires = Utc::now() + chrono::Duration::hours(1);
+            create_approval(
+                &pool,
+                CreateApprovalParams {
+                    community_id: community_a,
+                    token,
+                    workflow_id,
+                    run_id: run_a,
+                    step_id: "gate",
+                    step_index: 0,
+                    approver_spec: "@anyone",
+                    expires_at: expires,
                 },
             )
             .await
-            .expect("persist deterministic rejection");
-        assert_eq!(created.error_code.as_deref(), Some("repository_missing"));
-        assert_eq!(
-            created.error_message.as_deref(),
-            Some("repository could not be resolved")
-        );
-
-        let second = begin_workflow_admission(&pool, community, workflow_id, &key, &payload)
+            .expect("create approval A");
+            create_approval(
+                &pool,
+                CreateApprovalParams {
+                    community_id: community_b,
+                    token,
+                    workflow_id,
+                    run_id: run_b,
+                    step_id: "gate",
+                    step_index: 0,
+                    approver_spec: "@anyone",
+                    expires_at: expires,
+                },
+            )
             .await
-            .expect("begin duplicate admission");
-        let BeginWorkflowAdmission::Existing(existing) = second else {
-            panic!("same payload must return existing");
-        };
-        assert_eq!(existing.id, created.id);
-    }
+            .expect("create approval B");
 
-    #[tokio::test]
-    #[ignore = "requires Postgres"]
-    async fn admission_same_key_different_payload_is_conflict() {
-        let pool = setup_pool().await;
-        let community = make_community(&pool).await;
-        let (workflow_id, _) = make_workflow_in(&pool, community).await;
-        let key = [2_u8; 32];
-        let original_payload = [8_u8; 32];
-        let first =
-            begin_workflow_admission(&pool, community, workflow_id, &key, &original_payload)
+            // Scoped read returns each community's own approval (its own run id).
+            let read_a = get_approval(&pool, community_a, token)
+                .await
+                .expect("read A");
+            let read_b = get_approval(&pool, community_b, token)
+                .await
+                .expect("read B");
+            assert_eq!(read_a.run_id, run_a, "A read must resolve A's approval");
+            assert_eq!(read_b.run_id, run_b, "B read must resolve B's approval");
+
+            // Granting A/token must NOT act on B/token.
+            let approver = vec![0xc3; 32];
+            let granted = update_approval(
+                &pool,
+                community_a,
+                token,
+                ApprovalStatus::Granted,
+                Some(&approver),
+                None,
+            )
+            .await
+            .expect("grant A");
+            assert!(granted, "A's approval must be granted");
+
+            let after_a = get_approval(&pool, community_a, token)
+                .await
+                .expect("re-read A");
+            let after_b = get_approval(&pool, community_b, token)
+                .await
+                .expect("re-read B");
+            assert_eq!(after_a.status, ApprovalStatus::Granted, "A is now granted");
+            assert_eq!(
+                after_b.status,
+                ApprovalStatus::Pending,
+                "B's approval must remain pending after A is granted"
+            );
+        }
+
+        // -- SEC-006: disable-on-membership-loss primitive -------------------------
+
+        /// `disable_workflows_for_owner_in_channel` must disable exactly the
+        /// departing owner's enabled workflows in that channel — not other owners'
+        /// workflows, not the same owner's workflows in other channels — and be
+        /// idempotent. Disabled workflows must drop out of the trigger-path list.
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn disable_for_owner_scopes_to_owner_and_channel() {
+            let pool = setup_pool().await;
+            let community = make_community(&pool).await;
+
+            let departing = vec![0xd1; 32];
+            let staying = vec![0xd2; 32];
+            ensure_user(&pool, community, &departing)
+                .await
+                .expect("ensure departing");
+            ensure_user(&pool, community, &staying)
+                .await
+                .expect("ensure staying");
+
+            let channel_a = make_channel(&pool, community, &departing).await;
+            let channel_b = make_channel(&pool, community, &departing).await;
+
+            let def = r#"{"trigger":{"on":"message_posted"},"steps":[]}"#;
+            let wf_departing_a = create_workflow(
+                &pool,
+                community,
+                Some(channel_a),
+                &departing,
+                "departing-a",
+                def,
+                &[0u8; 32],
+            )
+            .await
+            .expect("wf departing a");
+            let wf_departing_b = create_workflow(
+                &pool,
+                community,
+                Some(channel_b),
+                &departing,
+                "departing-b",
+                def,
+                &[0u8; 32],
+            )
+            .await
+            .expect("wf departing b");
+            let wf_staying_a = create_workflow(
+                &pool,
+                community,
+                Some(channel_a),
+                &staying,
+                "staying-a",
+                def,
+                &[0u8; 32],
+            )
+            .await
+            .expect("wf staying a");
+
+            let disabled =
+                disable_workflows_for_owner_in_channel(&pool, community, channel_a, &departing)
+                    .await
+                    .expect("disable");
+            assert_eq!(
+                disabled, 1,
+                "exactly the departing owner's channel-A workflow"
+            );
+
+            // Idempotent: second call finds nothing enabled.
+            let again =
+                disable_workflows_for_owner_in_channel(&pool, community, channel_a, &departing)
+                    .await
+                    .expect("disable again");
+            assert_eq!(again, 0, "second disable must be a no-op");
+
+            let enabled_a = list_enabled_channel_workflows(&pool, community, channel_a)
+                .await
+                .expect("list channel a");
+            let enabled_a_ids: Vec<Uuid> = enabled_a.iter().map(|w| w.id).collect();
+            assert!(
+                !enabled_a_ids.contains(&wf_departing_a),
+                "departing owner's workflow must no longer be trigger-eligible"
+            );
+            assert!(
+                enabled_a_ids.contains(&wf_staying_a),
+                "other owners' workflows in the channel must be untouched"
+            );
+
+            let enabled_b = list_enabled_channel_workflows(&pool, community, channel_b)
+                .await
+                .expect("list channel b");
+            assert!(
+                enabled_b.iter().any(|w| w.id == wf_departing_b),
+                "same owner's workflow in a different channel must be untouched"
+            );
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn admission_same_key_same_payload_returns_existing_row() {
+            let pool = setup_pool().await;
+            let community = make_community(&pool).await;
+            let (workflow_id, _) = make_workflow_in(&pool, community).await;
+            let key = [1_u8; 32];
+            let payload = [9_u8; 32];
+
+            let first = begin_workflow_admission(&pool, community, workflow_id, &key, &payload)
                 .await
                 .expect("begin first admission");
-        let BeginWorkflowAdmission::Vacant(guard) = first else {
-            panic!("first admission must be vacant");
-        };
-        let created = guard
-            .reject(
-                &serde_json::json!({"webhook_fields": {}}),
-                WorkflowRunFailure {
-                    code: "repository_missing",
-                    message: "repository could not be resolved",
-                },
-            )
-            .await
-            .expect("persist first admission");
-
-        let second = begin_workflow_admission(&pool, community, workflow_id, &key, &[7_u8; 32])
-            .await
-            .expect("begin conflicting admission");
-        let BeginWorkflowAdmission::PayloadConflict { existing } = second else {
-            panic!("changed payload must conflict");
-        };
-        assert_eq!(existing.id, created.id);
-        assert_eq!(
-            existing.payload_hash.as_deref(),
-            Some(original_payload.as_slice())
-        );
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)::bigint FROM workflow_runs WHERE community_id = $1 AND workflow_id = $2",
-        )
-        .bind(community.as_uuid())
-        .bind(workflow_id)
-        .fetch_one(&pool)
-        .await
-        .expect("count workflow runs");
-        assert_eq!(count, 1);
-    }
-
-    #[tokio::test]
-    #[ignore = "requires Postgres"]
-    async fn admission_same_key_waits_for_first_guard_before_existing_decision() {
-        let pool = setup_pool().await;
-        let community = make_community(&pool).await;
-        let (workflow_id, _) = make_workflow_in(&pool, community).await;
-        let key = [3_u8; 32];
-        let payload = [7_u8; 32];
-        let first = begin_workflow_admission(&pool, community, workflow_id, &key, &payload)
-            .await
-            .expect("begin first admission");
-        let BeginWorkflowAdmission::Vacant(guard) = first else {
-            panic!("first admission must be vacant");
-        };
-
-        let second_pool = pool.clone();
-        let mut second = tokio::spawn(async move {
-            begin_workflow_admission(&second_pool, community, workflow_id, &key, &payload).await
-        });
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(100), &mut second)
+            let BeginWorkflowAdmission::Vacant(guard) = first else {
+                panic!("first admission must be vacant");
+            };
+            let created = guard
+                .reject(
+                    &serde_json::json!({"webhook_fields": {}}),
+                    WorkflowRunFailure {
+                        code: "repository_missing",
+                        message: "repository could not be resolved",
+                    },
+                )
                 .await
-                .is_err(),
-            "duplicate admission must wait for the first transaction"
-        );
+                .expect("persist deterministic rejection");
+            assert_eq!(created.error_code.as_deref(), Some("repository_missing"));
+            assert_eq!(
+                created.error_message.as_deref(),
+                Some("repository could not be resolved")
+            );
 
-        let created = guard
-            .reject(
-                &serde_json::json!({"webhook_fields": {}}),
-                WorkflowRunFailure {
-                    code: "project_missing",
-                    message: "project could not be resolved",
-                },
-            )
-            .await
-            .expect("finish first admission");
-        let second = second
-            .await
-            .expect("join second admission")
-            .expect("begin second admission");
-        let BeginWorkflowAdmission::Existing(existing) = second else {
-            panic!("second admission must observe the committed row");
-        };
-        assert_eq!(existing.id, created.id);
-    }
-
-    #[tokio::test]
-    #[ignore = "requires Postgres"]
-    async fn admission_guard_rollback_leaves_no_row_and_allows_retry() {
-        let pool = setup_pool().await;
-        let community = make_community(&pool).await;
-        let (workflow_id, _) = make_workflow_in(&pool, community).await;
-        let key = [4_u8; 32];
-        let payload = [6_u8; 32];
-        let first = begin_workflow_admission(&pool, community, workflow_id, &key, &payload)
-            .await
-            .expect("begin first admission");
-        let BeginWorkflowAdmission::Vacant(guard) = first else {
-            panic!("first admission must be vacant");
-        };
-        drop(guard);
-
-        let retry = begin_workflow_admission(&pool, community, workflow_id, &key, &payload)
-            .await
-            .expect("retry admission after rollback");
-        let BeginWorkflowAdmission::Vacant(retry_guard) = retry else {
-            panic!("rollback must leave the key vacant");
-        };
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)::bigint FROM workflow_runs WHERE community_id = $1 AND workflow_id = $2",
-        )
-        .bind(community.as_uuid())
-        .bind(workflow_id)
-        .fetch_one(&pool)
-        .await
-        .expect("count workflow runs");
-        assert_eq!(count, 0);
-        drop(retry_guard);
-    }
-
-    #[tokio::test]
-    #[ignore = "requires Postgres"]
-    async fn admission_identity_columns_are_immutable_after_insert() {
-        let pool = setup_pool().await;
-        let community = make_community(&pool).await;
-        let (workflow_id, _) = make_workflow_in(&pool, community).await;
-        let first =
-            begin_workflow_admission(&pool, community, workflow_id, &[5_u8; 32], &[5_u8; 32])
+            let second = begin_workflow_admission(&pool, community, workflow_id, &key, &payload)
                 .await
-                .expect("begin admission");
-        let BeginWorkflowAdmission::Vacant(guard) = first else {
-            panic!("first admission must be vacant");
-        };
-        let snapshot = WorkflowRouteSnapshot {
-            community_id: *community.as_uuid(),
-            repository_coordinate: format!("30617:{}:agentic-os-plan", "ab".repeat(32)),
-            project_coordinate: format!("30621:{}:gigo-harness", "ab".repeat(32)),
-            channel_id: Uuid::new_v4(),
-            matched_identity_tier: "d_tag".into(),
-        };
-        let run = guard
-            .accept(&serde_json::json!({"webhook_fields": {}}), &snapshot)
+                .expect("begin duplicate admission");
+            let BeginWorkflowAdmission::Existing(existing) = second else {
+                panic!("same payload must return existing");
+            };
+            assert_eq!(existing.id, created.id);
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn admission_same_key_different_payload_is_conflict() {
+            let pool = setup_pool().await;
+            let community = make_community(&pool).await;
+            let (workflow_id, _) = make_workflow_in(&pool, community).await;
+            let key = [2_u8; 32];
+            let original_payload = [8_u8; 32];
+            let first =
+                begin_workflow_admission(&pool, community, workflow_id, &key, &original_payload)
+                    .await
+                    .expect("begin first admission");
+            let BeginWorkflowAdmission::Vacant(guard) = first else {
+                panic!("first admission must be vacant");
+            };
+            let created = guard
+                .reject(
+                    &serde_json::json!({"webhook_fields": {}}),
+                    WorkflowRunFailure {
+                        code: "repository_missing",
+                        message: "repository could not be resolved",
+                    },
+                )
+                .await
+                .expect("persist first admission");
+
+            let second = begin_workflow_admission(&pool, community, workflow_id, &key, &[7_u8; 32])
+                .await
+                .expect("begin conflicting admission");
+            let BeginWorkflowAdmission::PayloadConflict { existing } = second else {
+                panic!("changed payload must conflict");
+            };
+            assert_eq!(existing.id, created.id);
+            assert_eq!(
+                existing.payload_hash.as_deref(),
+                Some(original_payload.as_slice())
+            );
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*)::bigint FROM workflow_runs WHERE community_id = $1 AND workflow_id = $2",
+            )
+            .bind(community.as_uuid())
+            .bind(workflow_id)
+            .fetch_one(&pool)
             .await
-            .expect("persist accepted admission");
+            .expect("count workflow runs");
+            assert_eq!(count, 1);
+        }
 
-        let hash_error = sqlx::query(
-            "UPDATE workflow_runs SET idempotency_key_hash = $1 WHERE community_id = $2 AND id = $3",
-        )
-        .bind([9_u8; 32].as_slice())
-        .bind(community.as_uuid())
-        .bind(run.id)
-        .execute(&pool)
-        .await
-        .expect_err("idempotency hash update must fail");
-        assert!(hash_error
-            .to_string()
-            .contains("admission identity is immutable"));
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn admission_same_key_waits_for_first_guard_before_existing_decision() {
+            let pool = setup_pool().await;
+            let community = make_community(&pool).await;
+            let (workflow_id, _) = make_workflow_in(&pool, community).await;
+            let key = [3_u8; 32];
+            let payload = [7_u8; 32];
+            let first = begin_workflow_admission(&pool, community, workflow_id, &key, &payload)
+                .await
+                .expect("begin first admission");
+            let BeginWorkflowAdmission::Vacant(guard) = first else {
+                panic!("first admission must be vacant");
+            };
 
-        let payload_error = sqlx::query(
-            "UPDATE workflow_runs SET payload_hash = $1 WHERE community_id = $2 AND id = $3",
-        )
-        .bind([8_u8; 32].as_slice())
-        .bind(community.as_uuid())
-        .bind(run.id)
-        .execute(&pool)
-        .await
-        .expect_err("payload hash update must fail");
-        assert!(payload_error
-            .to_string()
-            .contains("admission identity is immutable"));
+            let second_pool = pool.clone();
+            let mut second = tokio::spawn(async move {
+                begin_workflow_admission(&second_pool, community, workflow_id, &key, &payload).await
+            });
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), &mut second)
+                    .await
+                    .is_err(),
+                "duplicate admission must wait for the first transaction"
+            );
 
-        let route_error = sqlx::query(
-            "UPDATE workflow_runs SET route_snapshot = $1 WHERE community_id = $2 AND id = $3",
-        )
-        .bind(serde_json::json!({"tampered": true}))
-        .bind(community.as_uuid())
-        .bind(run.id)
-        .execute(&pool)
-        .await
-        .expect_err("route snapshot update must fail");
-        assert!(route_error
-            .to_string()
-            .contains("admission identity is immutable"));
+            let created = guard
+                .reject(
+                    &serde_json::json!({"webhook_fields": {}}),
+                    WorkflowRunFailure {
+                        code: "project_missing",
+                        message: "project could not be resolved",
+                    },
+                )
+                .await
+                .expect("finish first admission");
+            let second = second
+                .await
+                .expect("join second admission")
+                .expect("begin second admission");
+            let BeginWorkflowAdmission::Existing(existing) = second else {
+                panic!("second admission must observe the committed row");
+            };
+            assert_eq!(existing.id, created.id);
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn admission_guard_rollback_leaves_no_row_and_allows_retry() {
+            let pool = setup_pool().await;
+            let community = make_community(&pool).await;
+            let (workflow_id, _) = make_workflow_in(&pool, community).await;
+            let key = [4_u8; 32];
+            let payload = [6_u8; 32];
+            let first = begin_workflow_admission(&pool, community, workflow_id, &key, &payload)
+                .await
+                .expect("begin first admission");
+            let BeginWorkflowAdmission::Vacant(guard) = first else {
+                panic!("first admission must be vacant");
+            };
+            drop(guard);
+
+            let retry = begin_workflow_admission(&pool, community, workflow_id, &key, &payload)
+                .await
+                .expect("retry admission after rollback");
+            let BeginWorkflowAdmission::Vacant(retry_guard) = retry else {
+                panic!("rollback must leave the key vacant");
+            };
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*)::bigint FROM workflow_runs WHERE community_id = $1 AND workflow_id = $2",
+            )
+            .bind(community.as_uuid())
+            .bind(workflow_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count workflow runs");
+            assert_eq!(count, 0);
+            drop(retry_guard);
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn admission_identity_columns_are_immutable_after_insert() {
+            let pool = setup_pool().await;
+            let community = make_community(&pool).await;
+            let (workflow_id, _) = make_workflow_in(&pool, community).await;
+            let first =
+                begin_workflow_admission(&pool, community, workflow_id, &[5_u8; 32], &[5_u8; 32])
+                    .await
+                    .expect("begin admission");
+            let BeginWorkflowAdmission::Vacant(guard) = first else {
+                panic!("first admission must be vacant");
+            };
+            let snapshot = WorkflowRouteSnapshot {
+                community_id: *community.as_uuid(),
+                repository_coordinate: format!("30617:{}:agentic-os-plan", "ab".repeat(32)),
+                project_coordinate: format!("30621:{}:gigo-harness", "ab".repeat(32)),
+                channel_id: Uuid::new_v4(),
+                matched_identity_tier: "d_tag".into(),
+            };
+            let run = guard
+                .accept(&serde_json::json!({"webhook_fields": {}}), &snapshot)
+                .await
+                .expect("persist accepted admission");
+
+            let hash_error = sqlx::query(
+                "UPDATE workflow_runs SET idempotency_key_hash = $1 WHERE community_id = $2 AND id = $3",
+            )
+            .bind([9_u8; 32].as_slice())
+            .bind(community.as_uuid())
+            .bind(run.id)
+            .execute(&pool)
+            .await
+            .expect_err("idempotency hash update must fail");
+            assert!(hash_error
+                .to_string()
+                .contains("admission identity is immutable"));
+
+            let payload_error = sqlx::query(
+                "UPDATE workflow_runs SET payload_hash = $1 WHERE community_id = $2 AND id = $3",
+            )
+            .bind([8_u8; 32].as_slice())
+            .bind(community.as_uuid())
+            .bind(run.id)
+            .execute(&pool)
+            .await
+            .expect_err("payload hash update must fail");
+            assert!(payload_error
+                .to_string()
+                .contains("admission identity is immutable"));
+
+            let route_error = sqlx::query(
+                "UPDATE workflow_runs SET route_snapshot = $1 WHERE community_id = $2 AND id = $3",
+            )
+            .bind(serde_json::json!({"tampered": true}))
+            .bind(community.as_uuid())
+            .bind(run.id)
+            .execute(&pool)
+            .await
+            .expect_err("route snapshot update must fail");
+            assert!(route_error
+                .to_string()
+                .contains("admission identity is immutable"));
+        }
     }
 }

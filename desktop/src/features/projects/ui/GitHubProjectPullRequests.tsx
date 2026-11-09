@@ -19,7 +19,7 @@ import {
 } from "@/features/projects/lib/projectsViewHelpers";
 import type { ProjectPullRequestComment } from "@/features/projects/projectPullRequests.mjs";
 import { parseProjectPullRequestMergeError } from "@/shared/api/projectGit";
-import { TabsContent } from "@/shared/ui/tabs";
+import { Tabs, TabsContent } from "@/shared/ui/tabs";
 import { GitHubLoginIdentity } from "./GitHubIssueIdentity";
 import { GitHubRepoStateRecovery } from "./GitHubRepoStateRecovery";
 import { CopyCommitHashButton } from "./ProjectCommitCopyButton";
@@ -442,7 +442,10 @@ function GitHubPullRequestWorkspaceDetail(props: {
   ]);
 
   return (
-    <div className="grid xl:grid-cols-[minmax(0,1fr)_18rem]">
+    <Tabs
+      className="grid xl:grid-cols-[minmax(0,1fr)_18rem]"
+      defaultValue="pr-conversation"
+    >
       <div className="min-w-0">
         <header className="min-w-0 space-y-1 p-4 pb-4">
           <h3 className="line-clamp-2 min-w-0 text-xl font-semibold text-foreground">
@@ -587,6 +590,6 @@ function GitHubPullRequestWorkspaceDetail(props: {
           </dl>
         </OverviewRailSection>
       </aside>
-    </div>
+    </Tabs>
   );
 }

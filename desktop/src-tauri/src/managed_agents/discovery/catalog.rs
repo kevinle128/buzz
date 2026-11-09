@@ -9,6 +9,9 @@ use super::runtime_metadata::{
 };
 use super::{BUZZ_AGENT_AVATAR_URL, CLAUDE_CODE_AVATAR_URL, CODEX_AVATAR_URL, GOOSE_AVATAR_URL};
 
+const HERMES_AVATAR_URL: &str =
+    "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/website/static/img/logo.png";
+
 pub(crate) const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
     KnownAcpRuntime {
         id: "goose",
@@ -150,6 +153,43 @@ pub(crate) const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         context_limit_env_var: Some("BUZZ_AGENT_MAX_CONTEXT_TOKENS"),
         max_rounds_env_var: Some("BUZZ_AGENT_MAX_ROUNDS"),
         required_normalized_fields: &["model", "provider"],
+        login_hint: None,
+        auth_probe_args: None,
+    },
+    KnownAcpRuntime {
+        id: "hermes",
+        label: "Hermes Agent",
+        commands: &["hermes-acp"],
+        aliases: &["hermes", "hermes-agent"],
+        avatar_url: HERMES_AVATAR_URL,
+        // Hermes tool subprocesses do not reliably inherit Buzz identity env,
+        // so the session MCP server must carry BUZZ_PRIVATE_KEY itself.
+        mcp_command: Some("buzz-dev-mcp"),
+        mcp_hooks: true,
+        underlying_cli: None,
+        cli_install_commands: &[],
+        cli_install_commands_windows: &[],
+        adapter_install_commands: &[],
+        cli_install_instructions_url: "https://hermes-agent.nousresearch.com",
+        adapter_install_instructions_url: "",
+        cli_install_hint: "Buzz talks to Hermes Agent through its hermes-acp command.",
+        adapter_install_hint: "",
+        skill_dir: None,
+        supports_acp_model_switching: false,
+        model_env_var: None,
+        provider_env_var: None,
+        provider_locked: false,
+        default_env: &[],
+        config_file_path: None,
+        config_file_format: None,
+        supports_acp_native_config: false,
+        thinking_env_var: None,
+        effort_normalization: None,
+        effort_accepted_values: None,
+        max_tokens_env_var: None,
+        context_limit_env_var: None,
+        max_rounds_env_var: None,
+        required_normalized_fields: &[],
         login_hint: None,
         auth_probe_args: None,
     },

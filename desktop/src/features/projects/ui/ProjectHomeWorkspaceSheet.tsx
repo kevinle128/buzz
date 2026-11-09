@@ -1,3 +1,4 @@
+import { githubRemoteSnapshotEnabled } from "@/features/projects/lib/projectGithubSnapshot";
 import * as React from "react";
 
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
@@ -11,7 +12,6 @@ import {
 } from "@/features/projects/hooks";
 import { gitContributorPubkeysFromCommits } from "@/features/projects/lib/projectContributorMatching";
 import { resolveProjectDefaultBranch } from "@/features/projects/lib/projectBranches";
-import type { GithubIssueListState } from "@/features/projects/lib/projectGithubIssues";
 import type { ProjectHomeWorkspaceSheetTab } from "@/features/projects/lib/projectHomeWorkspaceSheet";
 import { useProjectCommitDiffQuery } from "@/features/projects/useProjectCommitDiff";
 import { useProjectRepositorySnapshots } from "@/features/projects/useProjectRepositorySnapshots";
@@ -75,8 +75,6 @@ export function ProjectHomeWorkspaceSheet({
   const [selectedIssueId, setSelectedIssueId] = React.useState<string | null>(
     null,
   );
-  const [githubIssueListState, setGithubIssueListState] =
-    React.useState<GithubIssueListState>("open");
   const [selectedPullRequestId, setSelectedPullRequestId] = React.useState<
     string | null
   >(null);
@@ -127,7 +125,10 @@ export function ProjectHomeWorkspaceSheet({
     defaultBranch,
     null,
     null,
-    true,
+    githubRemoteSnapshotEnabled({
+      cloneUrl: repository.cloneUrls[0],
+      githubStateReady: repoStateQuery.isSuccess,
+    }),
   );
   const snapshot = snapshotQuery.data ?? null;
   const repositorySnapshots = useProjectRepositorySnapshots(
@@ -311,8 +312,9 @@ export function ProjectHomeWorkspaceSheet({
     case "issues":
       body = (
         <ProjectIssuesPanel
-          githubIssueListState={githubIssueListState}
-          onGithubIssueListStateChange={setGithubIssueListState}
+          error={workItemsQuery.error}
+          isLoading={workItemsQuery.isLoading}
+          issueItems={issueItems}
           onSelectedIssueIdChange={setSelectedIssueId}
           profiles={people.profiles}
           project={selectedCommitRepository}

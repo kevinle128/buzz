@@ -80,6 +80,8 @@ pub const RELAY_ADMIN_TABLES: &[(&str, &str)] = &[
 pub const EXPECTED_SCOPED_TABLES: &[&str] = &[
     "nip_fi_profile_heads",
     "api_tokens",
+    "app_callback_deliveries",
+    "apps",
     "archived_identities",
     "artifact_heads",
     "artifact_revisions",
@@ -145,6 +147,9 @@ pub const PURGE_SCOPED_TABLES: &[&str] = &[
     "moderation_reports",
     "subscriptions",
     "api_tokens",
+    // Callback deliveries reference their App.
+    "app_callback_deliveries",
+    "apps",
     "channel_members",
     "thread_metadata",
     "moderation_actions",
@@ -4595,7 +4600,10 @@ mod postgres_tests {
             .await
             .expect("migrate with fence objects present");
         let store = db.deletion_store();
-        let legacy_fenced_tables = store.live_fenced_tables().await.expect("legacy fences");
+        let mut legacy_fenced_tables = store.live_fenced_tables().await.expect("legacy fences");
+        // The fork-only App migration (0088) still attaches the legacy fence to
+        // its two tables. Every other table created after 0066 must not get one.
+        legacy_fenced_tables.extend(["apps", "app_callback_deliveries"].map(str::to_owned));
         // Include current tables without requiring new application-admitted
         // tables to acquire legacy database fence triggers.
         db.migrate()
@@ -4612,6 +4620,8 @@ mod postgres_tests {
                 // will; this change itself ships no schema changes.
                 sqlx::raw_sql(r#"
 DROP TRIGGER IF EXISTS community_write_fence_api_tokens ON api_tokens;
+DROP TRIGGER IF EXISTS community_write_fence_app_callback_deliveries ON app_callback_deliveries;
+DROP TRIGGER IF EXISTS community_write_fence_apps ON apps;
 DROP TRIGGER IF EXISTS community_write_fence_archived_identities ON archived_identities;
 DROP TRIGGER IF EXISTS community_write_fence_artifact_heads ON artifact_heads;
 DROP TRIGGER IF EXISTS community_write_fence_artifact_revisions ON artifact_revisions;

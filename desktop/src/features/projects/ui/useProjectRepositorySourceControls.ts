@@ -11,6 +11,11 @@ import type {
 import { projectBranchCreationReason } from "@/features/projects/lib/projectBranches";
 import { githubBranchActionReason } from "@/features/projects/lib/projectBranchErrors";
 import { githubSyncCountDisplay } from "@/features/projects/lib/projectGithubSync";
+import {
+  projectRepoUnavailablePresentation,
+  projectRepoUnavailableReason,
+  refineRepoUnavailableReason,
+} from "@/features/projects/lib/projectRepoAvailability";
 import type { useProjectRepoSyncStatusQuery } from "@/features/projects/repoSyncHooks";
 import type { useProjectRepoPresentation } from "@/features/projects/useProjectRepoHost";
 import { parseProjectPullRequestMergeError } from "@/shared/api/projectGit";
@@ -37,6 +42,7 @@ type UseProjectRepositorySourceControlsInput = {
   deleteBranchReason: string | null;
   githubHosted: boolean;
   localRepoSnapshotQuery: ProjectLocalRepoSnapshotQuery;
+  memberChannelIds: readonly string[] | null;
   onBranchChange: (branch: string | null) => void;
   onClone: () => Promise<void>;
   onPull: () => Promise<void>;
@@ -67,6 +73,7 @@ export function useProjectRepositorySourceControls(
     deleteBranchReason,
     githubHosted,
     localRepoSnapshotQuery,
+    memberChannelIds,
     project,
     pullPending,
     pushPending,
@@ -124,21 +131,31 @@ export function useProjectRepositorySourceControls(
     const results = await Promise.all(tasks);
     const error = results.find((result) => result.error)?.error;
     if (error) {
-      toast.error(
-        githubHosted
-          ? "Could not refresh GitHub repository."
-          : "Could not fetch repository.",
-        {
+      if (githubHosted) {
+        toast.error("Could not refresh GitHub repository.", {
           description:
             error instanceof Error ? error.message : "The refresh failed.",
-        },
+        });
+        return;
+      }
+      const presentation = projectRepoUnavailablePresentation(
+        refineRepoUnavailableReason({
+          reason: projectRepoUnavailableReason(error),
+          repositoryChannelId: project?.channelId,
+          memberChannelIds,
+        }),
       );
+      toast.error(presentation.title, {
+        description: presentation.description,
+      });
       return;
     }
     toast.success("Remote state refreshed.");
   }, [
     githubHosted,
     hasCheckout,
+    memberChannelIds,
+    project?.channelId,
     repoSnapshotQuery.refetch,
     repoStateQuery.isError,
     repoStateQuery.refetch,
@@ -175,6 +192,8 @@ export function useProjectRepositorySourceControls(
       : repoSyncStatusQuery.data?.localPath || localRepoSnapshotQuery.data
         ? "Local"
         : "Local missing",
+    localPath:
+      repoSyncStatusQuery.data?.localPath ?? localRepoSnapshotQuery.data?.path,
     ...repoRemote.controls,
     githubHosted,
     onCloneLocal:

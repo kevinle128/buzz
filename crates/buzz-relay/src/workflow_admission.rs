@@ -286,6 +286,29 @@ pub(crate) async fn handle_workflow_webhook(
         .await
         .map_err(|_| not_found("workflow not found"))?;
 
+    // Verify webhook secret. Prefer header (not logged by proxies); fall back to query param.
+    // Until the caller proves the secret, every failure answers like a missing
+    // workflow, so the response never reveals that the workflow exists, its
+    // trigger type, or whether a secret was configured.
+    let stored_secret = crate::webhook_secret::extract_secret(&workflow.definition);
+    let provided_secret = headers
+        .get("x-webhook-secret")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .or(query_secret)
+        .unwrap_or_default();
+    if !stored_secret
+        .is_some_and(|secret| crate::webhook_secret::verify_secret(&provided_secret, &secret))
+    {
+        record_admission_observation(AdmissionObservation::without_run(
+            Some(id),
+            Some(*community_id.as_uuid()),
+            "rejected",
+            "none",
+        ));
+        return Err(not_found("workflow not found"));
+    }
+
     let def: WorkflowDef = serde_json::from_value(workflow.definition.clone())
         .map_err(|e| internal_error(&format!("corrupt workflow definition: {e}")))?;
 
@@ -294,35 +317,6 @@ pub(crate) async fn handle_workflow_webhook(
             StatusCode::BAD_REQUEST,
             "workflow does not have a webhook trigger",
         ));
-    }
-
-    // Verify webhook secret. Prefer header (not logged by proxies); fall back to query param.
-    let stored_secret = crate::webhook_secret::extract_secret(&workflow.definition);
-    let provided_secret = headers
-        .get("x-webhook-secret")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
-        .or(query_secret)
-        .unwrap_or_default();
-
-    match &stored_secret {
-        Some(secret) => {
-            if !crate::webhook_secret::verify_secret(&provided_secret, secret) {
-                record_admission_observation(AdmissionObservation::without_run(
-                    Some(id),
-                    Some(*community_id.as_uuid()),
-                    "rejected",
-                    "none",
-                ));
-                return Err(api_error(StatusCode::UNAUTHORIZED, "authentication failed"));
-            }
-        }
-        None => {
-            return Err(api_error(
-                StatusCode::UNAUTHORIZED,
-                "webhook secret required but not configured — re-save the workflow to generate one",
-            ));
-        }
     }
 
     if def.has_project_channel_routing() {

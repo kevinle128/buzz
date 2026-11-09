@@ -39,6 +39,10 @@ export function selectedGithubIssueAfterListLoad(input: {
   isFetching: boolean;
 }): string | null {
   if (input.selectedIssueId === null) return null;
+  // Buzz tasks share the tab but never appear in the GitHub list.
+  if (parseGithubIssueNumber(input.selectedIssueId) === null) {
+    return input.selectedIssueId;
+  }
   if (input.issueIds.includes(input.selectedIssueId)) {
     return input.selectedIssueId;
   }
@@ -112,12 +116,9 @@ export async function createProjectIssueCommentWith<
     throw new Error("Comment cannot be empty.");
   }
 
-  const cloneUrl = input.project.cloneUrls[0] ?? "";
-  if (isGitHubCloneUrl(cloneUrl)) {
-    const target = githubIssueWriteTarget(input.project, input.issue.id);
-    if (!target) {
-      throw new Error(GITHUB_WRITE_TARGET_ERROR);
-    }
+  // Route by item: Buzz tasks on a GitHub-hosted repository stay on Buzz.
+  const target = githubIssueWriteTarget(input.project, input.issue.id);
+  if (target) {
     await backends.createGithub({
       cloneUrl: target.cloneUrl,
       number: target.number,

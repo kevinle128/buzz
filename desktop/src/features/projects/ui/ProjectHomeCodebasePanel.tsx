@@ -1,3 +1,4 @@
+import { githubRemoteSnapshotEnabled } from "@/features/projects/lib/projectGithubSnapshot";
 import { ChevronDown, FolderGit2 } from "lucide-react";
 
 import {
@@ -50,7 +51,10 @@ export function ProjectHomeCodebasePanel({
     defaultBranch,
     null,
     null,
-    Boolean(repository),
+    githubRemoteSnapshotEnabled({
+      cloneUrl: repository?.cloneUrls[0],
+      githubStateReady: repoStateQuery.isSuccess,
+    }),
   );
   const fileContentSource = useRepositoryFileContentSource({
     activeBranch: defaultBranch,

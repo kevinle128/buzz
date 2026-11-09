@@ -35,6 +35,7 @@ export function CreateProjectFormContent({
 }) {
   const [name, setName] = React.useState("");
   const [description, setDescription] = React.useState("");
+  const [repositoryName, setRepositoryName] = React.useState("");
   const [errorMessage, setErrorMessage] = React.useState<string | null>(null);
   const nameInputRef = React.useRef<HTMLInputElement>(null);
   const settings = useCreateProjectFormSettings(active, setDescription);
@@ -43,6 +44,7 @@ export function CreateProjectFormContent({
     if (!active) return;
     setName(initialName);
     setDescription("");
+    setRepositoryName("");
     setErrorMessage(null);
 
     const timerId = globalThis.setTimeout(() => {
@@ -61,6 +63,7 @@ export function CreateProjectFormContent({
       await onCreate({
         name: trimmedName,
         description: description.trim() || undefined,
+        repositoryName: repositoryName.trim() || undefined,
         channelVisibility: settings.channelVisibility,
         projectVisibility: settings.projectVisibility,
         agents: settings.buildAgents(),
@@ -178,6 +181,45 @@ export function CreateProjectFormContent({
               value={description}
             />
           </div>
+        </div>
+
+        <div className="space-y-1.5">
+          <label
+            className="text-sm font-medium text-foreground"
+            htmlFor="create-project-repository-name"
+          >
+            Repository name
+            <span className={CREATE_LABEL_OPTIONAL_CLASS}>Optional</span>
+          </label>
+          <div
+            className={cn(
+              "flex min-h-11 items-center px-3",
+              CREATE_FIELD_SHELL_CLASS,
+            )}
+          >
+            <Input
+              autoCapitalize="none"
+              autoComplete="off"
+              autoCorrect="off"
+              className={cn(
+                "h-8 px-0 py-0 leading-6",
+                CREATE_FIELD_CONTROL_CLASS,
+              )}
+              data-testid="create-project-repository-name"
+              disabled={isCreating}
+              id="create-project-repository-name"
+              onChange={(event) => {
+                setRepositoryName(event.target.value);
+                setErrorMessage(null);
+              }}
+              placeholder="bee-garden-ios"
+              spellCheck={false}
+              value={repositoryName}
+            />
+          </div>
+          <p className="text-xs text-muted-foreground">
+            Defaults to the project name.
+          </p>
         </div>
 
         <CreateProjectFormSettings disabled={isCreating} {...settings} />

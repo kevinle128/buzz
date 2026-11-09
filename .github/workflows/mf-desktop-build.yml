@@ -25,7 +25,11 @@ permissions:
   contents: read
 
 env:
-  BUZZ_UPDATER_ENDPOINT: https://s3.ap-southeast-1.wasabisys.com/game-mobile-registry/buzz-desktop/latest.json
+  # The Wasabi account blocks anonymous reads, so clients download through a
+  # CDN that serves the bucket root: https://<cdn>/<key> maps to s3://<bucket>/<key>.
+  BUZZ_UPDATER_ENDPOINT: https://gamestudio.mobigame.vn/buzz-desktop/latest.json
+  WASABI_ENDPOINT: https://s3.ap-southeast-1.wasabisys.com
+  WASABI_BUCKET: game-mobile-registry
   BUZZ_UPDATER_PUBLIC_KEY: ${{ secrets.BUZZ_UPDATER_PUBLIC_KEY }}
 
 jobs:
@@ -475,16 +479,13 @@ jobs:
         id: upload
         run: |
           set -euo pipefail
-          # BUZZ_UPDATER_ENDPOINT is https://<s3-host>/<bucket>/<prefix>/latest.json.
-          # Derive every location from it so the manifest URL and the upload
-          # target cannot drift apart.
+          # BUZZ_UPDATER_ENDPOINT is https://<cdn>/<prefix>/latest.json, and the
+          # CDN path is the object key. Derive every location from it so the
+          # manifest URLs and the upload target cannot drift apart.
           path="${BUZZ_UPDATER_ENDPOINT#https://}"
-          host="${path%%/*}"
-          path="${path#*/}"
-          bucket="${path%%/*}"
           prefix="$(dirname "${path#*/}")"
           release_dir="${prefix}/v${VERSION}"
-          base_url="https://${host}/${bucket}/${release_dir}"
+          base_url="$(dirname "$BUZZ_UPDATER_ENDPOINT")/v${VERSION}"
 
           # Each updater artifact must match exactly one signed file, so a
           # missing or duplicate bundle fails here instead of in latest.json.
@@ -508,8 +509,8 @@ jobs:
           windows=$(one '*-setup.exe')
 
           find dist -type f -print0 | while IFS= read -r -d '' file; do
-            aws s3 cp "$file" "s3://${bucket}/${release_dir}/$(basename "$file")" \
-              --endpoint-url "https://${host}" --only-show-errors
+            aws s3 cp "$file" "s3://${WASABI_BUCKET}/${release_dir}/$(basename "$file")" \
+              --endpoint-url "$WASABI_ENDPOINT" --only-show-errors
           done
 
           desktop/scripts/generate-oss-latest-json.sh "$VERSION" \
@@ -520,18 +521,14 @@ jobs:
             > latest.json
           cat latest.json
 
-          {
-            echo "host=$host"
-            echo "manifest=s3://${bucket}/${prefix}/latest.json"
-          } >> "$GITHUB_OUTPUT"
+          echo "manifest=s3://${WASABI_BUCKET}/${prefix}/latest.json" >> "$GITHUB_OUTPUT"
 
       - name: Publish latest.json
         env:
-          HOST: ${{ steps.upload.outputs.host }}
           MANIFEST: ${{ steps.upload.outputs.manifest }}
         run: |
           aws s3 cp latest.json "$MANIFEST" \
-            --endpoint-url "https://${HOST}" \
+            --endpoint-url "$WASABI_ENDPOINT" \
             --content-type application/json \
             --cache-control no-cache \
             --only-show-errors

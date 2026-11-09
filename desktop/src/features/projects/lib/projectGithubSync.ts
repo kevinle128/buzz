@@ -1,4 +1,5 @@
 import { isGitHubCloneUrl } from "@/features/projects/lib/projectGitError";
+import { parseGithubPullRequestNumber } from "@/features/projects/lib/projectGithubPullRequests";
 
 /** Decide whether local-vs-remote sync status may run for this repository. */
 export function projectRepoSyncStatusEnabled(input: {
@@ -34,8 +35,14 @@ export function githubSyncCountDisplay(input: {
 /** Keep Nostr PR-update publication on Buzz pushes only. */
 export function shouldPublishPullRequestUpdateAfterPush(
   cloneUrl?: string | null,
+  pullRequestId?: string | null,
 ): boolean {
-  return !isGitHubCloneUrl(cloneUrl);
+  // A Buzz review on a GitHub-hosted repository still takes Nostr updates.
+  return (
+    !isGitHubCloneUrl(cloneUrl) ||
+    (Boolean(pullRequestId) &&
+      parseGithubPullRequestNumber(pullRequestId) === null)
+  );
 }
 
 /** Select the single primary repository sync action for the header. */

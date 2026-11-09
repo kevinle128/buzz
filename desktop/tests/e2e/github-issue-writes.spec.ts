@@ -22,6 +22,7 @@ async function openBuzzProject(page: import("@playwright/test").Page) {
     .first();
   await expect(projectEntry).toBeVisible({ timeout: 10_000 });
   await projectEntry.click();
+  await page.getByTestId("project-home-context-repo-buzz").click();
 }
 
 async function openGithubIssues(page: import("@playwright/test").Page) {
@@ -32,7 +33,7 @@ async function openGithubIssues(page: import("@playwright/test").Page) {
   });
   await installMockBridge(page);
   await openBuzzProject(page);
-  await page.getByRole("tab", { name: "Issues", exact: true }).click();
+  await page.getByRole("tab", { name: "Tasks", exact: true }).click();
 }
 
 test("GitHub issue writes close, comment, label, assign, and reopen #42", async ({
@@ -132,7 +133,7 @@ test("GitHub close failure keeps Open selected and shows Close failed.", async (
   });
   await installMockBridge(page);
   await openBuzzProject(page);
-  await page.getByRole("tab", { name: "Issues", exact: true }).click();
+  await page.getByRole("tab", { name: "Tasks", exact: true }).click();
   await page.getByRole("button", { name: "#42", exact: true }).click();
   await page.getByTestId("project-github-issue-close").click();
   await expect(page.getByText("Close failed.", { exact: true })).toBeVisible();
@@ -173,7 +174,7 @@ test("GitHub comment drafts do not carry into a different issue", async ({
     .getByTestId("project-github-issue-comment-input")
     .fill("Draft for issue 42");
 
-  await page.getByRole("button", { name: "New issue" }).click();
+  await page.getByRole("button", { name: "Create task" }).first().click();
   await page.getByTestId("create-issue-title").fill("Second GitHub issue");
   await page.getByTestId("create-issue-submit").click();
 

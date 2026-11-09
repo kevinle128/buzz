@@ -128,7 +128,7 @@ impl Db {
 }
 
 #[cfg(test)]
-mod tests {
+mod postgres_tests {
     use super::*;
     use crate::event::insert_event;
     use nostr::{EventBuilder, Keys, Kind, Tag};
@@ -318,7 +318,8 @@ mod tests {
         let db = crate::Db::from_pool(pool.clone());
         let community_a = make_community(&pool).await;
         let community_b = make_community(&pool).await;
-        let (workflow_id, _) = crate::workflow::tests::make_workflow_in(&pool, community_a).await;
+        let (workflow_id, _) =
+            crate::workflow::tests::postgres_tests::make_workflow_in(&pool, community_a).await;
         let owner = Keys::generate();
         let owner_bytes = owner.public_key().to_bytes();
         db.ensure_user(community_b, &owner_bytes)

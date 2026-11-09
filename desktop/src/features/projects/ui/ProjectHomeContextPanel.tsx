@@ -1,3 +1,4 @@
+import { githubRemoteSnapshotEnabled } from "@/features/projects/lib/projectGithubSnapshot";
 import {
   ChevronDown,
   CircleDot,
@@ -232,7 +233,10 @@ export function ProjectHomeContextPanel({
     defaultBranch,
     null,
     null,
-    Boolean(firstRepository),
+    githubRemoteSnapshotEnabled({
+      cloneUrl: firstRepository?.cloneUrls[0],
+      githubStateReady: repoStateQuery.isSuccess,
+    }),
   );
   const channelsById = new Map(
     channels.map((candidate) => [candidate.id, candidate]),
