@@ -8,6 +8,7 @@ mod git_runtime_tests;
 mod acp;
 mod config;
 mod edit_routing;
+mod elicitation_intake;
 mod engram_fetch;
 mod filter;
 mod isolated_execution;
@@ -25,6 +26,7 @@ use runtime::{AgentRuntime, PoolStartup, SessionMode};
 mod scope;
 mod setup_mode;
 mod usage;
+mod wake_intake;
 
 pub use usage::TurnUsage;
 
@@ -74,6 +76,9 @@ fn is_subcommand(name: &str) -> bool {
 
 /// Timeout for lightweight helper subcommands (spawn + initialize + model/method probes).
 const MODELS_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// `_buzz/wake` requests that can wait for the main loop.
+const AGENT_WAKE_QUEUE: usize = 64;
 
 /// Timeout for `buzz-acp authenticate`. Browser-based vendor auth can require
 /// human interaction, so it must not share the short probe timeout.
@@ -555,9 +560,16 @@ mod inbound_author_gate {
     pub(crate) struct AuthorizedListenerEvent {
         buzz_event: relay::BuzzEvent,
         effective_author: String,
+        relay_signed: bool,
     }
 
     impl AuthorizedListenerEvent {
+        /// Whether the active relay identity signed the event. Such an event
+        /// speaks for the relay or a workflow, never for a person.
+        pub(crate) fn relay_signed(&self) -> bool {
+            self.relay_signed
+        }
+
         pub(crate) fn into_parts(self) -> (relay::BuzzEvent, String) {
             (self.buzz_event, self.effective_author)
         }
@@ -752,9 +764,14 @@ mod inbound_author_gate {
                 );
                 return None;
             }
+            let relay_signed = self
+                .relay_self
+                .as_deref()
+                .is_some_and(|relay| buzz_event.event.pubkey.to_hex().eq_ignore_ascii_case(relay));
             Some(AuthorizedListenerEvent {
                 buzz_event,
                 effective_author: decision.effective_author,
+                relay_signed,
             })
         }
 
@@ -855,6 +872,26 @@ impl QueuedNormalListenerEvent {
         if !self.accepted || !queue.is_scope_in_flight(&self.scope) {
             return;
         }
+        // A wake turn has no batch to merge into a re-prompt, so a stop
+        // signal would lose it. The event waits and runs after the wake turn.
+        if queue.is_wake_in_flight(&self.scope) {
+            tracing::info!(
+                scope = %self.scope.telemetry_label(),
+                "wake turn in flight — event queued without steer or interrupt"
+            );
+            return;
+        }
+        // A turn that asked a question gets no stop signal until it ends: a
+        // stop while the question waits loses it, and a stop after the answer
+        // throws away the work the answer started. The event stays queued
+        // for the next turn.
+        if pool.elicitations().has_question(&self.scope) {
+            tracing::info!(
+                scope = %self.scope.telemetry_label(),
+                "turn has an open question — event queued without steer or interrupt"
+            );
+            return;
+        }
         let Some(signal) = mode_gate_signal(handling, &self.effective_author, owner) else {
             return;
         };
@@ -885,6 +922,49 @@ impl QueuedNormalListenerEvent {
 }
 
 impl NormalListenerIngress {
+    /// Use this event as the answer to the open ACP form question of `scope`
+    /// when it is a reply in the question thread.
+    ///
+    /// Returns `None` when the event was consumed: it is not queued, gets no
+    /// 👀 reaction, and never steers or interrupts the waiting turn. The
+    /// caller runs this after the author gate, which decides who may answer;
+    /// `relay_signed` comes from that gate. While the agent display name is
+    /// not known, a candidate answer looks it up again first, so a name with
+    /// spaces is never cut at its first word.
+    async fn answer_open_question(
+        self,
+        scope: &scope::SessionScope,
+        relay_signed: bool,
+        pool: &mut AgentPool,
+        poster: &elicitation_intake::ThreadPoster,
+    ) -> Option<Self> {
+        let candidate = elicitation_intake::AnswerCandidate {
+            event: &self.buzz_event.event,
+            effective_author: &self.effective_author,
+            relay_signed,
+        };
+        if !pool
+            .elicitations()
+            .accepts_candidate(scope, &candidate, poster.agent_hex())
+        {
+            return Some(self);
+        }
+        let label = poster.agent_label().await;
+        let known_names: Vec<&str> = label.as_deref().into_iter().collect();
+        match pool
+            .elicitations_mut()
+            .intake(scope, candidate, poster.agent_hex(), &known_names)
+        {
+            elicitation_intake::Intake::NotForQuestion => Some(self),
+            elicitation_intake::Intake::Consumed { reply } => {
+                if let Some(reply) = reply {
+                    poster.post(reply);
+                }
+                None
+            }
+        }
+    }
+
     /// Resolve an admitted edit's original message once, before its session
     /// scope is derived, so scope, reactions, prompt, typing, steering, and
     /// failure notices all share one routing authority. The lookup is bounded
@@ -3359,6 +3439,28 @@ async fn run_harness(
     //      `IN_FLIGHT_DEADLINE_SECS` expires.
     let (steer_ack_tx, mut steer_ack_rx) = mpsc::unbounded_channel::<SteerAckEvent>();
 
+    // ACP form questions from prompt-task read loops and from the posting
+    // tasks. Unbounded because every producer is bounded: one open question
+    // per in-flight turn, and one post result per question. A dropped event
+    // would leave a question record that no turn owns.
+    let (elicitation_tx, mut elicitation_rx) =
+        mpsc::unbounded_channel::<acp::elicitation::ElicitationEvent>();
+    // Posts questions and their notices as the agent; it also keeps the agent
+    // display name that the answer grammar strips. One per listener run.
+    let elicitation_poster = elicitation_intake::ThreadPoster::new(
+        config.keys.clone(),
+        relay.event_publisher(),
+        Some(ctx.rest_client.clone()),
+        elicitation_tx.clone(),
+    );
+    elicitation_poster.prefetch_agent_label();
+
+    // `_buzz/wake` requests from the reader tasks of the agent children.
+    // Bounded: a reader that finds it full answers `busy` itself, and each
+    // child has at most a few unanswered wake requests.
+    let (agent_wake_tx, mut agent_wake_rx) =
+        mpsc::channel::<acp::child_io::WakeFrame>(AGENT_WAKE_QUEUE);
+
     // Startup is complete; the main loop now owns graceful shutdown.
     let _ = startup_ready.send(());
 
@@ -3415,12 +3517,20 @@ async fn run_harness(
         Result(Box<PromptResult>),
         Panic(tokio::task::JoinError),
         SteerAck(SteerAckEvent),
+        Elicitation(acp::elicitation::ElicitationEvent),
+        AgentWake(acp::child_io::WakeFrame),
         Wake(u32, Result<AgentPool, String>),
         HoldDeadline,
         Recovery(recovery_wake::RecoveryWake),
     }
 
     loop {
+        // Every pool (also one that replaced a slept pool) routes ACP form
+        // questions to this loop.
+        pool.elicitations_mut().ensure_events_tx(&elicitation_tx);
+        // Every live worker (also after a respawn or a pool wake) routes its
+        // child's `_buzz/wake` requests to this loop.
+        pool.attach_wake_routes(&agent_wake_tx);
         // Whether buffered work is waiting on a lazy pool. Also gates the
         // retry-deadline sleep arm below: a `Failed` lifecycle keeps its
         // (possibly past) `retry_at` until the next wake, so sleeping on it
@@ -3559,6 +3669,12 @@ async fn run_harness(
                 // locked semantics (Eva + Max + Perci).
                 Some(ack_event) = steer_ack_rx.recv() => {
                     Some(PoolEvent::SteerAck(ack_event))
+                }
+                Some(event) = elicitation_rx.recv() => {
+                    Some(PoolEvent::Elicitation(event))
+                }
+                Some(frame) = agent_wake_rx.recv() => {
+                    Some(PoolEvent::AgentWake(frame))
                 }
                 Some((attempt, result)) = wake_rx.recv(), if config.lazy_pool && !pool_ready => {
                     Some(PoolEvent::Wake(attempt, result))
@@ -3915,6 +4031,7 @@ async fn run_harness(
                             else {
                                 continue;
                             };
+                            let relay_signed = authorized_event.relay_signed();
                             let Some(ingress) =
                                 AuthorizedNormalListenerEvent(authorized_event)
                                     .match_subscription(&rules, &pubkey_hex)
@@ -3946,6 +4063,21 @@ async fn run_harness(
                                 policy = %config.session_policy,
                                 "admitted event — resolved session scope"
                             );
+                            // A reply in the thread of an open ACP form
+                            // question answers it and is not queued. This
+                            // runs after the author gate on purpose: the gate
+                            // decides who may answer.
+                            let Some(ingress) = ingress
+                                .answer_open_question(
+                                    &session_scope,
+                                    relay_signed,
+                                    &mut pool,
+                                    &elicitation_poster,
+                                )
+                                .await
+                            else {
+                                continue; // consumed — do NOT push to queue
+                            };
                             let queued = ingress.push(&mut queue, session_scope, channel_is_dm);
                             // 👀 — immediate "seen" reaction, only if the event
                             // was actually queued (not dropped by DedupMode::Drop).
@@ -4146,6 +4278,9 @@ async fn run_harness(
                                     protocol_version,
                                 };
                                 pool.return_agent(agent);
+                                // Route the new child's wake requests before a
+                                // dispatch below can claim it for a turn.
+                                pool.attach_wake_routes(&agent_wake_tx);
                                 tracing::info!(agent = rr.index, "respawn complete");
                             }
                             Err(e) => {
@@ -4388,7 +4523,7 @@ async fn run_harness(
                     // agent. Scope-exact so the fallback cancels the
                     // steered event's OWN thread, not a sibling thread
                     // in the same channel.
-                    signal_in_flight_task_for_scope(&mut pool, &scope, ControlSignal::Steer);
+                    signal_steer_fallback(&mut pool, &scope);
                 }
                 // After releasing a withheld event, give dispatch a chance
                 // to re-flush. If the prompt is still in flight, the
@@ -4407,6 +4542,35 @@ async fn run_harness(
                     typing_channels.insert(scope, thread_tags);
                 }
             }
+            Some(PoolEvent::Elicitation(event)) => {
+                elicitation_intake::handle_event(
+                    &mut pool,
+                    &elicitation_poster,
+                    event,
+                    owner_cache.get(),
+                );
+            }
+            Some(PoolEvent::AgentWake(frame)) => {
+                let intake = wake_intake::WakeIntake {
+                    policy: config.session_policy,
+                    subscribed: &subscribed_channel_ids,
+                    channel_info: &ctx.channel_info,
+                };
+                let accepted = wake_intake::handle_wake_frame(frame, &mut queue, &intake)
+                    .await
+                    .is_some_and(|(reply, _)| reply == Ok(acp::wake::WakeOutcome::Accepted));
+                if accepted && pool_ready {
+                    for (scope, thread_tags) in dispatch_pending(
+                        &mut pool,
+                        &mut queue,
+                        &ctx,
+                        &mut last_activity,
+                        observer.as_ref(),
+                    ) {
+                        typing_channels.insert(scope, thread_tags);
+                    }
+                }
+            }
             Some(PoolEvent::Wake(attempt, result)) => {
                 let completion = result.as_ref().map(|_| ()).map_err(|error| error.clone());
                 if let Err(error) =
@@ -4420,6 +4584,8 @@ async fn run_harness(
                         pool = pool_lifecycle
                             .take_ready()
                             .expect("successful wake stores a ready pool");
+                        // Route wake requests before the dispatch below.
+                        pool.attach_wake_routes(&agent_wake_tx);
                         pool_ready = true;
                         emit_runtime_lifecycle(
                             observer.as_ref(),
@@ -4672,14 +4838,18 @@ fn signal_in_flight_task(
         .values_mut()
         .find(|m| m.channel_id == Some(channel_id));
 
-    if let Some(meta) = entry {
-        if let Some(tx) = meta.control_tx.take() {
-            tracing::info!(channel = %channel_id, ?mode, "control signal sent to in-flight task");
-            let _ = tx.send(mode);
-            return true;
-        }
-    }
-    false
+    let Some(meta) = entry else {
+        return false;
+    };
+    let Some(tx) = meta.control_tx.take() else {
+        return false;
+    };
+    tracing::info!(channel = %channel_id, ?mode, "control signal sent to in-flight task");
+    let _ = tx.send(mode);
+    // Every control signal stops the turn, so its question is gone too.
+    let turn_id = meta.turn_id.clone();
+    pool.elicitations_mut().clear_turn(&turn_id);
+    true
 }
 
 /// Send a control signal to the in-flight task for one exact session scope.
@@ -4700,19 +4870,41 @@ fn signal_in_flight_task_for_scope(
         .values_mut()
         .find(|m| m.scope.as_ref() == Some(scope));
 
-    if let Some(meta) = entry {
-        if let Some(tx) = meta.control_tx.take() {
-            tracing::info!(
-                channel = %scope.channel_id(),
-                scope = %scope.telemetry_label(),
-                ?mode,
-                "control signal sent to in-flight task (scope-exact)"
-            );
-            let _ = tx.send(mode);
-            return true;
-        }
+    let Some(meta) = entry else {
+        return false;
+    };
+    let Some(tx) = meta.control_tx.take() else {
+        return false;
+    };
+    tracing::info!(
+        channel = %scope.channel_id(),
+        scope = %scope.telemetry_label(),
+        ?mode,
+        "control signal sent to in-flight task (scope-exact)"
+    );
+    let _ = tx.send(mode);
+    // Every control signal stops the turn, so its question is gone too.
+    let turn_id = meta.turn_id.clone();
+    pool.elicitations_mut().clear_turn(&turn_id);
+    true
+}
+
+/// Send the cancel+merge fallback of a failed native steer to the turn of
+/// `scope`, unless that turn asked an ACP form question (pending or
+/// answered): cancelling it would lose the question or the work its answer
+/// started. The released event then stays queued and is dispatched after the
+/// turn ends.
+///
+/// Returns `true` if a signal was sent.
+fn signal_steer_fallback(pool: &mut AgentPool, scope: &scope::SessionScope) -> bool {
+    if pool.elicitations().has_question(scope) {
+        tracing::info!(
+            scope = %scope.telemetry_label(),
+            "turn has an open question — steer fallback not signalled"
+        );
+        return false;
     }
-    false
+    signal_in_flight_task_for_scope(pool, scope, ControlSignal::Steer)
 }
 
 /// Attempt the non-cancelling (ACP) steer for a freshly-queued event.
@@ -5211,7 +5403,7 @@ fn dispatch_pending(
         // thread's provider session so a temporarily busy worker cannot cause
         // another to open a duplicate session for the same thread.
         let affinity_hit = pool.has_session_for(&scope);
-        let mut agent = match pool.try_claim(Some(&scope)) {
+        let agent = match pool.try_claim(Some(&scope)) {
             Some(a) => a,
             None => {
                 let pending = queue.pending_channels();
@@ -5249,83 +5441,16 @@ fn dispatch_pending(
         }
         tracing::debug!(agent = agent.index, channel = %channel_id, scope = %scope.telemetry_label(), affinity_hit, "agent_claimed");
 
-        let recoverable_batch = match ctx.dedup_mode {
-            DedupMode::Queue => Some(batch.clone()),
-            DedupMode::Drop => None,
-        };
-
-        let result_tx = pool.result_tx();
-        let ctx_clone = Arc::clone(ctx);
-        let agent_index = agent.index;
-
-        // Mid-turn non-cancelling steer seam: install the per-turn steer
-        // receiver on the read loop so the main loop's mode-gate fork
-        // (see the `if accepted && queue.is_channel_in_flight(...)` block
-        // in the relay event branch of the main `select!` loop) can drive
-        // it via the matching sender stored in `TaskMeta.steer_tx`.
-        // Installed for every prompt task: the read loop picks the steer
-        // transport at write time from `active_run_id` and the agent's
-        // advertised `_session/steering` capability, and acks
-        // `ExpectedRunIdMissing` (→ cancel+merge) when it has neither.
-        let (tx, rx) = tokio::sync::mpsc::channel::<pool::SteerRequest>(1);
-        agent.acp.install_steer_rx(rx);
-        let steer_tx = Some(tx);
-
-        // Permission decision channel: delivers `permission_decision` control
-        // frames into the read loop's decision arm (spec §4). Installed
-        // per-session (the receiver is taken by the read loop and dropped
-        // when the turn ends; the next turn installs a fresh pair). Capacity
-        // matches PERMISSION_MAP_CAP so each pending entry gets a slot.
-        let (perm_tx, perm_rx) = tokio::sync::mpsc::channel::<crate::acp::PermissionDecision>(
-            crate::acp::PERMISSION_MAP_CAP,
-        );
-        agent.acp.install_permission_decision_rx(perm_rx);
-        let permission_decision_tx = Some(perm_tx);
-
-        // Prompt text is now built inside run_prompt_task (needs async for
-        // context fetching). Pass None for prompt_text; batch carries the data.
-        let (control_tx, control_rx) = tokio::sync::oneshot::channel::<ControlSignal>();
-        let turn_id = Uuid::new_v4().to_string();
-        let task_turn_id = turn_id.clone();
-
-        // Assign ownership before moving the worker into the task. If this is
-        // a bounded-hold fork, the new generation immediately invalidates the
-        // prior busy worker's copy when that worker eventually returns.
-        let owner_generation = pool.record_scope_owner(scope.clone(), agent.index);
-        agent
-            .state
-            .set_scope_owner_generation(scope.clone(), owner_generation);
-
         // The prompt task records how it routed replies, for the
         // native-steer guard (`EventQueue::in_flight_accepts_steer`).
         let prompt_routing = queue.in_flight_prompt_routing(&scope).unwrap_or_default();
-        let abort_handle = pool.join_set.spawn(async move {
-            pool::run_prompt_task(
-                agent,
-                Some(batch),
-                None,
-                ctx_clone,
-                result_tx,
-                Some(control_rx),
-                task_turn_id,
-                prompt_routing,
-            )
-            .await;
-        });
-
-        pool.task_map_mut().insert(
-            abort_handle.id(),
-            pool::TaskMeta {
-                agent_index,
-                channel_id: Some(channel_id),
-                scope: Some(scope.clone()),
-                turn_id,
-                recoverable_batch,
-                control_tx: Some(control_tx),
-                steer_tx,
-                permission_decision_tx,
-                successful_steer_deliveries: HashSet::new(),
-            },
+        spawn_scope_turn(
+            pool,
+            agent,
+            scope.clone(),
+            ScopeTurn::Batch(batch),
+            ctx,
+            prompt_routing,
         );
         dispatched_channels.push((scope, typing_scope));
         *last_activity = tokio::time::Instant::now();
@@ -5339,12 +5464,224 @@ fn dispatch_pending(
         queue.requeue_preserve_timestamps(batch);
         queue.mark_complete(scope);
     }
+    // Queued wake turns start after the batches, in scopes with no turn in
+    // flight, under the same busy-owner hold rule.
+    for (scope, thread_tags) in dispatch_wake_turns(pool, queue, ctx, now) {
+        dispatched_channels.push((scope, thread_tags));
+        *last_activity = tokio::time::Instant::now();
+    }
     tracing::debug!(
         dispatched = dispatched_channels.len(),
         queue_depth = queue.pending_channels(),
         "dispatch_pending"
     );
     dispatched_channels
+}
+
+/// The work of one scope turn that [`spawn_scope_turn`] starts.
+enum ScopeTurn {
+    Batch(FlushBatch),
+    Wake(acp::wake::PendingWake),
+}
+
+/// Start the claimed `agent` on one turn of `scope` in the pool's join set and
+/// record its task metadata. Every scope turn (batch or wake) gets the same
+/// per-turn channels: steer, permission decisions, control signal, and the
+/// route for ACP form questions.
+fn spawn_scope_turn(
+    pool: &mut AgentPool,
+    mut agent: OwnedAgent,
+    scope: scope::SessionScope,
+    turn: ScopeTurn,
+    ctx: &Arc<PromptContext>,
+    prompt_routing: queue::PromptRouting,
+) {
+    let channel_id = scope.channel_id();
+    let recoverable_batch = match (&turn, ctx.dedup_mode) {
+        (ScopeTurn::Batch(batch), DedupMode::Queue) => Some(batch.clone()),
+        _ => None,
+    };
+
+    let result_tx = pool.result_tx();
+    let ctx_clone = Arc::clone(ctx);
+    let agent_index = agent.index;
+
+    // Mid-turn non-cancelling steer seam: install the per-turn steer
+    // receiver on the read loop so the main loop's mode-gate fork
+    // (see the `if accepted && queue.is_channel_in_flight(...)` block
+    // in the relay event branch of the main `select!` loop) can drive
+    // it via the matching sender stored in `TaskMeta.steer_tx`.
+    // Installed for every prompt task: the read loop picks the steer
+    // transport at write time from `active_run_id` and the agent's
+    // advertised `_session/steering` capability, and acks
+    // `ExpectedRunIdMissing` (→ cancel+merge) when it has neither.
+    let (tx, rx) = tokio::sync::mpsc::channel::<pool::SteerRequest>(1);
+    agent.acp.install_steer_rx(rx);
+    let steer_tx = Some(tx);
+
+    // Permission decision channel: delivers `permission_decision` control
+    // frames into the read loop's decision arm (spec §4). Installed
+    // per-session (the receiver is taken by the read loop and dropped
+    // when the turn ends; the next turn installs a fresh pair). Capacity
+    // matches PERMISSION_MAP_CAP so each pending entry gets a slot.
+    let (perm_tx, perm_rx) = tokio::sync::mpsc::channel::<crate::acp::PermissionDecision>(
+        crate::acp::PERMISSION_MAP_CAP,
+    );
+    agent.acp.install_permission_decision_rx(perm_rx);
+    let permission_decision_tx = Some(perm_tx);
+
+    // Prompt text is now built inside run_prompt_task (needs async for
+    // context fetching). Pass None for prompt_text; batch carries the data.
+    let (control_tx, control_rx) = tokio::sync::oneshot::channel::<ControlSignal>();
+    let turn_id = Uuid::new_v4().to_string();
+    let task_turn_id = turn_id.clone();
+
+    let anchor = match &turn {
+        ScopeTurn::Batch(batch) => elicitation_anchor(batch),
+        ScopeTurn::Wake(wake) => Some(wake.request.thread.root_event_id.clone()),
+    };
+    if let Some(anchor_event_id) = anchor {
+        if let Some(sink) = pool
+            .elicitations()
+            .sink_for(acp::elicitation::ElicitationTurn {
+                turn_id: turn_id.clone(),
+                scope: scope.clone(),
+                anchor_event_id,
+            })
+        {
+            agent.acp.install_elicitation_sink(sink);
+        }
+    }
+
+    // Assign ownership before moving the worker into the task. If this is
+    // a bounded-hold fork, the new generation immediately invalidates the
+    // prior busy worker's copy when that worker eventually returns.
+    let owner_generation = pool.record_scope_owner(scope.clone(), agent.index);
+    agent
+        .state
+        .set_scope_owner_generation(scope.clone(), owner_generation);
+
+    let task_scope = scope.clone();
+    let abort_handle = pool.join_set.spawn(async move {
+        match turn {
+            ScopeTurn::Batch(batch) => {
+                pool::run_prompt_task(
+                    agent,
+                    Some(batch),
+                    None,
+                    ctx_clone,
+                    result_tx,
+                    Some(control_rx),
+                    task_turn_id,
+                    prompt_routing,
+                )
+                .await;
+            }
+            ScopeTurn::Wake(wake) => {
+                pool::run_wake_task(
+                    agent,
+                    task_scope,
+                    wake,
+                    ctx_clone,
+                    result_tx,
+                    Some(control_rx),
+                    task_turn_id,
+                    prompt_routing,
+                )
+                .await;
+            }
+        }
+    });
+
+    pool.task_map_mut().insert(
+        abort_handle.id(),
+        pool::TaskMeta {
+            agent_index,
+            channel_id: Some(channel_id),
+            scope: Some(scope.clone()),
+            turn_id,
+            recoverable_batch,
+            control_tx: Some(control_tx),
+            steer_tx,
+            permission_decision_tx,
+            successful_steer_deliveries: HashSet::new(),
+        },
+    );
+}
+
+/// Start queued wake turns whose scope has no turn in flight. A thread scope
+/// whose session owner is busy is held like a batch, and forks after the same
+/// bounded hold. Returns the scopes started, with the thread of each for the
+/// typing indicator.
+fn dispatch_wake_turns(
+    pool: &mut AgentPool,
+    queue: &mut EventQueue,
+    ctx: &Arc<PromptContext>,
+    now: tokio::time::Instant,
+) -> Vec<(scope::SessionScope, ThreadTags)> {
+    let mut started = Vec::new();
+    for scope in queue.ready_wake_scopes() {
+        if let pool::HoldDecision::Hold { owner_index, .. } =
+            pool.hold_decision(&scope, now, pool::HOLD_BUSY_OWNER_TIMEOUT)
+        {
+            tracing::debug!(
+                scope = %scope.telemetry_label(),
+                owner_index,
+                "wake turn held — thread session owner busy"
+            );
+            continue;
+        }
+        let Some(agent) = pool.try_claim(Some(&scope)) else {
+            break; // Pool exhausted; a returning worker dispatches again.
+        };
+        pool.clear_hold(&scope);
+        let Some(wake) = queue.start_wake(&scope) else {
+            pool.return_agent(agent);
+            continue;
+        };
+        let root = wake.request.thread.root_event_id.clone();
+        tracing::info!(
+            agent = agent.index,
+            wake_id = %wake.request.wake_id,
+            reason = wake.request.reason.as_str(),
+            scope = %scope.telemetry_label(),
+            "starting wake turn"
+        );
+        spawn_scope_turn(
+            pool,
+            agent,
+            scope.clone(),
+            ScopeTurn::Wake(wake),
+            ctx,
+            queue::PromptRouting::default(),
+        );
+        started.push((
+            scope,
+            ThreadTags {
+                root_event_id: Some(root.clone()),
+                parent_event_id: Some(root),
+                mentioned_pubkeys: Vec::new(),
+            },
+        ));
+    }
+    started
+}
+
+/// The thread an ACP form question of `batch`'s turn is posted in: the thread
+/// root of a thread scope, otherwise the thread of the newest event, which is
+/// where the turn replies. Lowercase hex.
+fn elicitation_anchor(batch: &FlushBatch) -> Option<String> {
+    batch
+        .scope
+        .root_event_id()
+        .map(str::to_ascii_lowercase)
+        .or_else(|| {
+            batch
+                .events
+                .last()
+                .or(batch.cancelled_events.last())
+                .map(queue::BatchEvent::reply_thread)
+        })
 }
 
 /// Returns `true` when `error` is a non-retryable authentication failure.
@@ -5374,6 +5711,24 @@ fn is_auth_error(error: &acp::AcpError) -> bool {
         return false;
     };
     message.contains("Re-authenticate") || message.contains("API Error: 401")
+}
+
+/// Whether a wake turn that ended with `outcome` runs again. A clean end or
+/// a deliberate stop (`!cancel`, rotation, model switch) does not; neither
+/// does a turn that hit the hard cap with no recent activity, which a batch
+/// would dead-letter.
+fn wake_turn_should_retry(outcome: &PromptOutcome) -> bool {
+    match outcome {
+        PromptOutcome::Ok(_) | PromptOutcome::Cancelled => false,
+        PromptOutcome::Timeout(TimeoutKind::Hard {
+            recently_active: false,
+        }) => false,
+        PromptOutcome::Error(_)
+        | PromptOutcome::ProjectContextIndeterminate(_)
+        | PromptOutcome::AgentExited
+        | PromptOutcome::Timeout(_)
+        | PromptOutcome::CancelDrainTimeout(_) => true,
+    }
 }
 
 fn should_replace_agent_after_error(error: &acp::AcpError) -> bool {
@@ -5467,7 +5822,9 @@ fn handle_prompt_result(
     // Start a full idle interval when channel work settles, before releasing
     // its in-flight guard. Heartbeats must not keep an otherwise idle pool alive.
     match &result.source {
-        PromptSource::Channel(_) => *last_activity = tokio::time::Instant::now(),
+        PromptSource::Channel(_) | PromptSource::Wake(_) => {
+            *last_activity = tokio::time::Instant::now()
+        }
         PromptSource::Heartbeat => {}
     }
     let before = pool.task_map().len();
@@ -5481,7 +5838,9 @@ fn handle_prompt_result(
     pool.task_map_mut()
         .retain(|_, meta| meta.agent_index != agent_index);
     debug_assert_eq!(before, pool.task_map().len() + 1);
-    if let PromptSource::Channel(scope) = &result.source {
+    // The turn is over; its question (answered or not) is gone with it.
+    pool.elicitations_mut().clear_turn(&result.turn_id);
+    if let PromptSource::Channel(scope) | PromptSource::Wake(scope) = &result.source {
         // The task may have invalidated this session before returning. Never
         // resurrect delivery state for a dead session; its replacement must
         // receive fresh standing context and history.
@@ -5635,6 +5994,17 @@ fn handle_prompt_result(
 
     match &result.source {
         PromptSource::Channel(scope) => queue.mark_complete(scope.clone()),
+        PromptSource::Wake(scope) => {
+            // Like a batch, a failed wake turn is queued again (within its
+            // attempt bound) before `mark_complete` ends the turn. The agent
+            // runtime already heard `accepted`, so it does not resend.
+            if wake_turn_should_retry(&result.outcome)
+                && !removed_channels.contains(&scope.channel_id())
+            {
+                queue.retry_wake(scope);
+            }
+            queue.mark_complete(scope.clone());
+        }
         PromptSource::Heartbeat => *heartbeat_in_flight = false,
     }
 
@@ -5889,6 +6259,7 @@ fn recover_panicked_agent(
         return;
     };
     let i = meta.agent_index;
+    pool.elicitations_mut().clear_turn(&meta.turn_id);
 
     // Requeue BEFORE mark_complete (same rationale as handle_prompt_result).
     if let Some(batch) = meta.recoverable_batch {
@@ -5918,6 +6289,11 @@ fn recover_panicked_agent(
                 // Clear the panicked turn's exact scope so a sibling thread in
                 // the same channel keeps its typing indicator.
                 typing_channels.remove(scope);
+                // A panicked wake turn runs again like a requeued batch. A
+                // no-op when the turn of the scope was a batch.
+                if !removed_channels.contains(&ch) {
+                    queue.retry_wake(scope);
+                }
                 queue.mark_complete(scope.clone());
             }
             None => {
@@ -6310,6 +6686,7 @@ async fn initialize_agent_pool(
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("unknown"),
                             steering_supported = acp.steering_supported(),
+                            wake_supported = acp.wake_supported(),
                             "agent initialized"
                         );
                         acp.observe(
@@ -7600,7 +7977,7 @@ mod author_gate_tests {
     }
 
     /// Serve scripted NIP-11 responses. `Err(())` returns HTTP 500.
-    async fn nip11_scripted_server(
+    pub(super) async fn nip11_scripted_server(
         responses: std::collections::VecDeque<Result<serde_json::Value, ()>>,
     ) -> (relay::RestClient, tokio::task::JoinHandle<()>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -11538,7 +11915,7 @@ mod error_outcome_emission_tests {
     /// Spawn a real but inert agent subprocess (`cat`) so the error paths have
     /// an `OwnedAgent` to move into respawn or return to the pool. The error
     /// branches never talk to the subprocess.
-    async fn dummy_agent(index: usize) -> OwnedAgent {
+    pub(super) async fn dummy_agent(index: usize) -> OwnedAgent {
         OwnedAgent {
             index,
             acp: AcpClient::spawn("cat", &[], &[], false)
@@ -11589,6 +11966,7 @@ mod error_outcome_emission_tests {
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                permission_decision_tx: None,
                 successful_steer_deliveries: HashSet::new(),
             },
         );
@@ -13943,3 +14321,9 @@ mod observer_payload_trim_tests {
 #[cfg(test)]
 #[path = "observer_audience_tests.rs"]
 mod observer_audience_tests;
+
+#[cfg(test)]
+mod elicitation_intake_tests;
+
+#[cfg(test)]
+mod wake_intake_tests;

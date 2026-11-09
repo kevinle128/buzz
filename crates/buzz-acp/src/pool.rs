@@ -176,7 +176,7 @@ impl SessionState {
     /// Invalidate the session (and turn counter) for a specific prompt source.
     pub fn invalidate(&mut self, source: &PromptSource) {
         match source {
-            PromptSource::Channel(scope) => {
+            PromptSource::Channel(scope) | PromptSource::Wake(scope) => {
                 self.invalidate_scope(scope);
             }
             PromptSource::Heartbeat => {
@@ -393,6 +393,9 @@ pub struct AgentPool {
     /// `Thread` scopes (the sole variant [`hold_decision`](Self::hold_decision)
     /// stamps).
     held_since: HashMap<SessionScope, tokio::time::Instant>,
+    /// Open ACP form questions, one per scope. Derived state of in-flight
+    /// turns: cleared on every turn-end, stop, invalidation, and respawn path.
+    elicitations: crate::elicitation_intake::ElicitationRegistry,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -422,13 +425,16 @@ pub struct PromptResult {
 pub enum PromptSource {
     Channel(SessionScope),
     Heartbeat,
+    /// A turn that the agent asked for with a `_buzz/wake` request. It works
+    /// in its scope like a channel turn: same session, same queue slot.
+    Wake(SessionScope),
 }
 
 impl PromptSource {
     /// The channel this prompt belongs to, or `None` for heartbeats.
     pub fn channel_id(&self) -> Option<Uuid> {
         match self {
-            Self::Channel(scope) => Some(scope.channel_id()),
+            Self::Channel(scope) | Self::Wake(scope) => Some(scope.channel_id()),
             Self::Heartbeat => None,
         }
     }
@@ -441,7 +447,7 @@ impl PromptSource {
     /// [`channel_id`]: PromptSource::channel_id
     pub fn scope(&self) -> Option<&SessionScope> {
         match self {
-            Self::Channel(scope) => Some(scope),
+            Self::Channel(scope) | Self::Wake(scope) => Some(scope),
             Self::Heartbeat => None,
         }
     }
@@ -966,7 +972,20 @@ impl AgentPool {
             session_owners: HashMap::new(),
             next_scope_owner_generation: 1,
             held_since: HashMap::new(),
+            elicitations: Default::default(),
         }
+    }
+
+    /// Open ACP form questions of in-flight turns.
+    pub(crate) fn elicitations(&self) -> &crate::elicitation_intake::ElicitationRegistry {
+        &self.elicitations
+    }
+
+    /// Mutable access to the open ACP form questions.
+    pub(crate) fn elicitations_mut(
+        &mut self,
+    ) -> &mut crate::elicitation_intake::ElicitationRegistry {
+        &mut self.elicitations
     }
 
     /// Record `agent_index` as the newest owner of `scope`, returning the
@@ -1043,6 +1062,22 @@ impl AgentPool {
             .get(scope)
             .map(|owner| owner.agent_index)
             .unwrap_or_default();
+        // A question waits for a human in this scope. A forked session would
+        // run the thread a second time while the first turn still waits, so
+        // hold without a deadline: the stamp is removed so that the hold
+        // deadline wake does not fire again at once, and the owner's return
+        // wakes the dispatcher.
+        if self.elicitations.is_pending(scope) {
+            let held_for = self
+                .held_since
+                .remove(scope)
+                .map(|first| now.saturating_duration_since(first))
+                .unwrap_or_default();
+            return HoldDecision::Hold {
+                held_for,
+                owner_index,
+            };
+        }
         let first = *self.held_since.entry(scope.clone()).or_insert(now);
         let held_for = now.saturating_duration_since(first);
         if held_for >= timeout {
@@ -1085,8 +1120,26 @@ impl AgentPool {
         idx.map(|i| self.agents[i].take().unwrap())
     }
 
+    /// Give each idle worker without a wake route the route to the main
+    /// loop. Workers enter the pool idle (at start-up and after a respawn),
+    /// so every live child gets its route before its first turn.
+    pub(crate) fn attach_wake_routes(&self, tx: &mpsc::Sender<crate::acp::child_io::WakeFrame>) {
+        for agent in self.agents.iter().flatten() {
+            let link = agent.acp.wake_link();
+            if !link.has_route() {
+                link.attach(crate::acp::child_io::WakeRoute::new(
+                    tx.clone(),
+                    agent.index,
+                ));
+            }
+        }
+    }
+
     /// Return an agent to its slot after a task completes.
     pub fn return_agent(&mut self, mut agent: OwnedAgent) {
+        // An idle worker runs no turn, so it can own no open question. This
+        // also covers a respawned worker that takes over the slot.
+        self.elicitations.clear_agent(agent.index);
         let stale_scopes: Vec<SessionScope> = agent
             .state
             .sessions
@@ -1355,6 +1408,8 @@ impl AgentPool {
         // reference a scope whose sessions are gone.
         self.held_since
             .retain(|scope, _| scope.channel_id() != channel_id);
+        // A question in a channel the agent left cannot get an answer.
+        self.elicitations.clear_channel(channel_id);
         count
     }
 
@@ -1377,6 +1432,7 @@ impl AgentPool {
         }
         self.session_owners.remove(scope);
         self.held_since.remove(scope);
+        self.elicitations.clear_scope(scope);
         count
     }
 
@@ -2405,6 +2461,8 @@ fn send_prompt_result(
     batch: Option<FlushBatch>,
 ) {
     agent.acp.clear_steer_rx();
+    agent.acp.clear_elicitation_sink();
+    agent.acp.set_turn_thread(None);
     let _ = result_tx.send(PromptResult {
         agent,
         source,
@@ -2428,7 +2486,7 @@ fn send_prompt_result(
 /// abort and the caller uses `task_map` to recover the agent index.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_prompt_task(
-    mut agent: OwnedAgent,
+    agent: OwnedAgent,
     batch: Option<FlushBatch>,
     prompt_text: Option<String>,
     ctx: Arc<PromptContext>,
@@ -2437,11 +2495,79 @@ pub async fn run_prompt_task(
     turn_id: String,
     prompt_routing: crate::queue::PromptRouting,
 ) {
-    // Is this a channel prompt or a heartbeat?
-    let source = match &batch {
-        Some(b) => PromptSource::Channel(b.scope.clone()),
-        None => PromptSource::Heartbeat,
+    run_turn(
+        agent,
+        batch,
+        prompt_text,
+        None,
+        ctx,
+        result_tx,
+        control_rx,
+        turn_id,
+        prompt_routing,
+    )
+    .await;
+}
+
+/// Run the wake turn `wake` in `scope`, with the same lifecycle as a channel
+/// turn of that scope (see [`run_prompt_task`]). The agent is always
+/// returned through `result_tx` with [`PromptSource::Wake`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_wake_task(
+    agent: OwnedAgent,
+    scope: SessionScope,
+    wake: crate::acp::wake::PendingWake,
+    ctx: Arc<PromptContext>,
+    result_tx: mpsc::UnboundedSender<PromptResult>,
+    control_rx: Option<tokio::sync::oneshot::Receiver<ControlSignal>>,
+    turn_id: String,
+    prompt_routing: crate::queue::PromptRouting,
+) {
+    run_turn(
+        agent,
+        None,
+        None,
+        Some((scope, wake)),
+        ctx,
+        result_tx,
+        control_rx,
+        turn_id,
+        prompt_routing,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_turn(
+    mut agent: OwnedAgent,
+    batch: Option<FlushBatch>,
+    prompt_text: Option<String>,
+    wake: Option<(SessionScope, crate::acp::wake::PendingWake)>,
+    ctx: Arc<PromptContext>,
+    result_tx: mpsc::UnboundedSender<PromptResult>,
+    control_rx: Option<tokio::sync::oneshot::Receiver<ControlSignal>>,
+    turn_id: String,
+    prompt_routing: crate::queue::PromptRouting,
+) {
+    // A wake, a channel prompt, or a heartbeat?
+    let source = match (&wake, &batch) {
+        (Some((scope, _)), _) => PromptSource::Wake(scope.clone()),
+        (None, Some(b)) => PromptSource::Channel(b.scope.clone()),
+        (None, None) => PromptSource::Heartbeat,
     };
+    // The thread this turn works in. A wake-capable agent receives it with
+    // each request and echoes it in its wake requests.
+    let turn_thread = match (&wake, &batch) {
+        (Some((_, wake)), _) => Some(wake.request.thread.clone()),
+        (None, Some(b)) => {
+            crate::elicitation_anchor(b).map(|root_event_id| crate::acp::wake::WakeThread {
+                channel_id: b.channel_id,
+                root_event_id,
+            })
+        }
+        (None, None) => None,
+    };
+    agent.acp.set_turn_thread(turn_thread);
     let observer_channel_id = source.channel_id();
     // Thread conversation context requires the canonical root to distinguish
     // concurrent threads in the same channel's activity.
@@ -2473,6 +2599,7 @@ pub async fn run_prompt_task(
         "source": match &source {
             PromptSource::Channel(_) => "channel",
             PromptSource::Heartbeat => "heartbeat",
+            PromptSource::Wake(_) => "wake",
         },
         "triggeringEventIds": triggering_event_ids,
     });
@@ -2536,25 +2663,27 @@ pub async fn run_prompt_task(
     // outcome: fail closed and preserve the batch without poisoning the healthy
     // ACP process.
     let resolved_channel_info = match &source {
-        PromptSource::Channel(scope) => match ctx.channel_info.resolve(scope.channel_id()).await {
-            Ok(info) => info,
-            Err(error) => {
-                tracing::warn!(
-                    channel_id = %scope.channel_id(),
-                    "project context is indeterminate; requeueing turn before ACP session creation: {}",
-                    error.0
-                );
-                send_prompt_result(
-                    &result_tx,
-                    &turn_id,
-                    agent,
-                    source,
-                    PromptOutcome::ProjectContextIndeterminate(error.0),
-                    requeue_batch_if_queue(&ctx, batch),
-                );
-                return;
+        PromptSource::Channel(scope) | PromptSource::Wake(scope) => {
+            match ctx.channel_info.resolve(scope.channel_id()).await {
+                Ok(info) => info,
+                Err(error) => {
+                    tracing::warn!(
+                        channel_id = %scope.channel_id(),
+                        "project context is indeterminate; requeueing turn before ACP session creation: {}",
+                        error.0
+                    );
+                    send_prompt_result(
+                        &result_tx,
+                        &turn_id,
+                        agent,
+                        source,
+                        PromptOutcome::ProjectContextIndeterminate(error.0),
+                        requeue_batch_if_queue(&ctx, batch),
+                    );
+                    return;
+                }
             }
-        },
+        }
         PromptSource::Heartbeat => None,
     };
     // Whether this turn's prompt renders the channel as a DM. `format_prompt`
@@ -2568,7 +2697,7 @@ pub async fn run_prompt_task(
         .as_ref()
         .is_some_and(|info| info.channel_type == "dm");
     let initial_message_pending = ctx.initial_message.is_some()
-        && matches!(&source, PromptSource::Channel(scope) if !agent.state.sessions.contains_key(scope));
+        && matches!(&source, PromptSource::Channel(scope) | PromptSource::Wake(scope) if !agent.state.sessions.contains_key(scope));
     if !initial_message_pending {
         prompt_routing.record_dm(prompt_is_dm);
     }
@@ -2599,7 +2728,7 @@ pub async fn run_prompt_task(
     //
     // Operator opt-out: `--no-memory` / `BUZZ_ACP_NO_MEMORY` skips the fetch.
     if ctx.memory_enabled {
-        if let (PromptSource::Channel(scope), Some(owner_pk)) =
+        if let (PromptSource::Channel(scope) | PromptSource::Wake(scope), Some(owner_pk)) =
             (&source, ctx.agent_owner_pubkey.as_ref())
         {
             // Session state is keyed by scope: repeated activity in a thread
@@ -2660,7 +2789,7 @@ pub async fn run_prompt_task(
     // canvas DM check uses — see `resolve_new_session_channel_context`.
     let mut title_channel: Option<String> = None;
     let mut origin_channel_type: Option<String> = None;
-    if let PromptSource::Channel(scope) = &source {
+    if let PromptSource::Channel(scope) | PromptSource::Wake(scope) = &source {
         let cid = scope.channel_id();
         let is_new_channel_session = !agent.state.sessions.contains_key(scope);
         let needs_canvas =
@@ -2686,14 +2815,16 @@ pub async fn run_prompt_task(
     // The core section to fold into the system prompt for this turn's session.
     // Channel-scoped; heartbeats carry no owner core.
     let agent_core: Option<String> = match &source {
-        PromptSource::Channel(scope) => agent.state.core_sections.get(scope).cloned(),
+        PromptSource::Channel(scope) | PromptSource::Wake(scope) => {
+            agent.state.core_sections.get(scope).cloned()
+        }
         PromptSource::Heartbeat => None,
     };
 
     // The canvas metadata section — channel-scoped, absent for heartbeats/DMs.
     // Prefer the committed cache; fall back to pending (for new sessions being created now).
     let agent_canvas: Option<String> = match &source {
-        PromptSource::Channel(scope) => agent
+        PromptSource::Channel(scope) | PromptSource::Wake(scope) => agent
             .state
             .canvas_sections
             .get(scope)
@@ -2703,7 +2834,7 @@ pub async fn run_prompt_task(
     };
 
     let (session_id, is_new_session) = match &source {
-        PromptSource::Channel(scope) => {
+        PromptSource::Channel(scope) | PromptSource::Wake(scope) => {
             let cid = &scope.channel_id();
             if let Some(sid) = agent.state.sessions.get(scope) {
                 (sid.clone(), false)
@@ -2865,7 +2996,7 @@ pub async fn run_prompt_task(
     // sessions created before this field existed fail safe by behaving as
     // undelivered once, rather than silently omitting standing context.
     let mut standing_context_sent = match &source {
-        PromptSource::Channel(scope) => agent
+        PromptSource::Channel(scope) | PromptSource::Wake(scope) => agent
             .state
             .deliveries
             .get(scope)
@@ -2874,7 +3005,7 @@ pub async fn run_prompt_task(
     };
 
     if is_new_session {
-        if let (PromptSource::Channel(scope), Some(ref initial_msg)) =
+        if let (PromptSource::Channel(scope) | PromptSource::Wake(scope), Some(ref initial_msg)) =
             (&source, &ctx.initial_message)
         {
             let cid = &scope.channel_id();
@@ -3045,7 +3176,33 @@ pub async fn run_prompt_task(
     // failed or cancelled first turn must not make its retry assume that the
     // provider retained any of that thread's context.
     let mut pending_hydrated_thread_roots = HashSet::new();
-    let prompt_sections: Vec<String> = if let Some(text) = prompt_text {
+    let prompt_sections: Vec<String> = if let Some((scope, wake)) = &wake {
+        // The runtime's text is framed as data inside the thread's context.
+        // A legacy agent gets the scope's standing context with the first
+        // prompt of a session, as a channel turn would.
+        let context = crate::queue::format_wake_context(
+            scope,
+            resolved_channel_info.as_ref(),
+            &wake.request.thread.root_event_id,
+            prompt_is_dm,
+        );
+        let text =
+            crate::acp::wake::frame_prompt(wake.request.reason, &context, &wake.request.prompt);
+        let text = if standing_context_sent {
+            text
+        } else {
+            prepend_standing_for_legacy(
+                if agent.has_system_prompt_support() {
+                    2
+                } else {
+                    1
+                },
+                &standing,
+                &text,
+            )
+        };
+        vec![text]
+    } else if let Some(text) = prompt_text {
         // Heartbeats create their session before this point, so a Goose method-not-found
         // probe has already selected the correct framing for this process.
         //
@@ -3209,7 +3366,7 @@ pub async fn run_prompt_task(
     };
     let prompt_bytes: usize = prompt_blocks.iter().map(|block| block.len()).sum();
     let has_standing_context = match &source {
-        PromptSource::Channel(_) => !standing.sections().is_empty(),
+        PromptSource::Channel(_) | PromptSource::Wake(_) => !standing.sections().is_empty(),
         PromptSource::Heartbeat => ctx.base_prompt.is_some(),
     };
     let standing_context_included =
@@ -3386,7 +3543,7 @@ pub async fn run_prompt_task(
                             );
                         }
                         log_stop_reason(&source, &StopReason::EndTurn);
-                        if let PromptSource::Channel(scope) = &source {
+                        if let PromptSource::Channel(scope) | PromptSource::Wake(scope) = &source {
                             let standing_sent = !agent.has_system_prompt_support();
                             record_scope_delivery_success(
                                 &mut agent,
@@ -3430,7 +3587,7 @@ pub async fn run_prompt_task(
         Ok(stop_reason) => {
             log_stop_reason(&source, &stop_reason);
 
-            if let PromptSource::Channel(scope) = &source {
+            if let PromptSource::Channel(scope) | PromptSource::Wake(scope) = &source {
                 let standing_sent = !agent.has_system_prompt_support();
                 record_scope_delivery_success(
                     &mut agent,
@@ -3452,7 +3609,7 @@ pub async fn run_prompt_task(
                 let limit = ctx.max_turns_per_session;
                 if limit > 0 {
                     match &source {
-                        PromptSource::Channel(scope) => {
+                        PromptSource::Channel(scope) | PromptSource::Wake(scope) => {
                             let count = agent.state.turn_counts.entry(scope.clone()).or_insert(0);
                             *count += 1;
                             *count >= limit
@@ -5022,6 +5179,11 @@ fn prompt_label(source: &PromptSource) -> String {
     match source {
         PromptSource::Channel(scope) => format!(
             "channel {} ({})",
+            scope.channel_id(),
+            scope.telemetry_label()
+        ),
+        PromptSource::Wake(scope) => format!(
+            "wake in channel {} ({})",
             scope.channel_id(),
             scope.telemetry_label()
         ),
@@ -9927,6 +10089,54 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         let (_steer_tx, steer_rx) = tokio::sync::mpsc::channel::<SteerRequest>(1);
         result.agent.acp.install_steer_rx(steer_rx);
         // Reaching here without a panic is the test.
+    }
+
+    /// A turn's question route ends with the turn: the agent that returns to
+    /// the pool has none, so a later turn without its own route (a heartbeat)
+    /// cannot post questions under the old turn's identity.
+    #[tokio::test]
+    async fn send_prompt_result_clears_the_question_route() {
+        let acp = AcpClient::spawn("cat", &[], &[], false)
+            .await
+            .expect("failed to spawn test agent");
+        let mut agent = OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_model_request_id: None,
+            desired_model_pending_ack: false,
+            startup_effort: None,
+            agent_name: "unknown".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        };
+        let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let channel_id = Uuid::new_v4();
+        agent
+            .acp
+            .install_elicitation_sink(crate::acp::elicitation::ElicitationSink::new(
+                events_tx,
+                crate::acp::elicitation::ElicitationTurn {
+                    turn_id: "t".into(),
+                    scope: SessionScope::Conversation { channel_id },
+                    anchor_event_id: "ab".repeat(32),
+                },
+            ));
+        assert!(agent.acp.has_elicitation_sink());
+        let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel::<PromptResult>();
+        send_prompt_result(
+            &result_tx,
+            "t",
+            agent,
+            PromptSource::Heartbeat,
+            PromptOutcome::Ok(StopReason::EndTurn),
+            None,
+        );
+        let result = result_rx.recv().await.expect("PromptResult must be sent");
+        assert!(!result.agent.acp.has_elicitation_sink());
     }
 
     // ── send_steer admission-reason tests ─────────────────────────────────

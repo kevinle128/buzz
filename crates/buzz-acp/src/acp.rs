@@ -8,11 +8,13 @@
 //! 4. [`AcpClient::session_prompt_with_idle_timeout`] — send prompt with idle/hard deadline, return stop reason
 //! 5. [`AcpClient::session_cancel`] / [`AcpClient::cancel_with_cleanup`] — cancel in-flight turn
 
+pub(crate) mod child_io;
+pub(crate) mod elicitation;
 mod launch;
+pub(crate) mod wake;
 
-use futures_util::StreamExt;
-use tokio::process::{Child, ChildStdin, ChildStdout};
-use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
+use tokio::process::Child;
+use tokio_util::codec::LinesCodecError;
 
 use crate::config::{PermissionMode, PermissionPolicy, ResolvedPermissionConfig};
 use crate::observer::{AuthorizationEnvelope, ObserverContext, ObserverEvent, ObserverHandle};
@@ -206,6 +208,36 @@ struct PermissionEntry {
     deadline: tokio::time::Instant,
 }
 
+/// An `elicitation/create` request that waits for a reply from the thread.
+#[derive(Debug)]
+struct PendingElicitation {
+    /// JSON-RPC id as received, for the response.
+    id: serde_json::Value,
+    /// Serialized id, the key the main loop uses for this question.
+    id_key: String,
+    /// The route of the turn that asked, kept so that a late drain reports
+    /// to that turn and never to a later one.
+    sink: elicitation::ElicitationSink,
+    /// Receiver of the human reply. Kept here, not in the read loop, so that
+    /// a reply that arrived just before the turn ended is still written by
+    /// the drain instead of being lost with the read loop. `None` once the
+    /// read loop took the reply.
+    reply_rx: Option<tokio::sync::oneshot::Receiver<elicitation::ElicitationReply>>,
+}
+
+/// Wait for the reply to the pending question, or forever when there is none.
+/// Borrows only the pending entry, so the read loop can poll it in `select!`
+/// next to `self.reader`. Cancel-safe: polling `&mut Receiver` does not lose
+/// the value on drop.
+async fn pending_elicitation_reply(
+    pending: &mut Option<PendingElicitation>,
+) -> Result<elicitation::ElicitationReply, tokio::sync::oneshot::error::RecvError> {
+    match pending.as_mut().and_then(|p| p.reply_rx.as_mut()) {
+        Some(rx) => rx.await,
+        None => std::future::pending().await,
+    }
+}
+
 /// ACP client that owns an agent subprocess and communicates over its stdio.
 ///
 /// One `AcpClient` per agent process. Multiple sessions can be created on the
@@ -213,12 +245,23 @@ struct PermissionEntry {
 pub struct AcpClient {
     /// The agent child process (kept alive to prevent zombie).
     child: Child,
-    /// Sole stdin writer; None after an interrupted/failed frame closes it.
-    stdin: Option<ChildStdin>,
-    /// Framed reader over the agent's stdout pipe (line-oriented, bounded).
-    /// Uses `LinesCodec::new_with_max_length` to enforce MAX_LINE_SIZE at the
-    /// read level — prevents OOM from rogue agents writing infinite non-newline bytes.
-    reader: FramedRead<ChildStdout, LinesCodec>,
+    /// Handle to the sole stdin writer task. A frame write that is
+    /// interrupted or fails closes stdin; later writes then fail.
+    writer: child_io::StdinWriter,
+    /// The agent's stdout lines from the reader task. The task reads the pipe
+    /// with `LinesCodec::new_with_max_length` (MAX_LINE_SIZE), so a rogue agent
+    /// writing endless bytes without a newline cannot exhaust memory. It sends
+    /// `_buzz/wake` requests to the pool instead of this receiver.
+    reader: child_io::LineReceiver,
+    /// Wake state shared with the reader task.
+    wake: std::sync::Arc<child_io::WakeLink>,
+    /// The thread of the current turn. Sent as `_meta["buzz.thread"]` on
+    /// `session/new` and `session/prompt` to an agent that advertised
+    /// `buzz.wake` version 1. Set per turn; cleared when the turn returns its
+    /// agent.
+    turn_thread: Option<wake::WakeThread>,
+    /// Ends the reader and writer tasks and retires the child on drop.
+    _io_guard: child_io::ChildIoGuard,
     /// Monotonically increasing JSON-RPC request id counter.
     /// Harness-generated IDs are always numeric.
     next_id: u64,
@@ -308,6 +351,17 @@ pub struct AcpClient {
     /// outside of a goose-native turn — the read loop's steer arm is
     /// disabled in that case.
     steer_rx: Option<tokio::sync::mpsc::Receiver<crate::pool::SteerRequest>>,
+    /// Per-turn route that takes `elicitation/create` questions to the main
+    /// loop. Installed by the dispatcher with
+    /// [`install_elicitation_sink`](Self::install_elicitation_sink) and
+    /// cleared when the prompt task returns its agent. `None` refuses every
+    /// question with `cancel`.
+    elicitation_sink: Option<elicitation::ElicitationSink>,
+    /// The one `elicitation/create` request of this turn that waits for a
+    /// human reply. Every turn exit path answers it `cancel` (see
+    /// [`drain_elicitation`](Self::drain_elicitation)), so it never survives
+    /// a turn.
+    pending_elicitation: Option<PendingElicitation>,
     /// Usage tracker for goose/buzz-agent's cumulative notification format.
     goose_usage: UsageTracker,
     /// Per-turn prompt-response usage and Claude's optional cumulative cost.
@@ -496,6 +550,12 @@ enum SteerTransport {
 
 fn build_client_capabilities() -> serde_json::Value {
     serde_json::json!({
+        // Buzz can show a flat form question as a thread message and read the
+        // answer from a thread reply. URL mode is not declared: it needs a
+        // secure browser context that a thread message cannot give.
+        "elicitation": {
+            "form": {}
+        },
         // Signal to ACP adapters that Buzz can hand users to terminal-native
         // auth flows. Adapters decide which auth methods to expose; Buzz does
         // not hardcode vendor login commands from this capability.
@@ -512,7 +572,10 @@ fn build_client_capabilities() -> serde_json::Value {
             // Non-standard extension used by claude-agent-acp to advertise the
             // exact terminal login argv for subscription auth. Unknown `_meta`
             // keys are ignored by other adapters.
-            "terminal-auth": true
+            "terminal-auth": true,
+            // Buzz answers the agent request `_buzz/wake` at any time and
+            // opens a turn in the thread it names.
+            wake::WAKE_CAPABILITY: wake::capability_value()
         }
     })
 }
@@ -531,6 +594,8 @@ impl AcpClient {
     /// Call this when you need guaranteed cleanup — e.g., in `run_models`
     /// before process exit.
     pub async fn shutdown(&mut self) {
+        // A wake request from this child must open no turn from now on.
+        self.wake.retire();
         // Kill the entire process group when possible. The child was spawned
         // with process_group(0), so its PID == its PGID. Killing the group
         // ensures subprocesses (MCP servers, tool processes) are cleaned up
@@ -719,10 +784,14 @@ impl AcpClient {
             .take()
             .ok_or_else(|| AcpError::Protocol("failed to open agent stdout".into()))?;
 
+        let io = child_io::start(stdout, stdin);
         Ok(Self {
             child,
-            stdin: Some(stdin),
-            reader: FramedRead::new(stdout, LinesCodec::new_with_max_length(MAX_LINE_SIZE)),
+            writer: io.writer,
+            reader: io.lines,
+            wake: io.link,
+            turn_thread: None,
+            _io_guard: io.guard,
             next_id: 0,
             pending_permission_id: None,
             permission_responded: false,
@@ -744,6 +813,8 @@ impl AcpClient {
             active_run_id: None,
             steering_supported: false,
             steer_rx: None,
+            elicitation_sink: None,
+            pending_elicitation: None,
             goose_usage: UsageTracker::default(),
             standard_usage: StandardUsageTracker::default(),
             standard_adapter,
@@ -847,6 +918,7 @@ impl AcpClient {
             .pointer("/_meta/steering/supported")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        self.wake.set_supported(wake::advertised_v1(&result));
         tracing::debug!(target: "acp::init", "initialize response: {result}");
         Ok(result)
     }
@@ -913,6 +985,10 @@ impl AcpClient {
             // Merge — claude-agent-acp spreads these into the CLI's argv.
             params["_meta"]["claudeCode"]["options"]["extraArgs"]["thinking-display"] =
                 serde_json::Value::String("summarized".to_owned());
+        }
+        if let Some(thread) = self.thread_meta() {
+            // Merge — the agent echoes this value in its wake requests.
+            params["_meta"][wake::THREAD_META] = thread;
         }
         let result = self.send_request("session/new", params).await?;
         let session_id = result["sessionId"]
@@ -1022,7 +1098,14 @@ impl AcpClient {
         idle_timeout: std::time::Duration,
         max_duration: std::time::Duration,
     ) -> Result<StopReason, AcpError> {
-        let params = build_prompt_params(session_id, prompt_blocks);
+        // A question left by a turn whose read loop was dropped without the
+        // cancel path still gets its `cancel` before the next turn starts.
+        self.drain_elicitation(elicitation::CloseReason::Ended)
+            .await;
+        let mut params = build_prompt_params(session_id, prompt_blocks);
+        if let Some(thread) = self.thread_meta() {
+            params["_meta"][wake::THREAD_META] = thread;
+        }
         let hard_deadline = tokio::time::Instant::now() + max_duration;
         self.current_hard_deadline = Some(hard_deadline);
 
@@ -1059,6 +1142,14 @@ impl AcpClient {
                 max_duration,
             )
             .await;
+        // No question survives its turn: answer `cancel` on every outcome
+        // before the caller sees it. At the hard deadline the thread also gets
+        // the expiry notice.
+        let close_reason = match &result {
+            Err(AcpError::HardTimeout { .. }) => elicitation::CloseReason::Expired,
+            _ => elicitation::CloseReason::Ended,
+        };
+        self.drain_elicitation(close_reason).await;
 
         // On timeout errors, leave current_hard_deadline set so cancel_with_cleanup
         // can inherit the remaining budget. Clear it on all other outcomes.
@@ -1121,6 +1212,39 @@ impl AcpClient {
         self.active_run_id.as_deref()
     }
 
+    /// Set the thread of the current turn, or clear it with `None`.
+    ///
+    /// While set, `session/new` and `session/prompt` carry it as
+    /// `_meta["buzz.thread"]` if the agent advertised `buzz.wake` version 1.
+    pub(crate) fn set_turn_thread(&mut self, thread: Option<wake::WakeThread>) {
+        self.turn_thread = thread;
+    }
+
+    /// The `buzz.thread` value for the next request, if any.
+    fn thread_meta(&self) -> Option<serde_json::Value> {
+        if !self.wake.supported() {
+            return None;
+        }
+        self.turn_thread.as_ref().map(wake::WakeThread::meta_value)
+    }
+
+    /// Whether the agent advertised `buzz.wake` version 1 at `initialize`.
+    pub(crate) fn wake_supported(&self) -> bool {
+        self.wake.supported()
+    }
+
+    /// Wake state of this child, shared with its reader task.
+    pub(crate) fn wake_link(&self) -> &std::sync::Arc<child_io::WakeLink> {
+        &self.wake
+    }
+
+    /// Notification lines that the reader task dropped while no read loop
+    /// ran.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn dropped_idle_notifications(&self) -> u64 {
+        self.reader.dropped_notifications()
+    }
+
     /// Whether the agent advertised the [`ACP_STEER_METHOD`] extension at
     /// `initialize` time (`_meta.steering.supported`).
     ///
@@ -1180,6 +1304,152 @@ impl AcpClient {
     /// Idempotent — safe to call when `steer_rx` is already `None`.
     pub fn clear_steer_rx(&mut self) {
         self.steer_rx = None;
+    }
+
+    /// Install the per-turn route for `elicitation/create` questions.
+    ///
+    /// Called by the dispatcher before the prompt task starts. A previous
+    /// turn's route is replaced; [`clear_elicitation_sink`](Self::clear_elicitation_sink)
+    /// removes it when the task returns its agent.
+    pub fn install_elicitation_sink(&mut self, sink: elicitation::ElicitationSink) {
+        self.elicitation_sink = Some(sink);
+    }
+
+    /// Remove the per-turn question route. Idempotent.
+    pub fn clear_elicitation_sink(&mut self) {
+        self.elicitation_sink = None;
+    }
+
+    /// Whether a per-turn question route is installed.
+    #[cfg(test)]
+    pub(crate) fn has_elicitation_sink(&self) -> bool {
+        self.elicitation_sink.is_some()
+    }
+
+    /// Whether a question of this turn waits for a reply.
+    #[cfg(test)]
+    pub(crate) fn has_pending_elicitation(&self) -> bool {
+        self.pending_elicitation.is_some()
+    }
+
+    /// Answer an in-turn `elicitation/create` request, or register it as the
+    /// pending question.
+    ///
+    /// Every outcome other than an open question writes its response at
+    /// once: `-32602` for a mode Buzz did not declare, otherwise
+    /// `{"action":"cancel"}`.
+    async fn handle_elicitation_request(
+        &mut self,
+        msg: &serde_json::Value,
+        session_id: &str,
+    ) -> Result<(), AcpError> {
+        let Some(id) = msg.get("id").cloned() else {
+            tracing::warn!(target: "acp::elicitation", "elicitation/create without id — ignoring");
+            return Ok(());
+        };
+        let open = match elicitation::check_request(&msg["params"], session_id) {
+            elicitation::RequestCheck::InvalidParams(why) => {
+                tracing::warn!(target: "acp::elicitation", "elicitation id={id} invalid: {why}");
+                self.write_ndjson(&elicitation::invalid_params_response(&id, &why))
+                    .await?;
+                return Ok(());
+            }
+            elicitation::RequestCheck::Refuse(why) => {
+                tracing::warn!(target: "acp::elicitation", "elicitation id={id} refused: {why}");
+                self.write_elicitation_cancel(&id).await?;
+                if let Some(sink) = &self.elicitation_sink {
+                    sink.refused();
+                }
+                return Ok(());
+            }
+            elicitation::RequestCheck::Open(open) => open,
+        };
+        // `cancel_with_cleanup_until` takes `last_prompt_id` before its drain
+        // read, so `None` here means the turn is already stopping.
+        let sink = match (&self.elicitation_sink, &self.pending_elicitation) {
+            _ if self.last_prompt_id.is_none() => Err("the turn is stopping"),
+            (_, Some(_)) => Err("another question of this turn is still open"),
+            (None, None) => Err("this turn has no thread to ask in"),
+            (Some(sink), None) => Ok(sink.clone()),
+        };
+        let sink = match sink {
+            Ok(sink) => sink,
+            Err(why) => {
+                tracing::warn!(target: "acp::elicitation", "elicitation id={id} cancelled: {why}");
+                self.write_elicitation_cancel(&id).await?;
+                return Ok(());
+            }
+        };
+        let id_key = id.to_string();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        if !sink.opened(&id_key, open.message, open.schema, reply_tx) {
+            tracing::warn!(
+                target: "acp::elicitation",
+                "elicitation id={id} cancelled: the main loop is gone"
+            );
+            self.write_elicitation_cancel(&id).await?;
+            return Ok(());
+        }
+        tracing::info!(
+            target: "acp::elicitation",
+            "elicitation id={id} opened (toolCallId={:?})",
+            open.tool_call_id
+        );
+        self.pending_elicitation = Some(PendingElicitation {
+            id,
+            id_key,
+            sink,
+            reply_rx: Some(reply_rx),
+        });
+        Ok(())
+    }
+
+    async fn write_elicitation_cancel(&mut self, id: &serde_json::Value) -> Result<(), AcpError> {
+        self.write_ndjson(&elicitation::reply_response(
+            id,
+            &elicitation::ElicitationReply::Cancel,
+        ))
+        .await
+    }
+
+    /// Write `reply` for the pending question and report it closed.
+    async fn finish_elicitation(
+        &mut self,
+        reply: &elicitation::ElicitationReply,
+        reason: elicitation::CloseReason,
+    ) -> Result<(), AcpError> {
+        let Some(pending) = self.pending_elicitation.take() else {
+            return Ok(());
+        };
+        let written = self
+            .write_ndjson(&elicitation::reply_response(&pending.id, reply))
+            .await;
+        pending.sink.closed(&pending.id_key, reason);
+        written
+    }
+
+    /// Answer the pending question on a turn exit path: with the reply when
+    /// one already arrived (the main loop counts it as delivered), otherwise
+    /// `cancel`.
+    ///
+    /// Best effort: the turn is already ending, so a failed write is logged
+    /// and the exit path continues.
+    async fn drain_elicitation(&mut self, reason: elicitation::CloseReason) {
+        let arrived = self
+            .pending_elicitation
+            .as_mut()
+            .and_then(|p| p.reply_rx.as_mut())
+            .and_then(|rx| rx.try_recv().ok());
+        let (reply, reason) = match arrived {
+            Some(reply) => (reply, elicitation::CloseReason::Replied),
+            None => (elicitation::ElicitationReply::Cancel, reason),
+        };
+        if let Err(error) = self.finish_elicitation(&reply, reason).await {
+            tracing::warn!(
+                target: "acp::elicitation",
+                "could not answer the pending question: {error}"
+            );
+        }
     }
 
     /// Returns `true` if no steer receiver is currently installed.
@@ -1360,6 +1630,11 @@ impl AcpClient {
             self.permission_responded = false;
         }
 
+        // A question of the stopping turn gets `cancel` before the turn
+        // itself is cancelled.
+        self.drain_elicitation(elicitation::CloseReason::Ended)
+            .await;
+
         // Step 2: send session/cancel notification (no id)
         self.session_cancel(session_id).await?;
         tracing::info!(target: "acp::cancel", "sent session/cancel for {session_id}");
@@ -1379,7 +1654,12 @@ impl AcpClient {
                 hard_deadline,
                 remaining,
             )
-            .await?;
+            .await;
+        // The drain read answers new questions `cancel` at once, so this is a
+        // backstop that keeps the invariant on every outcome.
+        self.drain_elicitation(elicitation::CloseReason::Ended)
+            .await;
+        let result = result?;
         // Cancel completed — drain any remaining permission entries (they were
         // answered with cancelled above, but drain Resolved ones to free capacity).
         self.pending_permissions.clear();
@@ -1412,13 +1692,10 @@ impl AcpClient {
     ) -> Result<(), AcpError> {
         const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
         let line = serde_json::to_string(value)?;
-        tokio::time::timeout(
-            WRITE_TIMEOUT,
-            frame_writer::write_frame(&mut self.stdin, line.as_bytes()),
-        )
-        .await
-        .map_err(|_| AcpError::WriteTimeout(WRITE_TIMEOUT))?
-        .map_err(AcpError::Io)?;
+        tokio::time::timeout(WRITE_TIMEOUT, self.writer.write_line(line))
+            .await
+            .map_err(|_| AcpError::WriteTimeout(WRITE_TIMEOUT))?
+            .map_err(AcpError::Io)?;
         if emit_observe {
             self.observe("acp_write", value.clone());
         }
@@ -1482,6 +1759,8 @@ impl AcpClient {
     /// `drain_timeout` elapses, whichever comes first. Errors are ignored.
     #[allow(dead_code)] // Scaffolding for future model-switch timeout cleanup; not yet wired.
     pub async fn drain_stale_responses(&mut self, drain_timeout: std::time::Duration) {
+        // While a read loop runs, the reader task keeps every line for it.
+        let _reading = self.reader.reading();
         let deadline = tokio::time::Instant::now() + drain_timeout;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -1536,6 +1815,8 @@ impl AcpClient {
         &mut self,
         expected_id: u64,
     ) -> Result<serde_json::Value, AcpError> {
+        // While a read loop runs, the reader task keeps every line for it.
+        let _reading = self.reader.reading();
         loop {
             // LinesCodec::new_with_max_length enforces MAX_LINE_SIZE at the
             // read level — the buffer never grows beyond the limit, preventing
@@ -1623,6 +1904,19 @@ impl AcpClient {
                             self.handle_permission_request(&msg, true, deadline).await?;
                         }
                     }
+                    elicitation::ELICITATION_METHOD => {
+                        // Outside a prompt turn there is no thread to ask in.
+                        // `cancel` tells the agent that no human saw the
+                        // question; `-32601` would claim the method is absent
+                        // although the client declares it.
+                        if let Some(id) = msg.get("id") {
+                            tracing::warn!(
+                                target: "acp::elicitation",
+                                "elicitation id={id} outside a turn — answering cancel"
+                            );
+                            self.write_elicitation_cancel(id).await?;
+                        }
+                    }
                     other => {
                         // If the unknown message has an id, it's a request expecting a reply.
                         // Silence would cause the agent to hang waiting for a response.
@@ -1685,6 +1979,9 @@ impl AcpClient {
     ) -> Result<serde_json::Value, AcpError> {
         use tokio::time::Instant;
 
+        // While a read loop runs, the reader task keeps every line for it.
+        let _reading = self.reader.reading();
+
         // Take the per-turn steer receiver into a local so it can be
         // borrowed independently of `self.reader` inside `select!`.
         // Dropped at scope exit (return paths drain `pending_steer` first
@@ -1736,9 +2033,12 @@ impl AcpClient {
                 .pending_permissions
                 .values()
                 .any(|e| matches!(e.state, PermissionEntryState::Pending));
+            // A question waits for a human, so agent silence is expected too.
+            // Its deadline is the turn hard deadline.
+            let has_pending_elicitation = self.pending_elicitation.is_some();
             let next_deadline;
             let idle_fires_first;
-            if has_pending_permissions {
+            if has_pending_permissions || has_pending_elicitation {
                 // Suspend idle; find earliest permission deadline (capped by hard).
                 let earliest_perm = self
                     .pending_permissions
@@ -1952,6 +2252,29 @@ impl AcpClient {
                         );
                     }
                     None // loop back; don't set read_result
+                }
+                // Human reply arm, before the reader for the same reason as
+                // the decision arm. A closed route (the main loop dropped its
+                // record) answers `cancel`.
+                reply = pending_elicitation_reply(&mut self.pending_elicitation) => {
+                    if let Some(pending) = self.pending_elicitation.as_mut() {
+                        pending.reply_rx = None;
+                    }
+                    let (reply, reason) = match reply {
+                        Ok(reply) => (reply, elicitation::CloseReason::Replied),
+                        Err(_) => (
+                            elicitation::ElicitationReply::Cancel,
+                            elicitation::CloseReason::Ended,
+                        ),
+                    };
+                    self.finish_elicitation(&reply, reason).await?;
+                    // The idle clock was suspended while the human decided.
+                    // Restart it so that a long wait does not count as agent
+                    // silence.
+                    let activity_now = Instant::now();
+                    idle_deadline = activity_now + idle_timeout;
+                    last_activity_at = activity_now;
+                    None
                 }
                 read_result = self.reader.next() => Some(read_result),
                 // Steer arm: gated off whenever a steer write is already in
@@ -2297,6 +2620,9 @@ impl AcpClient {
                                     hard_deadline,
                                 )
                                 .await?;
+                            }
+                            elicitation::ELICITATION_METHOD => {
+                                self.handle_elicitation_request(&msg, session_id).await?;
                             }
                             other => {
                                 // If the unknown message has an id, it's a request expecting a reply.
@@ -4149,6 +4475,30 @@ mod tests {
         client
     }
 
+    /// Like [`spawn_script`], for tests that run with paused time.
+    ///
+    /// Under `start_paused` the 10 s ready-line timeout in `spawn_script`
+    /// elapses at once, because the clock auto-advances while the runtime
+    /// waits on process I/O. This variant waits for the ready line with no
+    /// timer.
+    async fn spawn_script_paused_time(script: &str) -> AcpClient {
+        const READY: &str = "buzz-acp-test-script-ready";
+        let mut client = AcpClient::spawn(
+            "bash",
+            &["-c".into(), format!("echo {READY}; {script}")],
+            &[],
+            false,
+        )
+        .await
+        .expect("failed to spawn test script");
+        let ready = client.reader.next().await;
+        assert!(
+            matches!(&ready, Some(Ok(line)) if line == READY),
+            "expected ready line, got {ready:?}"
+        );
+        client
+    }
+
     #[cfg(unix)]
     async fn spawn_named_script(name: &str, script: &str) -> (AcpClient, std::path::PathBuf) {
         use std::os::unix::fs::PermissionsExt;
@@ -4354,11 +4704,11 @@ mod tests {
     /// each notification is observed, so OS scheduling cannot consume the idle
     /// window. Each update must extend the deadline; silence must still expire.
     async fn assert_activity_resets_idle(update: serde_json::Value) {
-        use tokio::io::AsyncWriteExt;
-
         let mut client =
             spawn_script(r#"while IFS= read -r line; do printf '%s\n' "$line"; done"#).await;
-        let mut stdin = client.stdin.take().expect("test stdin");
+        // A second handle to the stdin writer task, usable while the read
+        // loop below borrows the client.
+        let stdin = client.writer.clone();
         let observer = ObserverHandle::in_process();
         let mut events = observer.subscribe();
         client.set_observer(Some(observer), 0);
@@ -4372,11 +4722,10 @@ mod tests {
         let idle = std::time::Duration::from_secs(1);
         let hard = std::time::Duration::from_secs(10);
         let hard_deadline = tokio::time::Instant::now() + hard;
-        let mut frame = serde_json::json!({
+        let frame = serde_json::json!({
             "jsonrpc": "2.0", "method": "session/update", "params": { "update": update }
         })
         .to_string();
-        frame.push('\n');
         {
             let read = client.read_until_response_with_idle_timeout(
                 "test",
@@ -4390,7 +4739,7 @@ mod tests {
             for _ in 0..3 {
                 tokio::time::advance(std::time::Duration::from_millis(750)).await;
                 stdin
-                    .write_all(frame.as_bytes())
+                    .write_line(frame.clone())
                     .await
                     .expect("write activity");
                 let watchdog = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -4948,6 +5297,14 @@ sleep 1"#,
     // ── claude-agent-acp _meta.systemPrompt transport ─────────────────────
 
     include!("acp/system_prompt_tests.rs");
+
+    // ── elicitation/create in the read loops ───────────────────────────────
+
+    include!("acp/elicitation_read_loop_tests.rs");
+
+    // ── stdio tasks and buzz.wake metadata ──────────────────────────────────
+
+    include!("acp/wake_client_tests.rs");
 
     #[tokio::test]
     async fn active_run_id_sets_on_string() {
@@ -6733,7 +7090,9 @@ sleep 1"#,
         // decision without needing access to nonce generation inside the loop.
         // The script immediately emits the terminal id=999 response (simulating the
         // adapter continuing after the permission response was written to its stdin).
-        let script = r#"echo '{"jsonrpc":"2.0","id":999,"result":{"done":true}}'"#;
+        // The script keeps its stdin open after the terminal response, so the
+        // permission response write cannot race the child's exit.
+        let script = r#"echo '{"jsonrpc":"2.0","id":999,"result":{"done":true}}'; sleep 5"#;
         let mut client = spawn_script(script).await;
 
         let config = ResolvedPermissionConfig::resolve(PermissionPolicy::Ask, None).unwrap();
@@ -6979,7 +7338,7 @@ sleep 1"#,
     #[tokio::test(start_paused = true)]
     async fn ask_permission_deadline_idle_suspension_and_capacity_recovery() {
         // Script that emits nothing (simulates an agent waiting for permission response).
-        let mut client = spawn_script("sleep 600").await;
+        let mut client = spawn_script_paused_time("sleep 600").await;
         let config = ResolvedPermissionConfig::resolve(PermissionPolicy::Ask, None).unwrap();
         client.set_permission_config(config);
         client.set_owner_pubkey_known(true);
@@ -7044,7 +7403,7 @@ sleep 1"#,
         // ── Part 2: capacity recovery after 8 sequential requests ───────────
         // Clear any stale entries and verify 8+ sequential requests can succeed
         // when previous resolved entries are drained between turns.
-        let mut client2 = spawn_script("sleep 600").await;
+        let mut client2 = spawn_script_paused_time("sleep 600").await;
         client2.set_permission_config(
             ResolvedPermissionConfig::resolve(PermissionPolicy::Ask, None).unwrap(),
         );

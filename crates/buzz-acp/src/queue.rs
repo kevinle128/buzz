@@ -363,6 +363,10 @@ pub struct EventQueue {
     /// Must be strictly greater than `max_turn_duration` so a turn running to
     /// the hard cap returns via `mark_complete` before the backstop fires.
     in_flight_deadline: Duration,
+    /// Wake admission and the queued and running wake turns of each scope.
+    /// A wake turn is in flight in its scope like a batch, so it never runs
+    /// at the same time as another turn of the scope.
+    wakes: crate::acp::wake::WakeBoard,
 }
 
 impl EventQueue {
@@ -385,6 +389,7 @@ impl EventQueue {
             cancel_reasons: HashMap::new(),
             withheld_native_steer: HashMap::new(),
             in_flight_deadline: Duration::from_secs(DEFAULT_IN_FLIGHT_DEADLINE_SECS),
+            wakes: Default::default(),
         }
     }
 
@@ -526,6 +531,7 @@ impl EventQueue {
             self.in_flight_scopes.remove(&scope);
             self.in_flight_deadlines.remove(&scope);
             self.in_flight_reply_routes.remove(&scope);
+            self.wakes.finish(&scope);
             // Recover any withheld goose-native steer events for the expired
             // scope back to the queue front so normal dispatch delivers
             // them. Unlike the in-flight batch above (already delivered to a
@@ -657,6 +663,7 @@ impl EventQueue {
         self.in_flight_deadlines.remove(&scope);
         self.in_flight_batch_sizes.remove(&scope);
         self.in_flight_reply_routes.remove(&scope);
+        self.wakes.finish(&scope);
         let now = Instant::now();
         match self.retry_after.get(&scope) {
             // Active throttle → scope was requeued; keep retry_counts intact.
@@ -876,6 +883,7 @@ impl EventQueue {
             self.in_flight_scopes.remove(&scope);
             self.in_flight_deadlines.remove(&scope);
             self.in_flight_reply_routes.remove(&scope);
+            self.wakes.finish(&scope);
             // Symmetric with the flush_next expiry block: recover withheld
             // goose-native steer events for the expired scope so they are
             // not permanently orphaned in the side table.
@@ -890,6 +898,7 @@ impl EventQueue {
             .cancelled_batches
             .keys()
             .any(|scope| !self.in_flight_scopes.contains(scope))
+            || self.has_ready_wake()
     }
 
     /// Returns `true` if any undispatched work remains for a channel that is
@@ -922,7 +931,7 @@ impl EventQueue {
             .withheld_native_steer
             .iter()
             .any(|(scope, v)| !v.is_empty() && !self.in_flight_scopes.contains(scope));
-        has_queued || has_cancelled || has_withheld
+        has_queued || has_cancelled || has_withheld || self.has_ready_wake()
     }
 
     /// Number of pending partitions (session scopes) with queued events.
@@ -947,6 +956,7 @@ impl EventQueue {
                 .cancelled_batches
                 .get(scope)
                 .is_some_and(|events| !events.is_empty())
+            || self.wakes.has_pending(scope)
     }
 
     /// Number of queued events for a specific scope (or channel, treated as its
@@ -1017,6 +1027,9 @@ impl EventQueue {
             .retain(|s, _| s.channel_id() != channel_id);
         self.cancel_reasons
             .retain(|s, _| s.channel_id() != channel_id);
+        // Queued wake turns of the channel are stale too. A running one ends
+        // through `mark_complete` like a batch.
+        self.wakes.drop_channel(channel_id);
         // Preserve in_flight_scopes AND in_flight_deadlines: the in-flight
         // task will eventually complete (calling mark_complete) or the deadline
         // will expire (auto-cleaning the scope). Removing deadlines without
@@ -1103,6 +1116,68 @@ impl EventQueue {
     /// Whether any scope currently has a turn in flight.
     pub fn has_in_flight(&self) -> bool {
         !self.in_flight_scopes.is_empty()
+    }
+
+    // ── Wake turns ─────────────────────────────────────────────────────────
+    //
+    // An accepted `_buzz/wake` request queues one wake turn for its scope.
+    // It waits while any turn of the scope is in flight, then is put in flight
+    // itself (`start_wake`), so the scope never runs two turns at once.
+    // `mark_complete` ends it like a batch.
+
+    /// Decide a valid wake request for `scope` at `now`. An accepted request
+    /// becomes the scope's queued wake turn.
+    pub(crate) fn admit_wake(
+        &mut self,
+        now: Instant,
+        request: crate::acp::wake::WakeRequest,
+        scope: SessionScope,
+    ) -> crate::acp::wake::WakeOutcome {
+        self.wakes.admit(now, request, scope)
+    }
+
+    fn has_ready_wake(&self) -> bool {
+        self.wakes
+            .pending_keys()
+            .any(|scope| !self.in_flight_scopes.contains(scope))
+    }
+
+    /// Scopes whose queued wake turn can start now (no turn in flight in the
+    /// scope), oldest acceptance first.
+    pub(crate) fn ready_wake_scopes(&self) -> Vec<SessionScope> {
+        self.wakes
+            .pending_scopes()
+            .into_iter()
+            .filter(|scope| !self.in_flight_scopes.contains(scope))
+            .collect()
+    }
+
+    /// Put the queued wake turn of `scope` in flight and return it. `None`
+    /// when the scope has no queued wake turn or a turn is in flight there.
+    pub(crate) fn start_wake(
+        &mut self,
+        scope: &SessionScope,
+    ) -> Option<crate::acp::wake::PendingWake> {
+        if self.in_flight_scopes.contains(scope) {
+            return None;
+        }
+        let wake = self.wakes.start(scope)?;
+        self.in_flight_scopes.insert(scope.clone());
+        self.in_flight_deadlines
+            .insert(scope.clone(), Instant::now() + self.in_flight_deadline);
+        self.in_flight_batch_sizes.insert(scope.clone(), 0);
+        Some(wake)
+    }
+
+    /// Whether the turn in flight in `scope` is a wake turn.
+    pub(crate) fn is_wake_in_flight(&self, scope: &SessionScope) -> bool {
+        self.wakes.is_running(scope)
+    }
+
+    /// The wake turn in flight in `scope` failed: queue it again within its
+    /// attempt bound. Call before [`mark_complete`](Self::mark_complete).
+    pub(crate) fn retry_wake(&mut self, scope: &SessionScope) -> bool {
+        self.wakes.retry(scope)
     }
 
     // ── Goose-native steer withhold (side table) ──────────────────────────
@@ -1422,6 +1497,18 @@ pub fn parse_thread_tags(event: &Event) -> ThreadTags {
 /// with `/` followed by an ASCII alphanumeric; `None` otherwise. A `/`
 /// appearing later in the text (e.g. `"@Eva see /tmp/foo"`) never matches.
 pub fn extract_slash_command(content: &str, known_names: &[&str]) -> Option<String> {
+    let rest = strip_leading_mentions(content, known_names);
+    let mut chars = rest.chars();
+    (chars.next() == Some('/') && chars.next().is_some_and(|c| c.is_ascii_alphanumeric()))
+        .then(|| rest.to_string())
+}
+
+/// Remove the leading mention run of `content`: `@<name>` for a display name
+/// in `known_names` (longest first, case-insensitive, ending at whitespace or
+/// the end), else a single `@word` token of the characters Buzz allows in
+/// plain mentions, and NIP-27 `nostr:npub1…` / `nostr:nprofile1…` tokens.
+/// A bare `@` stops the run. The rest starts at its first non-space.
+pub(crate) fn strip_leading_mentions<'a>(content: &'a str, known_names: &[&str]) -> &'a str {
     // Longest-first so "Dawn Smith" wins over "Dawn".
     let mut names: Vec<&str> = known_names
         .iter()
@@ -1461,16 +1548,14 @@ pub fn extract_slash_command(content: &str, known_names: &[&str]) -> Option<Stri
                         .unwrap_or(after_at.len());
                     (len > 0).then_some(len)
                 });
-            let len = name_len?; // bare '@' — not a mention
+            let Some(len) = name_len else {
+                return rest; // bare '@' — not a mention
+            };
             rest = after_at[len..].trim_start();
         } else {
-            break;
+            return rest;
         }
     }
-
-    let mut chars = rest.chars();
-    (chars.next() == Some('/') && chars.next().is_some_and(|c| c.is_ascii_alphanumeric()))
-        .then(|| rest.to_string())
 }
 
 /// Return the slash command for a batch, if it qualifies for pass-through.
@@ -1939,6 +2024,30 @@ fn append_project_home(s: &mut String, channel_info: Option<&PromptChannelInfo>,
     s.push_str(&format!(
         "\nThis channel is that project's home. Tasks, repositories, and files created here belong to this project. Do not run `buzz projects create`. Create a repository with `buzz repos create --id <id> --name \"…\" --channel {channel_id}`. Create tasks with `buzz issues create --channel {channel_id} --subject \"…\" --content \"…\"`."
     ));
+}
+
+/// The `<context>` section of a wake turn in `scope` whose replies go to the
+/// thread `root_event_id`. It is the section of a turn in that thread that has
+/// no conversation context, with the reply instruction for the thread.
+pub(crate) fn format_wake_context(
+    scope: &SessionScope,
+    channel_info: Option<&PromptChannelInfo>,
+    root_event_id: &str,
+    is_dm: bool,
+) -> String {
+    let thread_tags = ThreadTags {
+        root_event_id: Some(root_event_id.to_owned()),
+        parent_event_id: None,
+        mentioned_pubkeys: Vec::new(),
+    };
+    format_context_hints(
+        scope,
+        channel_info,
+        &thread_tags,
+        is_dm,
+        ConversationContextStatus::Absent,
+        Some(root_event_id),
+    )
 }
 
 /// Format a `<context>` section from the resolved session scope and turn routing.

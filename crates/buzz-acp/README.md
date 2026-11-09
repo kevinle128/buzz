@@ -295,6 +295,132 @@ Forum event kinds:
 
 > **Note:** Without `--no-mention-filter` (or `require_mention = false`), the default `subscribe=mentions` mode filters events that don't @mention the agent — forum posts will be invisible.
 
+## Questions From the Agent (ACP Form Elicitation)
+
+`initialize` declares `clientCapabilities.elicitation.form`. URL mode is not
+declared, so an `elicitation/create` request with `mode: "url"` gets JSON-RPC
+error `-32602`.
+
+During a prompt turn, a form request for that turn's session becomes a plain
+kind 9 reply in the turn's thread, signed by the agent key. The thread is the
+thread root under `--session-policy thread`, else the thread of the message
+that started the turn. The owner is `p`-tagged when known. The message lists
+the answer words from the schema.
+
+A human answers with a reply in that thread that mentions the agent:
+
+```text
+@<agent> approve
+@<agent> reject keep the upstream version of foo.ts
+@<agent> decline
+@<agent> cancel
+```
+
+- The leading mentions are removed with the same rules as slash commands; the
+  agent display name (from its kind:0 profile, looked up once and again while
+  unknown) is removed whole, also when it has spaces. Then only the first word
+  counts. An enum value (or `yes`/`no`/`true`/`false` for a boolean) answers
+  `accept` with that value; the rest of the text fills the string property.
+  Text after the value when the schema has no string property is not an
+  answer. `decline` and `cancel` give those actions only as the whole reply,
+  and not when the enum itself has that value.
+- The `respond_to` author gate decides who may answer: anyone whose messages
+  the agent accepts. There is no separate answer list. The reply must also
+  `p`-tag the agent and be signed by its own author: the agent's own posts,
+  relay-signed events, and `buzz:workflow` messages never answer.
+- The first valid answer wins. A later answer gets "Already answered by …"
+  and is not sent. A reply that is not an answer while the question waits gets
+  a hint with the expected words and is not queued. At most 3 such replies
+  are posted per question; later ones are consumed without a post.
+- Replies in other threads never answer. Until the turn that asked ends, other
+  events in that scope are queued, never steered or interrupted into the turn.
+- One question per thread at a time: a question from another turn of the same
+  scope gets `cancel` and one notice.
+
+Supported schemas: a flat object with at most one enum-or-boolean property and
+at most one string property. Other schemas, a request for another session, or
+a request outside a turn get `{"action":"cancel"}` at once (with at most one
+thread notice per turn). The question waits up to the turn hard
+deadline (`--max-turn-duration`); the idle timeout is suspended meanwhile. Every
+turn exit (end, cancel, timeout, error) answers an open question `cancel`. At
+the hard deadline the thread gets "The question expired; mention me in this
+thread to ask again."
+
+Note: under the default `--subscribe mentions` mode only events that `p`-tag
+the agent reach the harness, so an answer must mention the agent.
+
+## Turns Asked For by the Agent (`_buzz/wake`)
+
+An agent runtime can ask for a turn in a thread when work outside a turn
+changes, for example when a long task needs input or is complete. Both sides
+declare `"_meta": {"buzz.wake": {"version": 1}}` in `initialize`:
+buzz-acp in `clientCapabilities._meta`, the agent in
+`agentCapabilities._meta` (or the result's `_meta`). Any other value means "not
+supported".
+
+To an agent that declared it, every `session/new` and `session/prompt` of a
+channel turn carries the thread of the turn, merged into `_meta`:
+
+```json
+{"_meta": {"buzz.thread": {"channelId": "<uuid>", "rootEventId": "<64 lowercase hex>"}}}
+```
+
+The thread is the thread root under `--session-policy thread`, else the thread
+of the message that started the turn. Other agents get no new `_meta`.
+
+The agent sends the request `_buzz/wake` at any time, also between turns:
+
+```json
+{"jsonrpc": "2.0", "id": "goclaw-17", "method": "_buzz/wake",
+ "params": {"wakeId": "w_…", "reason": "input_required",
+            "thread": {"channelId": "…", "rootEventId": "…"},
+            "sessionId": "…", "task": {…}, "prompt": "…", "createdAt": "…"}}
+```
+
+buzz-acp reads the agent's stdout at all times, answers when it has queued or
+refused the turn (not after the turn), and answers every request once:
+
+| Answer | When |
+|--------|------|
+| `{"outcome": "accepted"}` | A wake turn is queued in the thread. |
+| `{"outcome": "duplicate"}` | This `wakeId` was accepted in the last 7 days (at most 4096 ids are kept; the oldest goes first). No turn. |
+| `{"outcome": "busy"}` | The thread already has a queued wake turn, its last accepted wake is less than 30 s old, or it had 20 accepted wakes in the last hour. Also when buzz-acp cannot take the request now (the worker is not in the pool yet, or the queue is full). Send again later. |
+| JSON-RPC error `-32602` | The frame is over 16 KiB; the agent did not declare `buzz.wake` version 1; `params` is not an object; `wakeId` is not a non-empty string of at most 128 bytes; `reason` is not `input_required`, `pr_ready`, `completed`, `failed`, or `cancelled`; `thread.channelId` is not a UUID; `thread.rootEventId` is not 64 lowercase hex; `prompt` is missing, not a string, or over 2048 bytes; or the channel is not one this agent is subscribed to. |
+
+The limits apply per session scope: the thread under `--session-policy
+thread`, else the channel. The dedup set lives in memory: after a restart, a
+resend is accepted again.
+
+A wake turn runs in its scope like a channel turn: it reuses the scope's ACP
+session (on the worker that owns it, after the same busy-owner hold), else
+opens one, and it never runs at the same time as another turn of the scope. If
+a turn runs in the scope, the wake turn waits and runs after it. Messages that
+arrive during a wake turn wait for it; they do not steer or interrupt it. Form
+questions in a wake turn post in the wake thread. The prompt holds only the
+runtime's `prompt` text, framed as data; `task` and `sessionId` are logged and
+never put in the prompt:
+
+```text
+[Buzz wake] Your runtime asked for a turn in this thread (reason: <reason>).
+<context>
+…the thread context, with the reply instruction for the thread…
+</context>
+<runtime-text>
+…prompt from the request…
+</runtime-text>
+```
+
+A failed wake turn (error, agent exit, timeout) runs again, up to 3 times in
+total; a clean end or a deliberate stop (`!cancel`, rotation, model switch)
+does not run it again. A request from an agent child that was replaced (for
+example after a respawn) gets no answer and opens no turn. While no turn runs,
+the agent's other notification lines that do not fit the bounded line queue
+are dropped (counted, with a rate-limited warning) so the agent never blocks;
+lines with an `id` are never dropped.
+
+The agent must stay alive between turns to send wakes: keep `--lazy-pool` off
+and `--idle-pool-sleep` and `--exit-after-inactivity` at 0.
+
 ## How It Works
 
 1. **Startup** — Spawns N agent subprocesses (default 1), sends ACP `initialize` to each, connects to the relay with NIP-42 auth.
