@@ -218,6 +218,24 @@ struct PendingElicitation {
     /// The route of the turn that asked, kept so that a late drain reports
     /// to that turn and never to a later one.
     sink: elicitation::ElicitationSink,
+    /// Receiver of the human reply. Kept here, not in the read loop, so that
+    /// a reply that arrived just before the turn ended is still written by
+    /// the drain instead of being lost with the read loop. `None` once the
+    /// read loop took the reply.
+    reply_rx: Option<tokio::sync::oneshot::Receiver<elicitation::ElicitationReply>>,
+}
+
+/// Wait for the reply to the pending question, or forever when there is none.
+/// Borrows only the pending entry, so the read loop can poll it in `select!`
+/// next to `self.reader`. Cancel-safe: polling `&mut Receiver` does not lose
+/// the value on drop.
+async fn pending_elicitation_reply(
+    pending: &mut Option<PendingElicitation>,
+) -> Result<elicitation::ElicitationReply, tokio::sync::oneshot::error::RecvError> {
+    match pending.as_mut().and_then(|p| p.reply_rx.as_mut()) {
+        Some(rx) => rx.await,
+        None => std::future::pending().await,
+    }
 }
 
 /// ACP client that owns an agent subprocess and communicates over its stdio.
@@ -1302,33 +1320,39 @@ impl AcpClient {
         self.elicitation_sink = None;
     }
 
+    /// Whether a per-turn question route is installed.
+    #[cfg(test)]
+    pub(crate) fn has_elicitation_sink(&self) -> bool {
+        self.elicitation_sink.is_some()
+    }
+
     /// Whether a question of this turn waits for a reply.
     #[cfg(test)]
     pub(crate) fn has_pending_elicitation(&self) -> bool {
         self.pending_elicitation.is_some()
     }
 
-    /// Answer an in-turn `elicitation/create` request, or register it.
+    /// Answer an in-turn `elicitation/create` request, or register it as the
+    /// pending question.
     ///
-    /// Returns the receiver of the human reply when the question is open.
-    /// Every other outcome writes its response at once: `-32602` for a mode
-    /// Buzz did not declare, otherwise `{"action":"cancel"}`.
+    /// Every outcome other than an open question writes its response at
+    /// once: `-32602` for a mode Buzz did not declare, otherwise
+    /// `{"action":"cancel"}`.
     async fn handle_elicitation_request(
         &mut self,
         msg: &serde_json::Value,
         session_id: &str,
-    ) -> Result<Option<tokio::sync::oneshot::Receiver<elicitation::ElicitationReply>>, AcpError>
-    {
+    ) -> Result<(), AcpError> {
         let Some(id) = msg.get("id").cloned() else {
             tracing::warn!(target: "acp::elicitation", "elicitation/create without id — ignoring");
-            return Ok(None);
+            return Ok(());
         };
         let open = match elicitation::check_request(&msg["params"], session_id) {
             elicitation::RequestCheck::InvalidParams(why) => {
                 tracing::warn!(target: "acp::elicitation", "elicitation id={id} invalid: {why}");
                 self.write_ndjson(&elicitation::invalid_params_response(&id, &why))
                     .await?;
-                return Ok(None);
+                return Ok(());
             }
             elicitation::RequestCheck::Refuse(why) => {
                 tracing::warn!(target: "acp::elicitation", "elicitation id={id} refused: {why}");
@@ -1336,7 +1360,7 @@ impl AcpClient {
                 if let Some(sink) = &self.elicitation_sink {
                     sink.refused();
                 }
-                return Ok(None);
+                return Ok(());
             }
             elicitation::RequestCheck::Open(open) => open,
         };
@@ -1353,7 +1377,7 @@ impl AcpClient {
             Err(why) => {
                 tracing::warn!(target: "acp::elicitation", "elicitation id={id} cancelled: {why}");
                 self.write_elicitation_cancel(&id).await?;
-                return Ok(None);
+                return Ok(());
             }
         };
         let id_key = id.to_string();
@@ -1364,15 +1388,20 @@ impl AcpClient {
                 "elicitation id={id} cancelled: the main loop is gone"
             );
             self.write_elicitation_cancel(&id).await?;
-            return Ok(None);
+            return Ok(());
         }
         tracing::info!(
             target: "acp::elicitation",
             "elicitation id={id} opened (toolCallId={:?})",
             open.tool_call_id
         );
-        self.pending_elicitation = Some(PendingElicitation { id, id_key, sink });
-        Ok(Some(reply_rx))
+        self.pending_elicitation = Some(PendingElicitation {
+            id,
+            id_key,
+            sink,
+            reply_rx: Some(reply_rx),
+        });
+        Ok(())
     }
 
     async fn write_elicitation_cancel(&mut self, id: &serde_json::Value) -> Result<(), AcpError> {
@@ -1399,18 +1428,26 @@ impl AcpClient {
         written
     }
 
-    /// Answer the pending question `cancel` on a turn exit path.
+    /// Answer the pending question on a turn exit path: with the reply when
+    /// one already arrived (the main loop counts it as delivered), otherwise
+    /// `cancel`.
     ///
     /// Best effort: the turn is already ending, so a failed write is logged
     /// and the exit path continues.
     async fn drain_elicitation(&mut self, reason: elicitation::CloseReason) {
-        if let Err(error) = self
-            .finish_elicitation(&elicitation::ElicitationReply::Cancel, reason)
-            .await
-        {
+        let arrived = self
+            .pending_elicitation
+            .as_mut()
+            .and_then(|p| p.reply_rx.as_mut())
+            .and_then(|rx| rx.try_recv().ok());
+        let (reply, reason) = match arrived {
+            Some(reply) => (reply, elicitation::CloseReason::Replied),
+            None => (elicitation::ElicitationReply::Cancel, reason),
+        };
+        if let Err(error) = self.finish_elicitation(&reply, reason).await {
             tracing::warn!(
                 target: "acp::elicitation",
-                "could not answer cancel to the pending question: {error}"
+                "could not answer the pending question: {error}"
             );
         }
     }
@@ -1969,14 +2006,6 @@ impl AcpClient {
             tokio::sync::oneshot::Sender<crate::pool::SteerAck>,
         )> = None;
 
-        // Receiver of the human reply to this turn's open question. Local, so
-        // that `self.reader` and the reply can both be polled in `select!`.
-        // Dropping it (the read loop returns or is dropped) closes the route;
-        // the question itself stays on `self` until a drain answers it.
-        let mut elicitation_reply_rx: Option<
-            tokio::sync::oneshot::Receiver<elicitation::ElicitationReply>,
-        > = None;
-
         let now = Instant::now();
         let mut idle_deadline = now + idle_timeout;
         let mut hard_deadline = hard_deadline;
@@ -2225,16 +2254,12 @@ impl AcpClient {
                     None // loop back; don't set read_result
                 }
                 // Human reply arm, before the reader for the same reason as
-                // the decision arm. Cancel-safe: polling `&mut Receiver`
-                // does not lose the value on drop. A closed route (the main
-                // loop dropped its record) answers `cancel`.
-                reply = async {
-                    match elicitation_reply_rx.as_mut() {
-                        Some(rx) => rx.await,
-                        None => std::future::pending().await,
+                // the decision arm. A closed route (the main loop dropped its
+                // record) answers `cancel`.
+                reply = pending_elicitation_reply(&mut self.pending_elicitation) => {
+                    if let Some(pending) = self.pending_elicitation.as_mut() {
+                        pending.reply_rx = None;
                     }
-                } => {
-                    elicitation_reply_rx = None;
                     let (reply, reason) = match reply {
                         Ok(reply) => (reply, elicitation::CloseReason::Replied),
                         Err(_) => (
@@ -2597,11 +2622,7 @@ impl AcpClient {
                                 .await?;
                             }
                             elicitation::ELICITATION_METHOD => {
-                                if let Some(rx) =
-                                    self.handle_elicitation_request(&msg, session_id).await?
-                                {
-                                    elicitation_reply_rx = Some(rx);
-                                }
+                                self.handle_elicitation_request(&msg, session_id).await?;
                             }
                             other => {
                                 // If the unknown message has an id, it's a request expecting a reply.

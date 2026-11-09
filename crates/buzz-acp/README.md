@@ -316,22 +316,31 @@ A human answers with a reply in that thread that mentions the agent:
 @<agent> cancel
 ```
 
-- After the leading mentions, only the first word counts. An enum value (or
-  `yes`/`no`/`true`/`false` for a boolean) answers `accept` with that value;
-  the rest of the text fills the string property. `decline` and `cancel` give
-  those actions, unless the enum itself has that value.
+- The leading mentions are removed with the same rules as slash commands; the
+  agent display name (from its kind:0 profile, looked up once and again while
+  unknown) is removed whole, also when it has spaces. Then only the first word
+  counts. An enum value (or `yes`/`no`/`true`/`false` for a boolean) answers
+  `accept` with that value; the rest of the text fills the string property.
+  Text after the value when the schema has no string property is not an
+  answer. `decline` and `cancel` give those actions only as the whole reply,
+  and not when the enum itself has that value.
 - The `respond_to` author gate decides who may answer: anyone whose messages
-  the agent accepts. There is no separate answer list.
+  the agent accepts. There is no separate answer list. The reply must also
+  `p`-tag the agent and be signed by its own author: the agent's own posts,
+  relay-signed events, and `buzz:workflow` messages never answer.
 - The first valid answer wins. A later answer gets "Already answered by …"
   and is not sent. A reply that is not an answer while the question waits gets
-  one hint with the expected words and is not queued.
-- Replies in other threads never answer. While a question waits, other events
-  in that scope are queued, never steered or interrupted into the turn.
+  a hint with the expected words and is not queued. At most 3 such replies
+  are posted per question; later ones are consumed without a post.
+- Replies in other threads never answer. Until the turn that asked ends, other
+  events in that scope are queued, never steered or interrupted into the turn.
+- One question per thread at a time: a question from another turn of the same
+  scope gets `cancel` and one notice.
 
 Supported schemas: a flat object with at most one enum-or-boolean property and
 at most one string property. Other schemas, a request for another session, or
-a request outside a turn get `{"action":"cancel"}` at once (with one thread
-notice when a turn is running). The question waits up to the turn hard
+a request outside a turn get `{"action":"cancel"}` at once (with at most one
+thread notice per turn). The question waits up to the turn hard
 deadline (`--max-turn-duration`); the idle timeout is suspended meanwhile. Every
 turn exit (end, cancel, timeout, error) answers an open question `cancel`. At
 the hard deadline the thread gets "The question expired; mention me in this

@@ -10091,6 +10091,54 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         // Reaching here without a panic is the test.
     }
 
+    /// A turn's question route ends with the turn: the agent that returns to
+    /// the pool has none, so a later turn without its own route (a heartbeat)
+    /// cannot post questions under the old turn's identity.
+    #[tokio::test]
+    async fn send_prompt_result_clears_the_question_route() {
+        let acp = AcpClient::spawn("cat", &[], &[], false)
+            .await
+            .expect("failed to spawn test agent");
+        let mut agent = OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_model_request_id: None,
+            desired_model_pending_ack: false,
+            startup_effort: None,
+            agent_name: "unknown".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        };
+        let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let channel_id = Uuid::new_v4();
+        agent
+            .acp
+            .install_elicitation_sink(crate::acp::elicitation::ElicitationSink::new(
+                events_tx,
+                crate::acp::elicitation::ElicitationTurn {
+                    turn_id: "t".into(),
+                    scope: SessionScope::Conversation { channel_id },
+                    anchor_event_id: "ab".repeat(32),
+                },
+            ));
+        assert!(agent.acp.has_elicitation_sink());
+        let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel::<PromptResult>();
+        send_prompt_result(
+            &result_tx,
+            "t",
+            agent,
+            PromptSource::Heartbeat,
+            PromptOutcome::Ok(StopReason::EndTurn),
+            None,
+        );
+        let result = result_rx.recv().await.expect("PromptResult must be sent");
+        assert!(!result.agent.acp.has_elicitation_sink());
+    }
+
     // ── send_steer admission-reason tests ─────────────────────────────────
     //
     // These pin the fixed structured admission-refusal labels the stock

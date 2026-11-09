@@ -12,6 +12,7 @@
 //! `{"action":"cancel"}` so that the agent never waits for an answer that no
 //! thread reply can give.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};
@@ -35,6 +36,11 @@ const MAX_MESSAGE_CHARS: usize = 4_000;
 
 /// Text of the notice that replaces a question Buzz cannot show.
 pub const UNSUPPORTED_NOTICE: &str = "I cannot show this question in Buzz.";
+
+/// Text of the notice for a question asked while another question of the
+/// same thread still waits.
+pub const BUSY_NOTICE: &str =
+    "I can ask only one question at a time in this thread; the new question was cancelled.";
 
 /// Text of the notice that follows a question that reached the turn deadline.
 pub const EXPIRED_NOTICE: &str = "The question expired; mention me in this thread to ask again.";
@@ -218,18 +224,21 @@ pub enum ElicitationReply {
 
 /// Parse a thread reply against `schema`.
 ///
-/// The leading `@<agent_label>` mention and any other leading `@name` or
-/// `nostr:` tokens are removed first. Then only the **first** remaining word
-/// decides the action: a choice value gives `accept`, `decline` gives
-/// `decline`, `cancel` gives `cancel`. The parser never searches later words,
-/// so "don't approve" can never become an approval. Text after a choice value
-/// fills the string property. Returns `None` when the reply is not an answer.
+/// The leading mention run is removed first with the same rules as slash
+/// commands; `known_names` holds the agent display name, so a name with
+/// spaces is removed whole. Then only the **first** remaining word decides
+/// the action: a choice value gives `accept`, and the text after it fills the
+/// string property. The parser never searches later words, so "don't
+/// approve" can never become an approval. `decline` and `cancel` are actions
+/// only when they are the whole reply, so "cancel the old plan" is not read
+/// as a cancel. Returns `None` when the reply is not an answer, including a
+/// choice followed by text that the schema has no field for.
 pub fn parse_reply(
     text: &str,
     schema: &FormSchema,
-    agent_label: Option<&str>,
+    known_names: &[&str],
 ) -> Option<ElicitationReply> {
-    let rest = strip_leading_mentions(text, agent_label);
+    let rest = crate::queue::strip_leading_mentions(text, known_names).trim_end();
     let (first, remainder) = match rest.split_once(char::is_whitespace) {
         Some((first, remainder)) => (first, remainder.trim()),
         None => (rest, ""),
@@ -254,21 +263,23 @@ pub fn parse_reply(
         if let Some(value) = value {
             let mut content = serde_json::Map::new();
             content.insert(choice.name.clone(), value);
-            if let Some(field) = &schema.text {
-                if !remainder.is_empty() {
+            match (&schema.text, remainder.is_empty()) {
+                (Some(field), false) => {
                     content.insert(
                         field.name.clone(),
                         serde_json::Value::String(remainder.to_string()),
                     );
-                } else if field.required {
-                    return None;
                 }
+                (Some(field), true) if field.required => return None,
+                // Text the agent cannot receive must not vanish silently.
+                (None, false) => return None,
+                _ => {}
             }
             return Some(ElicitationReply::Accept(content));
         }
     }
 
-    if !schema.shadows_keyword(word) {
+    if remainder.is_empty() && !schema.shadows_keyword(word) {
         if word.eq_ignore_ascii_case("decline") {
             return Some(ElicitationReply::Decline);
         }
@@ -287,32 +298,6 @@ pub fn parse_reply(
             Some(ElicitationReply::Accept(content))
         }
         _ => None,
-    }
-}
-
-/// Remove the leading mention run: `@<agent_label>` (case-insensitive, also
-/// for a label with spaces), then single `@name` and `nostr:` tokens.
-fn strip_leading_mentions<'a>(text: &'a str, agent_label: Option<&str>) -> &'a str {
-    let separators = |c: char| c.is_whitespace() || c == ',' || c == ':';
-    let mut rest = text.trim_start_matches(separators);
-    if let Some(label) = agent_label.filter(|l| !l.trim().is_empty()) {
-        let mention = format!("@{}", label.trim());
-        if let Some(head) = rest.get(..mention.len()) {
-            let tail = &rest[mention.len()..];
-            let at_boundary = tail.chars().next().is_none_or(|c| !c.is_alphanumeric());
-            if head.to_lowercase() == mention.to_lowercase() && at_boundary {
-                rest = tail.trim_start_matches(separators);
-            }
-        }
-    }
-    loop {
-        let token_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-        let token = &rest[..token_end];
-        if token.starts_with('@') || token.starts_with("nostr:") {
-            rest = rest[token_end..].trim_start_matches(separators);
-        } else {
-            return rest;
-        }
     }
 }
 
@@ -537,15 +522,6 @@ pub enum ElicitationEvent {
         /// Turn that asked.
         turn: Arc<ElicitationTurn>,
     },
-    /// The harness posted the question. Sent by the posting task.
-    Posted {
-        /// Turn that asked.
-        turn_id: String,
-        /// JSON-RPC id of the request, serialized.
-        request_id: String,
-        /// The agent display name the question used, when it was found.
-        agent_label: Option<String>,
-    },
     /// The harness could not post the question. Sent by the posting task.
     PostFailed {
         /// Turn that asked.
@@ -560,6 +536,9 @@ pub enum ElicitationEvent {
 pub struct ElicitationSink {
     tx: mpsc::UnboundedSender<ElicitationEvent>,
     turn: Arc<ElicitationTurn>,
+    /// Set by the first `Refused` of the turn: one notice per turn at most,
+    /// however many requests the agent sends.
+    refusal_noticed: Arc<AtomicBool>,
 }
 
 impl ElicitationSink {
@@ -568,6 +547,7 @@ impl ElicitationSink {
         Self {
             tx,
             turn: Arc::new(turn),
+            refusal_noticed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -599,8 +579,12 @@ impl ElicitationSink {
         });
     }
 
-    /// Send `Refused`. A gone main loop cannot post the notice anyway.
+    /// Send `Refused` for the first refusal of the turn only. A gone main
+    /// loop cannot post the notice anyway.
     pub(crate) fn refused(&self) {
+        if self.refusal_noticed.swap(true, Ordering::Relaxed) {
+            return;
+        }
         let _ = self.tx.send(ElicitationEvent::Refused {
             turn: Arc::clone(&self.turn),
         });
@@ -721,7 +705,7 @@ mod tests {
             "decision":{"type":"string","enum":["approve","reject"]},
             "comment":{"type":"string"}},"required":["decision","comment"]}));
         let text_only = parsed(json!({"type":"object","properties":{"why":{"type":"string"}}}));
-        let label = Some("Merge Bot");
+        let names: &[&str] = &["Merge Bot"];
 
         let cases: Vec<(&str, &FormSchema, &str, Option<ElicitationReply>)> = vec![
             (
@@ -746,9 +730,9 @@ mod tests {
                 ]),
             ),
             (
-                "punctuation after the mention and the word",
+                "punctuation after the word",
                 &decision,
-                "@Merge Bot, approve. ok",
+                "@Merge Bot approve. ok",
                 accept(&[("decision", json!("approve")), ("comment", json!("ok"))]),
             ),
             (
@@ -758,10 +742,16 @@ mod tests {
                 accept(&[("decision", json!("approve"))]),
             ),
             (
-                "unknown label strips one token",
+                "single-word mention",
                 &decision,
                 "@bot approve",
                 accept(&[("decision", json!("approve"))]),
+            ),
+            (
+                "unknown multi-word name is not guessed",
+                &decision,
+                "@Merge Botty approve",
+                None,
             ),
             (
                 "decline",
@@ -772,8 +762,20 @@ mod tests {
             (
                 "cancel",
                 &decision,
-                "@Merge Bot Cancel please",
+                "@Merge Bot Cancel.",
                 Some(ElicitationReply::Cancel),
+            ),
+            (
+                "cancel with more text is no action",
+                &decision,
+                "@Merge Bot cancel the old plan",
+                None,
+            ),
+            (
+                "decline with more text is no action",
+                &decision,
+                "@Merge Bot decline it",
+                None,
             ),
             ("empty", &decision, "@Merge Bot", None),
             ("unknown word", &decision, "@Merge Bot looks fine", None),
@@ -796,6 +798,12 @@ mod tests {
                 accept(&[("ok", json!(false))]),
             ),
             ("boolean unknown", &boolean, "@Merge Bot maybe", None),
+            (
+                "text after a choice with no text field is not dropped",
+                &boolean,
+                "@Merge Bot yes but fix foo first",
+                None,
+            ),
             (
                 "enum value cancel wins over the keyword",
                 &cancel_enum,
@@ -826,10 +834,16 @@ mod tests {
                 "@Merge Bot decline",
                 Some(ElicitationReply::Decline),
             ),
+            (
+                "text only keeps a sentence that starts with decline",
+                &text_only,
+                "@Merge Bot decline the offer",
+                accept(&[("why", json!("decline the offer"))]),
+            ),
         ];
         for (name, schema, text, expected) in cases {
             assert_eq!(
-                parse_reply(text, schema, label),
+                parse_reply(text, schema, names),
                 expected,
                 "reply case {name:?}"
             );

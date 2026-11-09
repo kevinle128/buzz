@@ -1497,6 +1497,18 @@ pub fn parse_thread_tags(event: &Event) -> ThreadTags {
 /// with `/` followed by an ASCII alphanumeric; `None` otherwise. A `/`
 /// appearing later in the text (e.g. `"@Eva see /tmp/foo"`) never matches.
 pub fn extract_slash_command(content: &str, known_names: &[&str]) -> Option<String> {
+    let rest = strip_leading_mentions(content, known_names);
+    let mut chars = rest.chars();
+    (chars.next() == Some('/') && chars.next().is_some_and(|c| c.is_ascii_alphanumeric()))
+        .then(|| rest.to_string())
+}
+
+/// Remove the leading mention run of `content`: `@<name>` for a display name
+/// in `known_names` (longest first, case-insensitive, ending at whitespace or
+/// the end), else a single `@word` token of the characters Buzz allows in
+/// plain mentions, and NIP-27 `nostr:npub1…` / `nostr:nprofile1…` tokens.
+/// A bare `@` stops the run. The rest starts at its first non-space.
+pub(crate) fn strip_leading_mentions<'a>(content: &'a str, known_names: &[&str]) -> &'a str {
     // Longest-first so "Dawn Smith" wins over "Dawn".
     let mut names: Vec<&str> = known_names
         .iter()
@@ -1536,16 +1548,14 @@ pub fn extract_slash_command(content: &str, known_names: &[&str]) -> Option<Stri
                         .unwrap_or(after_at.len());
                     (len > 0).then_some(len)
                 });
-            let len = name_len?; // bare '@' — not a mention
+            let Some(len) = name_len else {
+                return rest; // bare '@' — not a mention
+            };
             rest = after_at[len..].trim_start();
         } else {
-            break;
+            return rest;
         }
     }
-
-    let mut chars = rest.chars();
-    (chars.next() == Some('/') && chars.next().is_some_and(|c| c.is_ascii_alphanumeric()))
-        .then(|| rest.to_string())
 }
 
 /// Return the slash command for a batch, if it qualifies for pass-through.

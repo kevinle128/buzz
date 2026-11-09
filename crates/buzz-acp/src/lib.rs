@@ -560,9 +560,16 @@ mod inbound_author_gate {
     pub(crate) struct AuthorizedListenerEvent {
         buzz_event: relay::BuzzEvent,
         effective_author: String,
+        relay_signed: bool,
     }
 
     impl AuthorizedListenerEvent {
+        /// Whether the active relay identity signed the event. Such an event
+        /// speaks for the relay or a workflow, never for a person.
+        pub(crate) fn relay_signed(&self) -> bool {
+            self.relay_signed
+        }
+
         pub(crate) fn into_parts(self) -> (relay::BuzzEvent, String) {
             (self.buzz_event, self.effective_author)
         }
@@ -757,9 +764,14 @@ mod inbound_author_gate {
                 );
                 return None;
             }
+            let relay_signed = self
+                .relay_self
+                .as_deref()
+                .is_some_and(|relay| buzz_event.event.pubkey.to_hex().eq_ignore_ascii_case(relay));
             Some(AuthorizedListenerEvent {
                 buzz_event,
                 effective_author: decision.effective_author,
+                relay_signed,
             })
         }
 
@@ -869,12 +881,14 @@ impl QueuedNormalListenerEvent {
             );
             return;
         }
-        // Any stop signal would cancel the turn that waits for a human answer
-        // and lose the question. The event stays queued for the next turn.
-        if pool.elicitations().is_pending(&self.scope) {
+        // A turn that asked a question gets no stop signal until it ends: a
+        // stop while the question waits loses it, and a stop after the answer
+        // throws away the work the answer started. The event stays queued
+        // for the next turn.
+        if pool.elicitations().has_question(&self.scope) {
             tracing::info!(
                 scope = %self.scope.telemetry_label(),
-                "question waits for an answer — event queued without steer or interrupt"
+                "turn has an open question — event queued without steer or interrupt"
             );
             return;
         }
@@ -913,16 +927,33 @@ impl NormalListenerIngress {
     ///
     /// Returns `None` when the event was consumed: it is not queued, gets no
     /// 👀 reaction, and never steers or interrupts the waiting turn. The
-    /// caller runs this after the author gate, which decides who may answer.
-    fn answer_open_question(
+    /// caller runs this after the author gate, which decides who may answer;
+    /// `relay_signed` comes from that gate. While the agent display name is
+    /// not known, a candidate answer looks it up again first, so a name with
+    /// spaces is never cut at its first word.
+    async fn answer_open_question(
         self,
         scope: &scope::SessionScope,
+        relay_signed: bool,
         pool: &mut AgentPool,
         poster: &elicitation_intake::ThreadPoster,
     ) -> Option<Self> {
+        let candidate = elicitation_intake::AnswerCandidate {
+            event: &self.buzz_event.event,
+            effective_author: &self.effective_author,
+            relay_signed,
+        };
+        if !pool
+            .elicitations()
+            .accepts_candidate(scope, &candidate, poster.agent_hex())
+        {
+            return Some(self);
+        }
+        let label = poster.agent_label().await;
+        let known_names: Vec<&str> = label.as_deref().into_iter().collect();
         match pool
             .elicitations_mut()
-            .intake(scope, &self.buzz_event.event, &self.effective_author)
+            .intake(scope, candidate, poster.agent_hex(), &known_names)
         {
             elicitation_intake::Intake::NotForQuestion => Some(self),
             elicitation_intake::Intake::Consumed { reply } => {
@@ -3414,6 +3445,15 @@ async fn run_harness(
     // would leave a question record that no turn owns.
     let (elicitation_tx, mut elicitation_rx) =
         mpsc::unbounded_channel::<acp::elicitation::ElicitationEvent>();
+    // Posts questions and their notices as the agent; it also keeps the agent
+    // display name that the answer grammar strips. One per listener run.
+    let elicitation_poster = elicitation_intake::ThreadPoster::new(
+        config.keys.clone(),
+        relay.event_publisher(),
+        Some(ctx.rest_client.clone()),
+        elicitation_tx.clone(),
+    );
+    elicitation_poster.prefetch_agent_label();
 
     // `_buzz/wake` requests from the reader tasks of the agent children.
     // Bounded: a reader that finds it full answers `busy` itself, and each
@@ -3991,6 +4031,7 @@ async fn run_harness(
                             else {
                                 continue;
                             };
+                            let relay_signed = authorized_event.relay_signed();
                             let Some(ingress) =
                                 AuthorizedNormalListenerEvent(authorized_event)
                                     .match_subscription(&rules, &pubkey_hex)
@@ -4026,15 +4067,14 @@ async fn run_harness(
                             // question answers it and is not queued. This
                             // runs after the author gate on purpose: the gate
                             // decides who may answer.
-                            let poster = elicitation_intake::ThreadPoster::new(
-                                config.keys.clone(),
-                                relay.event_publisher(),
-                                owner_cache.get().map(str::to_string),
-                                Some(ctx.rest_client.clone()),
-                                elicitation_tx.clone(),
-                            );
-                            let Some(ingress) =
-                                ingress.answer_open_question(&session_scope, &mut pool, &poster)
+                            let Some(ingress) = ingress
+                                .answer_open_question(
+                                    &session_scope,
+                                    relay_signed,
+                                    &mut pool,
+                                    &elicitation_poster,
+                                )
+                                .await
                             else {
                                 continue; // consumed — do NOT push to queue
                             };
@@ -4503,14 +4543,12 @@ async fn run_harness(
                 }
             }
             Some(PoolEvent::Elicitation(event)) => {
-                let poster = elicitation_intake::ThreadPoster::new(
-                    config.keys.clone(),
-                    relay.event_publisher(),
-                    owner_cache.get().map(str::to_string),
-                    Some(ctx.rest_client.clone()),
-                    elicitation_tx.clone(),
+                elicitation_intake::handle_event(
+                    &mut pool,
+                    &elicitation_poster,
+                    event,
+                    owner_cache.get(),
                 );
-                elicitation_intake::handle_event(&mut pool, &poster, event);
             }
             Some(PoolEvent::AgentWake(frame)) => {
                 let intake = wake_intake::WakeIntake {
@@ -4852,16 +4890,17 @@ fn signal_in_flight_task_for_scope(
 }
 
 /// Send the cancel+merge fallback of a failed native steer to the turn of
-/// `scope`, unless that turn waits for a human answer to an ACP form
-/// question: cancelling it would lose the question. The released event then
-/// stays queued and is dispatched after the turn ends.
+/// `scope`, unless that turn asked an ACP form question (pending or
+/// answered): cancelling it would lose the question or the work its answer
+/// started. The released event then stays queued and is dispatched after the
+/// turn ends.
 ///
 /// Returns `true` if a signal was sent.
 fn signal_steer_fallback(pool: &mut AgentPool, scope: &scope::SessionScope) -> bool {
-    if pool.elicitations().is_pending(scope) {
+    if pool.elicitations().has_question(scope) {
         tracing::info!(
             scope = %scope.telemetry_label(),
-            "question waits for an answer — steer fallback not signalled"
+            "turn has an open question — steer fallback not signalled"
         );
         return false;
     }
@@ -7938,7 +7977,7 @@ mod author_gate_tests {
     }
 
     /// Serve scripted NIP-11 responses. `Err(())` returns HTTP 500.
-    async fn nip11_scripted_server(
+    pub(super) async fn nip11_scripted_server(
         responses: std::collections::VecDeque<Result<serde_json::Value, ()>>,
     ) -> (relay::RestClient, tokio::task::JoinHandle<()>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
