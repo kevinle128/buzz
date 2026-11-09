@@ -5,6 +5,8 @@ import {
   createDesktopNotificationActivationQueue,
   shouldBounceForChannelNotification,
 } from "@/app/AppShell.helpers";
+import { useOpenAgentActivity } from "@/features/agents/useOpenAgentActivity";
+import { usePendingPermissionAlerts } from "@/features/agents/usePendingPermissionAlerts";
 import { useCommunityJoinAlerts } from "@/features/community-members/useCommunityJoinAlerts";
 import { hasMentionForEvent } from "@/features/notifications/lib/shouldNotify";
 import type { NotificationSettings } from "@/features/notifications/hooks";
@@ -55,6 +57,9 @@ export function useAppShellDesktopNotifications({
   useCommunityJoinAlerts({
     enabled: enabled && notificationSettings.desktopEnabled,
   });
+  // Agent permission requests alert through the same notification settings.
+  usePendingPermissionAlerts({ enabled, notificationSettings });
+  const { openAgentActivity } = useOpenAgentActivity();
 
   const resolveSenderName = useNotificationSenderName();
 
@@ -157,6 +162,7 @@ export function useAppShellDesktopNotifications({
         {
           goChannel,
           goHome,
+          openAgentActivity,
           openSearchHit,
           revealWindow: revealDesktopAppWindow,
         },

@@ -4,9 +4,11 @@ import {
 } from "@/features/agents/channelAgents";
 import { fetchProjects, type Project } from "@/features/projects/hooks";
 import {
+  assertCustomRepositoryAvailable,
   buildDefaultProjectRepositoryTemplate,
   buildProjectBootstrapTemplates,
   conflictingListedProject,
+  defaultRepositoryIdentity,
   isUnsupportedProjectKindError,
   projectDtagFromName,
   type ProjectListingVisibility,
@@ -34,6 +36,8 @@ export type CreateProjectInput = {
   projectVisibility?: ProjectListingVisibility;
   agents?: readonly CreateChannelManagedAgentInput[];
   templateId?: string;
+  /** Optional default-repository name; omitted keeps the project slug. */
+  repositoryName?: string;
 };
 
 export type CreateProjectResult = {
@@ -46,6 +50,8 @@ export type CreateProjectResult = {
 export type CreateProjectResumeState = {
   channels: Map<string, Channel>;
   projectIds: Set<string>;
+  /** Default-repository address this retry already published, per project id. */
+  repositoryAddresses: Map<string, string>;
 };
 
 function formatAgentFailures(
@@ -141,6 +147,7 @@ async function ensureDefaultRepository({
     name: input.name,
     ownerPubkey,
     projectChannelId: channelId,
+    repositoryName: input.repositoryName,
   });
   const existingRepository =
     project.repositories.find(
@@ -152,7 +159,7 @@ async function ensureDefaultRepository({
   let repositoryEvent = await fetchOwnHead(
     KIND_REPO_ANNOUNCEMENT,
     ownerPubkey,
-    repositoryTemplate.dtag,
+    repositoryTemplate.repositoryDtag,
   );
   if (!repositoryEvent) {
     repositoryEvent = await signRelayEvent(repositoryTemplate.repository);
@@ -212,6 +219,7 @@ async function finishCreate(
   }
   resume.projectIds.delete(projectId);
   resume.channels.delete(projectId);
+  resume.repositoryAddresses.delete(projectId);
   return { channel, project };
 }
 
@@ -234,6 +242,19 @@ export async function createProject(
   );
   const projectId = `${ownerPubkey}:${dtagPreview}`;
   const canResume = resume.projectIds.has(projectId);
+  const { repositoryDtag } = defaultRepositoryIdentity({
+    projectDtag: dtagPreview,
+    projectName: input.name.trim(),
+    repositoryName: input.repositoryName,
+  });
+  await assertCustomRepositoryAvailable({
+    fetchRepositoryHead: (dtag) =>
+      fetchOwnHead(KIND_REPO_ANNOUNCEMENT, ownerPubkey, dtag),
+    ownerPubkey,
+    projectDtag: dtagPreview,
+    repositoryDtag,
+    resumedRepositoryAddress: resume.repositoryAddresses.get(projectId),
+  });
   if (existingProject && !canResume) {
     throw new Error(`You already have a project named "${dtagPreview}".`);
   }
@@ -280,12 +301,14 @@ export async function createProject(
     ownerPubkey: identity.pubkey,
     projectChannelId: channel.id,
     projectVisibility: input.projectVisibility ?? "listed",
+    repositoryName: input.repositoryName,
   });
   const existingRepositoryEvent = await fetchOwnHead(
     KIND_REPO_ANNOUNCEMENT,
     ownerPubkey,
-    templates.dtag,
+    templates.repositoryDtag,
   );
+  resume.repositoryAddresses.set(projectId, templates.repositoryAddress);
   const projectEvent = await signRelayEvent(templates.project);
   await publishProjectEvent(projectEvent);
 

@@ -14,6 +14,7 @@ import type { TimelineMessage } from "@/features/messages/types";
 import { useKnownAgentPubkeys } from "@/features/agents/useKnownAgentPubkeys";
 import { HuddleAttachment } from "@/features/huddle/components/HuddleAttachment";
 import { MessageReactions } from "@/features/messages/ui/MessageReactions";
+import { MessageAppBadge } from "@/features/messages/ui/MessageAuthorIdentity";
 import { MessageAuthorWithIndicators } from "@/features/messages/ui/MessageAuthorWithIndicators";
 import { useReactionHandler } from "@/features/messages/ui/useReactionHandler";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
@@ -275,8 +276,11 @@ export const MessageRow = React.memo(
       (message.pubkey && isKnownAgentPubkey(message.pubkey))
         ? "bot"
         : message.role;
+    const isApp = message.isApp === true;
+    // Apps are relay-signed; their signer is not a person to open a profile for.
+    const interactiveAuthor = Boolean(message.pubkey) && !isApp;
     const isAuthorAgent =
-      message.isAgent === true || profilePopoverRole === "bot";
+      !isApp && (message.isAgent === true || profilePopoverRole === "bot");
     const agentMentionPubkeysByName = React.useMemo(() => {
       if (!mentionPubkeysByName) {
         return undefined;
@@ -534,7 +538,7 @@ export const MessageRow = React.memo(
 
     const avatarGutterNode = isDisplayedAsContinuation ? (
       continuationTimestampGutter
-    ) : message.pubkey ? (
+    ) : interactiveAuthor && message.pubkey ? (
       <UserProfilePopover
         pubkey={message.pubkey}
         role={profilePopoverRole}
@@ -554,7 +558,7 @@ export const MessageRow = React.memo(
       <div className="flex shrink-0 items-start">{avatarNode}</div>
     );
 
-    const authorNode = message.pubkey ? (
+    const authorNode = interactiveAuthor ? (
       <MessageAuthorText hoverUnderline>{message.author}</MessageAuthorText>
     ) : (
       <MessageAuthorText as="h3">{message.author}</MessageAuthorText>
@@ -657,7 +661,7 @@ export const MessageRow = React.memo(
       // pe reserves the measured action-rail footprint (0px until measured) so
       // header content ends before the rail's left edge in every rail state.
       <MessageHeaderRow className="pe-[var(--message-action-rail-width,0px)]">
-        {message.pubkey ? (
+        {interactiveAuthor && message.pubkey ? (
           <MessageAuthorWithIndicators
             authorName={message.author}
             ownerPubkey={message.ownerPubkey}
@@ -669,6 +673,7 @@ export const MessageRow = React.memo(
         ) : (
           authorNode
         )}
+        {isApp ? <MessageAppBadge /> : null}
         {/* Author is not a segment: "Alice 9:53 AM" needs no divider. */}
         <MessageMetaSegments
           segments={[
@@ -944,6 +949,8 @@ export const MessageRow = React.memo(
     prev.message.pubkey === next.message.pubkey &&
     prev.message.body === next.message.body &&
     prev.message.author === next.message.author &&
+    prev.message.isApp === next.message.isApp &&
+    prev.message.appId === next.message.appId &&
     prev.message.isAgent === next.message.isAgent &&
     prev.message.ownerPubkey === next.message.ownerPubkey &&
     prev.message.ownerLabel === next.message.ownerLabel &&

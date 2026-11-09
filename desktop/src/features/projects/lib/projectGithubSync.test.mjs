@@ -97,6 +97,20 @@ test("GitHub push skips a Nostr pull-request update", () => {
     ),
     true,
   );
+  assert.equal(
+    shouldPublishPullRequestUpdateAfterPush(
+      "https://github.com/acme/app",
+      "42",
+    ),
+    false,
+  );
+  assert.equal(
+    shouldPublishPullRequestUpdateAfterPush(
+      "https://github.com/acme/app",
+      "e".repeat(64),
+    ),
+    true,
+  );
 });
 
 test("GitHub uses Pull Push Fetch while other external hosts use Open", () => {

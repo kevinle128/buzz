@@ -22,6 +22,7 @@ async function openBuzzProject(page: import("@playwright/test").Page) {
     .first();
   await expect(projectEntry).toBeVisible({ timeout: 10_000 });
   await projectEntry.click();
+  await page.getByTestId("project-home-context-repo-buzz").click();
 }
 
 async function openGithubIssues(page: import("@playwright/test").Page) {
@@ -32,7 +33,7 @@ async function openGithubIssues(page: import("@playwright/test").Page) {
   });
   await installMockBridge(page);
   await openBuzzProject(page);
-  await page.getByRole("tab", { name: "Issues", exact: true }).click();
+  await page.getByRole("tab", { name: "Tasks", exact: true }).click();
 }
 
 test("GitHub Issues lists metadata, loads read-only detail, and creates #N", async ({
@@ -79,11 +80,13 @@ test("GitHub Issues lists metadata, loads read-only detail, and creates #N", asy
     page.getByText("No closed issues.", { exact: true }),
   ).toBeVisible();
 
-  await page.getByRole("button", { name: "New issue" }).click();
+  await page.getByRole("button", { name: "Create task" }).first().click();
   await page.getByTestId("create-issue-title").fill("New GitHub bug");
   await page.getByTestId("create-issue-body").fill("Created from Buzz");
   await page.getByTestId("create-issue-submit").click();
-  await expect(page.getByText("New GitHub bug", { exact: true })).toBeVisible({
+  await expect(
+    page.getByText("New GitHub bug", { exact: true }).first(),
+  ).toBeVisible({
     timeout: 10_000,
   });
   await expect(page.getByText("#43", { exact: true })).toBeVisible();
@@ -114,7 +117,7 @@ test("GitHub issue auth failure renders recovery before empty state", async ({
   });
   await installMockBridge(page);
   await openBuzzProject(page);
-  await page.getByRole("tab", { name: "Issues", exact: true }).click();
+  await page.getByRole("tab", { name: "Tasks", exact: true }).click();
   await expect(page.getByText("GitHub authentication required")).toBeVisible({
     timeout: 10_000,
   });
@@ -137,7 +140,7 @@ test("GitHub comment failure keeps the issue body and retries only comments", as
   });
   await installMockBridge(page);
   await openBuzzProject(page);
-  await page.getByRole("tab", { name: "Issues", exact: true }).click();
+  await page.getByRole("tab", { name: "Tasks", exact: true }).click();
   const row = page.getByTestId("project-github-issue-row").first();
   await row.getByRole("button", { name: "#42", exact: true }).click();
   await expect(page.getByText("Repro steps", { exact: true })).toBeVisible();
@@ -187,7 +190,7 @@ test("GitHub user failure disables self-assignment and keeps recovery visible", 
   });
   await installMockBridge(page);
   await openBuzzProject(page);
-  await page.getByRole("tab", { name: "Issues", exact: true }).click();
+  await page.getByRole("tab", { name: "Tasks", exact: true }).click();
   const row = page.getByTestId("project-github-issue-row").first();
   await row.getByRole("button", { name: "#42", exact: true }).click();
 

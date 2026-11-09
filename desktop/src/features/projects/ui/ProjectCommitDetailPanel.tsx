@@ -1,16 +1,8 @@
 import { Calendar, GitCommitHorizontal, Hash, UserRound } from "lucide-react";
 
 import type { Repository } from "@/features/projects/hooks";
-import {
-  profileForCommit,
-  type ViewerGitIdentity,
-} from "@/features/projects/lib/projectContributorMatching";
 import { commitDiscussionQuery } from "@/features/projects/lib/discussionChannels";
 import { commitShareLink } from "@/features/projects/lib/projectShareLinks";
-import {
-  resolveUserLabel,
-  type UserProfileLookup,
-} from "@/features/profile/lib/identity";
 import type { ProjectRepoCommit, ProjectRepoDiff } from "@/shared/api/types";
 import { DiscussedInChannels } from "./DiscussionChannels";
 import { CopyCommitHashButton } from "./ProjectCommitCopyButton";
@@ -22,7 +14,6 @@ import { ProjectDetailSection } from "./ProjectDetailSection";
 import { PROJECT_DETAIL_READING_COLUMN_CLASS } from "./projectPanelStyles";
 import { ProjectDiffFilesPanel } from "./ProjectPullRequestFilesChangedPanel";
 import { ProjectOriginReference } from "./ProjectOriginReference";
-import { ProfileIdentityButton } from "./ProjectProfileIdentity";
 import { ProjectRichContent } from "./ProjectRichContent";
 import { ShareLinkButton } from "./ShareLinkButton";
 
@@ -39,36 +30,23 @@ function commitDateLabel(timestamp: number) {
  */
 export function ProjectCommitDetailPanel({
   commit,
-  commitAuthorPubkeys,
   commitHash,
   diff,
   diffError,
   diffLoading,
   originAgentName,
   originChannelId,
-  profiles,
   project,
-  viewerGitIdentity,
 }: {
   commit: ProjectRepoCommit | null;
-  /** Signed commit-to-pubkey mapping derived from pull request events. */
-  commitAuthorPubkeys?: Map<string, string>;
   commitHash: string;
   diff: ProjectRepoDiff | null | undefined;
   diffError: unknown;
   diffLoading: boolean;
   originAgentName?: string | null;
   originChannelId?: string | null;
-  profiles?: UserProfileLookup;
   project: Repository;
-  viewerGitIdentity?: ViewerGitIdentity | null;
 }) {
-  const matchedProfile = commit
-    ? profileForCommit(commit, profiles, commitAuthorPubkeys, viewerGitIdentity)
-    : null;
-  const authorLabel = matchedProfile
-    ? resolveUserLabel({ pubkey: matchedProfile.pubkey, profiles })
-    : (commit?.authorName ?? commit?.authorEmail ?? "Unknown author");
   const shortHash = commit?.shortHash ?? commitHash.slice(0, 7);
 
   return (
@@ -89,16 +67,6 @@ export function ProjectCommitDetailPanel({
             />
           </h3>
           <p className="flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-muted-foreground">
-            <ProfileIdentityButton
-              avatarClassName="shrink-0"
-              avatarSize="xs"
-              avatarUrl={matchedProfile?.profile.avatarUrl ?? null}
-              isAgent={matchedProfile?.profile.isAgent === true}
-              label={authorLabel}
-              pubkey={matchedProfile?.pubkey ?? null}
-              showLabel={false}
-            />
-            <span className="font-medium text-foreground">{authorLabel}</span>
             <span>Committed</span>
             {commit ? (
               <span
@@ -124,13 +92,13 @@ export function ProjectCommitDetailPanel({
               />
             </span>
           </ProjectDetailMetaRow>
-          {commit ? (
+          {commit?.authorName ? (
             <ProjectDetailMetaRow icon={UserRound} label="Author">
               <span
                 className="min-w-0 truncate text-muted-foreground"
-                title={commit.authorEmail ?? undefined}
+                title={commit.authorEmail}
               >
-                {authorLabel}
+                {commit.authorName}
               </span>
             </ProjectDetailMetaRow>
           ) : null}

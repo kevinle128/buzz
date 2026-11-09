@@ -902,7 +902,7 @@ mod postgres_tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 86);
+        assert_eq!(migrations.len(), 88);
         assert!(migrations[83]
             .sql
             .as_str()
@@ -994,6 +994,16 @@ mod postgres_tests {
             .sql
             .as_str()
             .contains("CREATE FUNCTION profile_name_fields"));
+        // Fork-only migrations sit after the newest upstream version. When an
+        // upstream sync adds versions, move them past upstream again.
+        assert_eq!(migrations[86].version, 87);
+        assert_eq!(
+            &*migrations[86].description,
+            "workflow run route idempotency"
+        );
+        assert_eq!(migrations[87].version, 88);
+        assert_eq!(&*migrations[87].description, "app callback notifications");
+        assert!(migrations[87].sql.as_str().contains("CREATE TABLE apps"));
         assert_eq!(migrations[55].version, 56);
         assert!(migrations[55]
             .sql

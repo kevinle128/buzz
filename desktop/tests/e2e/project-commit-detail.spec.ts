@@ -1645,3 +1645,106 @@ test("navigating via a 30617 entity-link route opens the correct non-primary rep
     page.getByText("feature/entity-link-test").first(),
   ).toBeVisible();
 });
+
+test("empty projects keeps project creation available", async ({ page }) => {
+  await enableProjectsFeature(page);
+  await page.addInitScript(() => {
+    window.localStorage.setItem(
+      "buzz.projects.hidden-cards.v1",
+      JSON.stringify([
+        `30621:${"deadbeef".repeat(8)}:buzz`,
+        `30617:${"deadbeef".repeat(8)}:buzz`,
+        "30617:953d3363262e86b770419834c53d2446409db6d918a57f8f339d495d54ab001f:relay-tools",
+        "30617:bb22a5299220cad76ffd46190ccbeede8ab5dc260faa28b6e5a2cb31b9aff260:design-system",
+      ]),
+    );
+  });
+  await installMockBridge(page);
+  await page.goto("/", { waitUntil: "domcontentloaded" });
+  await page.getByTestId("open-projects-view").click();
+
+  await expect(
+    page.getByText("No projects yet", { exact: true }),
+  ).toBeVisible();
+  await page
+    .getByRole("main")
+    .getByRole("button", { name: "Create project" })
+    .click();
+  await expect(page.getByTestId("create-project-dialog")).toBeVisible();
+});
+
+test("create project dialog exposes an optional repository name", async ({
+  page,
+}) => {
+  await enableProjectsFeature(page);
+  await installMockBridge(page);
+  await page.goto("/", { waitUntil: "domcontentloaded" });
+  await page.getByTestId("open-projects-view").click();
+  await openCreateProjectDialog(page);
+
+  const repositoryName = page.getByTestId("create-project-repository-name");
+  await expect(page.getByTestId("create-project-dialog")).toBeVisible();
+  await expect(repositoryName).toBeVisible();
+  await expect(repositoryName).toHaveAttribute("placeholder", "bee-garden-ios");
+  await expect(repositoryName).toHaveValue("");
+
+  const label = page.locator("label[for='create-project-repository-name']");
+  await expect(label).toContainText("Repository name");
+  await expect(label).toContainText("Optional");
+  await expect(page.getByText("Defaults to the project name.")).toBeVisible();
+
+  const fieldOrder = await page
+    .locator("#create-project-form [data-testid]")
+    .evaluateAll((elements) =>
+      elements
+        .map((element) => element.getAttribute("data-testid"))
+        .filter((id): id is string => Boolean(id)),
+    );
+  expect(fieldOrder.indexOf("create-project-name")).toBeLessThan(
+    fieldOrder.indexOf("create-project-description"),
+  );
+  expect(fieldOrder.indexOf("create-project-description")).toBeLessThan(
+    fieldOrder.indexOf("create-project-repository-name"),
+  );
+
+  await page.getByTestId("create-project-name").fill("bee-garden");
+  await expect(page.getByTestId("create-project-submit")).toBeEnabled();
+
+  await repositoryName.fill("anhle128/buzz");
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("create-project-dialog")).toBeHidden();
+  await openCreateProjectDialog(page);
+  await expect(page.getByTestId("create-project-repository-name")).toHaveValue(
+    "",
+  );
+});
+
+test("project creation retry does not adopt a different existing repository", async ({
+  page,
+}) => {
+  await enableProjectsFeature(page);
+  await page.addInitScript(() => {
+    window.__BUZZ_E2E_REJECT_PROJECT_EVENT_KINDS__ = [30621];
+  });
+  await installMockBridge(page);
+  await page.goto("/", { waitUntil: "domcontentloaded" });
+  await page.getByTestId("open-projects-view").click();
+  await openCreateProjectDialog(page);
+  await page.getByTestId("create-project-name").fill("retry-repository-change");
+  const repositoryName = page.getByTestId("create-project-repository-name");
+  await repositoryName.fill("first/repository");
+  await page.getByTestId("create-project-submit").click();
+
+  await expect(page.getByTestId("create-project-dialog")).toBeVisible();
+  await expect(page.getByText("mock project event rejection")).toBeVisible();
+
+  await repositoryName.fill("buzz");
+  await page.getByTestId("create-project-submit").click();
+
+  await expect(page.getByTestId("create-project-dialog")).toBeVisible();
+  await expect(
+    page.getByText(
+      'A repository named "buzz" already exists (as a standalone repository or in another project). Choose a different name to avoid overwriting it.',
+    ),
+  ).toBeVisible();
+});

@@ -38,13 +38,17 @@ import {
   useRichTextEditor,
 } from "@/features/messages/lib/useRichTextEditor";
 import { FormattingToolbar } from "@/features/messages/ui/FormattingToolbar";
-import { TimelineMessageList } from "@/features/messages/ui/TimelineMessageList";
+import { MessageThreadTranscript } from "@/features/messages/ui/MessageThreadTranscript";
+import { ThreadRepliesErrorCard } from "@/features/messages/ui/MessageThreadReplyState";
 import type { TimelineMessage } from "@/features/messages/types";
 import { useThreadRepliesForRoots } from "@/features/messages/useThreadReplies";
 import { useProfileQuery, useUsersBatchQuery } from "@/features/profile/hooks";
 import type { Project } from "@/features/projects/hooks";
+import { pickDefaultProjectsAgent } from "@/features/projects/lib/projectAgentSelection";
 import { AgentContextPayloadPreview } from "./AgentContextPayloadPreview";
 import {
+  PROJECT_WORKSPACE_CONTEXT_MARKER,
+  splitProjectDetailAgentContext,
   UNTRUSTED_CONTEXT_NOTICE,
   untrustedPromptValue,
 } from "@/features/projects/lib/projectDetailAgentContext";
@@ -72,6 +76,7 @@ import {
 import { cn } from "@/shared/lib/cn";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import { Button } from "@/shared/ui/button";
+import { ProjectAgentSubmittedContextPill } from "./ProjectAgentSubmittedContextPill";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -84,9 +89,10 @@ import { UserAvatar } from "@/shared/ui/UserAvatar";
 export type AgentCandidate = {
   pubkey: string;
   name: string;
+  personaId?: string | null;
   /** Managed agents can be auto-started before the prompt is sent. */
   isManaged: boolean;
-  isActive: boolean;
+  isActive: boolean | null;
 };
 
 type ProjectAgentConversation = {
@@ -96,7 +102,6 @@ type ProjectAgentConversation = {
 };
 
 const MAX_CONTEXT_REPOS = 8;
-const REPO_CONTEXT_MARKER = "Workspace repositories:";
 
 /** Compact machine-readable footer so the agent can scope git queries
  * (repo announcements are addressable by these coordinates). Only sent
@@ -121,7 +126,7 @@ function repoContextBlock(projects: readonly Project[]) {
         `- ${untrustedPromptValue(repository.label)} (address: ${untrustedPromptValue(repository.repoAddress, 400)})`,
     );
   const remaining = repositories.length - listed.length;
-  return ["", "---", REPO_CONTEXT_MARKER, ...listed]
+  return ["", "---", PROJECT_WORKSPACE_CONTEXT_MARKER, ...listed]
     .concat(remaining > 0 ? [`…and ${remaining} more`] : [])
     .concat([UNTRUSTED_CONTEXT_NOTICE])
     .join("\n");
@@ -177,6 +182,7 @@ export function useAgentCandidates() {
     const candidates: AgentCandidate[] = managed.map((agent) => ({
       pubkey: normalizePubkey(agent.pubkey),
       name: agent.name,
+      personaId: agent.personaId,
       isManaged: true,
       isActive: isManagedAgentActive(agent),
     }));
@@ -187,12 +193,18 @@ export function useAgentCandidates() {
         pubkey,
         name: agent.name,
         isManaged: false,
-        isActive: agent.status !== "offline",
+        isActive:
+          agent.status === "unknown" ? null : agent.status !== "offline",
       });
     }
 
     return candidates.sort((left, right) => {
-      if (left.isActive !== right.isActive) return left.isActive ? -1 : 1;
+      // Unknown is neither offline nor proof that the agent can answer now.
+      const activityRank = (active: boolean | null) =>
+        active === true ? 0 : active === null ? 1 : 2;
+      const activityOrder =
+        activityRank(left.isActive) - activityRank(right.isActive);
+      if (activityOrder) return activityOrder;
       if (left.isManaged !== right.isManaged) return left.isManaged ? -1 : 1;
       return left.name.localeCompare(right.name);
     });
@@ -205,11 +217,9 @@ export function useAgentCandidates() {
 }
 
 /** Live message feed for the conversation's backing DM channel, reduced to
- * plain chat rows (kind 9 / 40002 only). The user's own messages render
- * verbatim — including any machine-appended context footer — so the exact
- * payload signed under the user's identity is always visible. Hiding it
- * while sending it would let relay-controlled metadata ride invisibly on
- * the user's signature. */
+ * plain chat rows (kind 9 / 40002 only). Machine-appended context stays
+ * inspectable beside the user's message, but defaults to a compact disclosure
+ * so the transcript foregrounds what the user actually typed. */
 export function ConversationThread({
   channel,
   agent,
@@ -280,12 +290,13 @@ export function ConversationThread({
       selfAvatarUrl,
     ],
   );
-  const messages = React.useMemo(() => {
+  const conversationMessages = React.useMemo(() => {
     const events = mergeProjectAgentConversationEvents(
       messagesQuery.data ?? [],
       threadReplies.events,
     );
-    return formatTimelineMessages(
+    const contexts = new Map<string, string>();
+    const messages = formatTimelineMessages(
       events,
       channel,
       currentPubkey ?? undefined,
@@ -297,15 +308,35 @@ export function ConversationThread({
       relaySelfPubkey,
       undefined,
       apps,
-    ).filter(
-      (message) =>
-        (message.kind === KIND_STREAM_MESSAGE ||
-          message.kind === KIND_STREAM_MESSAGE_V2) &&
-        isAtOrAfterConversationOpener(
-          { created_at: message.createdAt, id: message.id, tags: message.tags },
-          opener,
-        ),
-    );
+    )
+      .filter(
+        (message) =>
+          (message.kind === KIND_STREAM_MESSAGE ||
+            message.kind === KIND_STREAM_MESSAGE_V2) &&
+          isAtOrAfterConversationOpener(
+            {
+              created_at: message.createdAt,
+              id: message.id,
+              tags: message.tags,
+            },
+            opener,
+          ),
+      )
+      .map((message) => {
+        const authorPubkey = message.signerPubkey ?? message.pubkey;
+        if (
+          !normalizedCurrent ||
+          !authorPubkey ||
+          normalizePubkey(authorPubkey) !== normalizedCurrent
+        ) {
+          return message;
+        }
+        const split = splitProjectDetailAgentContext(message.body);
+        if (!split.context) return message;
+        contexts.set(message.id, split.context);
+        return { ...message, body: split.message };
+      });
+    return { contexts, messages };
   }, [
     apps,
     channel,
@@ -316,10 +347,17 @@ export function ConversationThread({
     selfAvatarUrl,
     threadReplies.events,
     opener,
+    normalizedCurrent,
   ]);
-  const conversationEntries = React.useMemo(
-    () => messages.map((message) => ({ message, summary: null })),
-    [messages],
+  const messages = conversationMessages.messages;
+  const renderSubmittedContext = React.useCallback(
+    (message: TimelineMessage) => {
+      const payload = conversationMessages.contexts.get(message.id);
+      return payload ? (
+        <ProjectAgentSubmittedContextPill payload={payload} />
+      ) : null;
+    },
+    [conversationMessages.contexts],
   );
   const lastMessageId = messages[messages.length - 1]?.id ?? null;
   const handleToggleReaction = React.useCallback(
@@ -339,18 +377,17 @@ export function ConversationThread({
 
   return (
     <div data-project-agent-channel-id={channel.id}>
-      <TimelineMessageList
+      <MessageThreadTranscript
         channelId={channel.id}
-        channelName={agent.name}
-        channelType="dm"
         currentPubkey={currentPubkey ?? undefined}
-        hideDayDividers
-        mainEntries={conversationEntries}
         messages={messages}
         onToggleReaction={handleToggleReaction}
         profiles={profiles}
-        useVirtualizer={false}
+        renderAfterMessage={renderSubmittedContext}
       />
+      {threadReplies.isError ? (
+        <ThreadRepliesErrorCard onRetry={threadReplies.refetch} />
+      ) : null}
       {agentWorking.working ? (
         <div className="flex items-center gap-2 pl-11 text-sm text-muted-foreground">
           <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -456,8 +493,7 @@ export function ProjectsAgentPromptPage({
   const selectedAgent =
     conversation?.agent ??
     candidates.find((candidate) => candidate.pubkey === selectedPubkey) ??
-    candidates[0] ??
-    null;
+    pickDefaultProjectsAgent(candidates);
   const richText = useRichTextEditor({
     editable: !isSending,
     onEditLink: (info) => onEditLinkRef.current?.(info),
@@ -653,6 +689,7 @@ export function ProjectsAgentPromptPage({
                         avatarUrl={avatarUrlFor(selectedAgent.pubkey)}
                         className="shrink-0"
                         displayName={selectedAgent.name}
+                        shape="squircle"
                         size="xs"
                       />
                     ) : null}
@@ -679,19 +716,22 @@ export function ProjectsAgentPromptPage({
                           avatarUrl={avatarUrlFor(candidate.pubkey)}
                           className="mr-2 shrink-0"
                           displayName={candidate.name}
+                          shape="squircle"
                           size="xs"
                         />
                         <span className="min-w-0 truncate">
                           {candidate.name}
                         </span>
-                        <span
-                          className={cn(
-                            "ml-2 h-1.5 w-1.5 shrink-0 rounded-full",
-                            candidate.isActive
-                              ? "bg-emerald-500"
-                              : "bg-muted-foreground/40",
-                          )}
-                        />
+                        {candidate.isActive !== null ? (
+                          <span
+                            className={cn(
+                              "ml-2 h-1.5 w-1.5 shrink-0 rounded-full",
+                              candidate.isActive
+                                ? "bg-emerald-500"
+                                : "bg-muted-foreground/40",
+                            )}
+                          />
+                        ) : null}
                       </DropdownMenuRadioItem>
                     ))}
                   </DropdownMenuRadioGroup>

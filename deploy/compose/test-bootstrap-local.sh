@@ -40,9 +40,9 @@ grep -Eq '^BUZZ_RELAY_PRIVATE_KEY=[0-9a-f]{64}$' "${env_file}"
 grep -Eq '^POSTGRES_PASSWORD=[0-9a-f]{64}$' "${env_file}"
 grep -Eq '^BUZZ_S3_ACCESS_KEY=buzz[0-9a-f]{24}$' "${env_file}"
 
-checksum_before="$(shasum -a 256 "${env_file}")"
+checksum_before="$(cksum "${env_file}")"
 expect_failure "${TEST_DIR}/bootstrap-local.sh" relay-node.example.ts.net "${owner_pubkey}" >/dev/null 2>&1
-[[ "$(shasum -a 256 "${env_file}")" == "${checksum_before}" ]]
+[[ "$(cksum "${env_file}")" == "${checksum_before}" ]]
 
 rm "${env_file}"
 expect_failure "${TEST_DIR}/bootstrap-local.sh" 'https://bad.example' "${owner_pubkey}" >/dev/null 2>&1

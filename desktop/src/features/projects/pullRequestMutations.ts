@@ -3,6 +3,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { isGitHubCloneUrl } from "@/features/projects/lib/projectGitError";
 import {
   githubPullRequestId,
+  parseGithubPullRequestNumber,
   requireNostrPullRequestId,
 } from "@/features/projects/lib/projectGithubPullRequests";
 import {
@@ -192,7 +193,14 @@ export async function publishProjectPullRequestUpdate({
   project: Project;
   pullRequest: ProjectPullRequest;
 }): Promise<boolean> {
-  if (isGitHubCloneUrl(project.cloneUrls[0])) return false;
+  // GitHub pull requests never take Nostr updates; Buzz reviews on a
+  // GitHub-hosted repository still do.
+  if (
+    isGitHubCloneUrl(project.cloneUrls[0]) &&
+    parseGithubPullRequestNumber(pullRequest.id) !== null
+  ) {
+    return false;
+  }
   const pullRequestId = requireNostrPullRequestId(pullRequest.id);
   if (pullRequest.commit?.toLowerCase() === commit.toLowerCase()) return false;
   const identity = await getIdentity();

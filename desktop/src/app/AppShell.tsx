@@ -21,6 +21,8 @@ import { useChannelBrowserDialog } from "@/app/useChannelBrowserDialog";
 import { useMarkAsReadShortcuts } from "@/app/useMarkAsReadShortcuts";
 import { useSettingsShortcuts } from "@/app/useSettingsShortcuts";
 import { useAppShellKeyboardShortcuts } from "@/app/useAppShellKeyboardShortcuts";
+import { useAppsQuery } from "@/features/apps/hooks/useAppsQuery";
+import { useRelaySelfQuery } from "@/features/moderation/hooks";
 import { useAppShellDesktopNotifications } from "@/app/useAppShellDesktopNotifications";
 import { useAppShellLifecycleEffects } from "@/app/useAppShellLifecycleEffects";
 import { useChannelActivityProjection } from "@/app/useChannelActivityProjection";
@@ -456,6 +458,8 @@ export function AppShell() {
     unreadThreadFeedItems,
   ]);
 
+  const apps = useAppsQuery().data;
+  const relaySelfPubkey = useRelaySelfQuery().data;
   const { homeBadgeCount, homeBadgeCountExcludingHighPriority } =
     useHomeFeedNotificationState(
       homeFeedQuery.data,
@@ -475,6 +479,8 @@ export function AppShell() {
       getMessageReadAt,
       channels,
       huddleBackingChannelIds,
+      apps,
+      relaySelfPubkey,
     );
   const dueReminderBadge = useDueReminderBadgeCount(
     identityQuery.data?.pubkey,

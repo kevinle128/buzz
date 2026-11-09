@@ -155,6 +155,23 @@ test("notification activation starts routing before a hung reveal", async () => 
   assert.equal(navigationSettled, true);
 });
 
+test("agent-scoped notification activation opens the agent activity panel", async () => {
+  const calls = [];
+  await activateDesktopNotificationTarget(
+    { agentPubkey: "agent", channelId: "channel" },
+    {
+      goChannel: async () => calls.push("channel"),
+      goHome: async () => calls.push("home"),
+      openAgentActivity: (pubkey, options) =>
+        calls.push(`agent:${pubkey}:${options.channelId}`),
+      openSearchHit: async () => calls.push("message"),
+      revealWindow: async () => calls.push("reveal"),
+    },
+  );
+
+  assert.deepEqual(calls, ["agent:agent:channel", "reveal"]);
+});
+
 test("notification activation falls back to forced channel navigation", async () => {
   const calls = [];
   await activateDesktopNotificationTarget(

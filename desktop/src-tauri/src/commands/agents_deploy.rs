@@ -46,6 +46,11 @@ pub(crate) fn resolve_deploy_model_provider(
 /// `descriptor.env` is the authoritative six-layer environment for ordinary
 /// values. Desktop-owned settings are reserved, stripped from that layer, and
 /// emitted through `policy_env` so local and provider launches agree.
+///
+/// `effective_permission_policy` is the already-resolved per-agent → global →
+/// built-in policy, so this function does not need the global config. `None`
+/// falls back to the built-in default.
+#[allow(clippy::too_many_arguments)]
 fn build_launch_block_for_policy(
     record: &ManagedAgentRecord,
     descriptor: &crate::managed_agents::readiness::EffectiveHarnessDescriptor,
@@ -54,6 +59,7 @@ fn build_launch_block_for_policy(
     effective_model: Option<&str>,
     owner_pubkey: &str,
     session_policy: crate::managed_agents::AcpSessionPolicy,
+    effective_permission_policy: Option<crate::managed_agents::permission_policy::PermissionPolicy>,
 ) -> serde_json::Value {
     use crate::managed_agents::{
         known_acp_runtime, resolve_session_title, DISPLAY_NAME_ENV_VAR, SESSION_TITLE_ENV_VAR,
@@ -121,6 +127,14 @@ fn build_launch_block_for_policy(
         policy_env.insert("BUZZ_ACP_TEAM_INSTRUCTIONS".into(), value);
     }
 
+    let permission_policy = effective_permission_policy.unwrap_or_else(
+        crate::managed_agents::permission_policy::PermissionPolicy::desktop_default,
+    );
+    policy_env.insert(
+        "BUZZ_ACP_PERMISSION_POLICY".into(),
+        permission_policy.as_str().to_string(),
+    );
+
     // B2 remote parity: mirror the local A1 model authority. For a Claude
     // launch, ALWAYS strip BOTH BUZZ_ACP_MODEL and ANTHROPIC_MODEL from
     // launch.env — the resolved canonical model rides policy_env.ANTHROPIC_MODEL
@@ -174,6 +188,7 @@ pub(super) fn build_launch_block(
         effective_model,
         owner_pubkey,
         crate::managed_agents::AcpSessionPolicy::Channel,
+        None,
     )
 }
 
@@ -216,6 +231,10 @@ pub(crate) fn build_deploy_payload<R: tauri::Runtime>(
         crate::managed_agents::resolve_effective_harness_descriptor(record, &personas, &global)
             .map_err(|error| crate::managed_agents::user_facing_harness_error(&error))?;
     let owner_pubkey = super::workspace_owner_hex(state)?;
+    let (effective_permission_policy, _) =
+        crate::managed_agents::permission_policy::resolve_effective_permission_policy(
+            record, &global,
+        );
     let launch = build_launch_block_for_policy(
         record,
         &descriptor,
@@ -224,6 +243,7 @@ pub(crate) fn build_deploy_payload<R: tauri::Runtime>(
         effective.model.value.as_deref(),
         &owner_pubkey,
         crate::managed_agents::effective_acp_session_policy(record, &personas),
+        Some(effective_permission_policy),
     );
 
     let effective_parallelism =
@@ -385,6 +405,7 @@ mod tests {
             None,
             "owner-hex",
             crate::managed_agents::AcpSessionPolicy::Thread,
+            None,
         );
 
         assert_eq!(launch["policy_env"]["BUZZ_ACP_SESSION_POLICY"], "thread");
