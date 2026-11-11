@@ -110,6 +110,11 @@ if (args[0] === "issue" && args[1] === "list") {
   console.log("https://github.com/kevinle128/buzz/issues/31");
 } else if (args[0] === "api" && args[1].endsWith("/pulls")) {
   console.log(JSON.stringify(state.pulls));
+} else if (args[0] === "api" && args[1].endsWith("/git/refs") && state.refSha) {
+  console.error("Reference already exists (HTTP 422)");
+  process.exit(1);
+} else if (args[0] === "api" && args[1].includes("/git/ref/")) {
+  console.log(state.refSha);
 } else if (args[0] === "api") {
   console.log("{}");
 }
@@ -117,7 +122,7 @@ if (args[0] === "issue" && args[1] === "list") {
 
 function runScript(
   script,
-  { issues = [], pulls = [], env = {}, cwd, path = [] } = {},
+  { issues = [], pulls = [], refSha = null, env = {}, cwd, path = [] } = {},
 ) {
   const directory = mkdtempSync(join(tmpdir(), "fork-workflow-"));
   try {
@@ -126,7 +131,10 @@ function runScript(
     writeFileSync(join(directory, "gh"), fakeGh, { mode: 0o755 });
     writeFileSync(join(directory, "script.sh"), script);
     writeFileSync(outputPath, "");
-    writeFileSync(statePath, JSON.stringify({ issues, pulls, calls: [] }));
+    writeFileSync(
+      statePath,
+      JSON.stringify({ issues, pulls, refSha, calls: [] }),
+    );
     const result = spawnSync("bash", [join(directory, "script.sh")], {
       cwd: cwd ?? directory,
       encoding: "utf8",
@@ -238,12 +246,28 @@ test("only a real run pushes main, with the push token in that one step, and rel
     push,
     /if: steps\.merge\.outputs\.merged == 'true' && steps\.inputs\.outputs\.test != 'true'/,
   );
+  // The push token goes to two steps only: the push of main and the test
+  // base branch of a test run.
   assert.equal(
     syncWorkflow.split("secrets.SYNC_PUSH_TOKEN").length,
-    2,
-    "one use of the push token",
+    3,
+    "two uses of the push token",
   );
   assert.match(push, /SYNC_PUSH_TOKEN: \$\{\{ secrets\.SYNC_PUSH_TOKEN \}\}/);
+  const testBase = stepBlock(syncWorkflow, "test_base");
+  assert.match(
+    testBase,
+    /if: \$\{\{ failure\(\) && steps\.inputs\.outputs\.test == 'true' && /,
+  );
+  assert.match(testBase, /GH_TOKEN: \$\{\{ secrets\.SYNC_PUSH_TOKEN \}\}/);
+  assert.match(
+    stepBlock(syncWorkflow, "issue"),
+    /if: \$\{\{ failure\(\) && steps\.test_base\.outcome != 'failure' && /,
+  );
+  assert.doesNotMatch(
+    stepBlock(syncWorkflow, "issue"),
+    /SYNC_PUSH_TOKEN|git\/refs/,
+  );
   assert.match(
     stepBlock(syncWorkflow, "release"),
     /if: steps\.merge\.outputs\.changed == 'true' && steps\.inputs\.outputs\.test != 'true'\n[\s\S]*run: scripts\/fork-desktop-release-tag\.sh "\$\(git rev-parse HEAD\)"/,
@@ -509,21 +533,79 @@ test("a clean merge passes on green checks and blocks like a conflict on failed 
   }
 });
 
-test("a test issue gets its base branch and the force label goes on at creation", async (t) => {
+test("a test run creates only a sync-test base branch, at the replayed commit", async (t) => {
+  const testBase = stepRunScript(syncWorkflow, "test_base");
+  const sha = "c".repeat(40);
+  const create = (ref) => [
+    "api",
+    "repos/kevinle128/buzz/git/refs",
+    "-f",
+    `ref=refs/heads/${ref}`,
+    "-f",
+    `sha=${sha}`,
+  ];
+  for (const scenario of [
+    {
+      name: "new test base",
+      ref: "sync-test/20261111-7-base",
+      status: 0,
+      created: true,
+    },
+    {
+      name: "rerun finds the branch at the same commit",
+      ref: "sync-test/20261111-7-base",
+      refSha: sha,
+      status: 0,
+      created: true,
+    },
+    {
+      name: "branch exists at another commit",
+      ref: "sync-test/20261111-7-base",
+      refSha: "d".repeat(40),
+      status: 1,
+      created: true,
+    },
+    { name: "main is never created", ref: "main", status: 1, created: false },
+    {
+      name: "a token is required",
+      ref: "sync-test/20261111-7-base",
+      token: "",
+      status: 1,
+      created: false,
+    },
+  ]) {
+    await t.test(scenario.name, () => {
+      const result = runScript(testBase, {
+        refSha: scenario.refSha ?? null,
+        env: {
+          GH_TOKEN: scenario.token ?? "token",
+          GH_REPO: "kevinle128/buzz",
+          FORK_REF: scenario.ref,
+          TEST_FORK_SHA: sha,
+        },
+      });
+      assert.equal(result.status, scenario.status, result.stdout);
+      const refs = result.calls.filter(
+        (call) => call[0] === "api" && call[1].endsWith("/git/refs"),
+      );
+      assert.deepEqual(refs, scenario.created ? [create(scenario.ref)] : []);
+    });
+  }
+});
+
+test("a test issue gets the test label and the force label goes on at creation", async (t) => {
   const issue = stepRunScript(syncWorkflow, "issue");
   for (const scenario of [
     {
       name: "real issue",
       test: "false",
       force: "",
-      branch: false,
       labels: ["upstream-sync-conflict"],
     },
     {
       name: "test issue with forced review",
       test: "true",
       force: "true",
-      branch: true,
       labels: [
         "upstream-sync-conflict",
         "sync-test",
@@ -547,31 +629,15 @@ test("a test issue gets its base branch and the force label goes on at creation"
             GITHUB_SERVER_URL: "https://github.com",
             LABEL: "upstream-sync-conflict",
             FORCE_HUMAN_REVIEW: scenario.force,
-            FORK_REF:
-              scenario.test === "true" ? "sync-test/20261111-7-base" : "main",
             TEST: scenario.test,
-            TEST_FORK_SHA: scenario.test === "true" ? "c".repeat(40) : "",
             RUN_URL: "https://example.test/run/1",
           },
         });
         assert.equal(result.status, 0, result.stdout);
-        const refs = result.calls.filter(
-          (call) => call[0] === "api" && call[1].endsWith("/git/refs"),
-        );
-        assert.deepEqual(
-          refs,
-          scenario.branch
-            ? [
-                [
-                  "api",
-                  "repos/kevinle128/buzz/git/refs",
-                  "-f",
-                  "ref=refs/heads/sync-test/20261111-7-base",
-                  "-f",
-                  `sha=${"c".repeat(40)}`,
-                ],
-              ]
-            : [],
+        assert.equal(
+          result.calls.some((call) => call[0] === "api"),
+          false,
+          "the issue step creates no ref",
         );
         const create = result.calls.find(
           (call) => call[0] === "issue" && call[1] === "create",
