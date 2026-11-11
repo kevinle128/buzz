@@ -1486,14 +1486,25 @@ async fn handle_agent_observer_event(
         );
         let agent_bytes = route.agent.to_bytes().to_vec();
         let owner_bytes = route.owner.to_bytes().to_vec();
-        let cache_key = (conn.tenant.community(), agent_bytes.clone(), owner_bytes.clone());
+        let cache_key = (
+            conn.tenant.community(),
+            agent_bytes.clone(),
+            owner_bytes.clone(),
+        );
         let is_owner = if session_owner_match {
             true
         } else {
             match state.observer_owner_cache.get(&cache_key) {
                 Some(cached) => cached,
-                None => match state.db.is_agent_owner(conn.tenant.community(), &agent_bytes, &owner_bytes).await {
-                    Ok(v) => { state.observer_owner_cache.insert(cache_key, v); v }
+                None => match state
+                    .db
+                    .is_agent_owner(conn.tenant.community(), &agent_bytes, &owner_bytes)
+                    .await
+                {
+                    Ok(v) => {
+                        state.observer_owner_cache.insert(cache_key, v);
+                        v
+                    }
                     Err(e) => {
                         warn!(conn_id = %conn_id, event_id = %event_id_hex, "agent observer owner check failed: {e}");
                         write.ok(&conn, event_id_hex, false, "error: internal server error");
@@ -1504,7 +1515,12 @@ async fn handle_agent_observer_event(
         };
         if !is_owner {
             reject("auth");
-            write.ok(&conn, event_id_hex, false, "restricted: observer frame is not authorized for this agent owner");
+            write.ok(
+                &conn,
+                event_id_hex,
+                false,
+                "restricted: observer frame is not authorized for this agent owner",
+            );
             return;
         }
     }

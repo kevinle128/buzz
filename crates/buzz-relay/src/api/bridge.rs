@@ -7,8 +7,8 @@ mod membership_snapshot;
 mod read_state_snapshot;
 pub(crate) mod search_slots;
 
-use std::sync::Arc;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use axum::{
     body::Body,
@@ -2874,9 +2874,13 @@ pub async fn app_callback(
     headers: HeaderMap,
     request: axum::http::Request<Body>,
 ) -> impl IntoResponse {
-    let peer_ip = request.extensions().get::<ConnectInfo<SocketAddr>>()
-        .map(|info| info.0.ip()).unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
-    crate::app_sink::handle_app_callback(state, peer_ip, app_id_str, headers, request.into_body()).await
+    let peer_ip = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|info| info.0.ip())
+        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+    crate::app_sink::handle_app_callback(state, peer_ip, app_id_str, headers, request.into_body())
+        .await
 }
 
 /// Webhook trigger endpoint. No user auth — the webhook secret authenticates the caller.

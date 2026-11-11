@@ -50,12 +50,12 @@ mod store;
 pub mod app;
 /// Serialized idempotent admission for App callback deliveries.
 pub mod app_admission;
+/// Concurrency caps whose limit can change at runtime.
+pub mod concurrency_gate;
 /// Unlimited latest live global parameterized heads (NIP-33 kinds 30617/30621).
 pub mod project_heads;
 /// Serialized idempotent admission for dynamically routed webhook workflow runs.
 pub mod workflow_admission;
-/// Concurrency caps whose limit can change at runtime.
-pub mod concurrency_gate;
 
 /// Database error types.
 pub mod error;
