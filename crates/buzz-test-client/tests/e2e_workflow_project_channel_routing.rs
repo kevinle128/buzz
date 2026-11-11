@@ -424,10 +424,10 @@ async fn create_foreign_channel(pool: &sqlx::PgPool, channel_id: Uuid, keys: &Ke
     let host = format!("foreign-{}.example.test", Uuid::new_v4());
     let owner = Keys::generate();
     let created = db
-        .create_community_with_owner(&host, &owner.public_key().to_hex())
+        .create_community_with_owner(&host, &owner.public_key().to_hex(), &Keys::generate())
         .await
         .unwrap_or_else(|e| panic!("create foreign community: {e}"));
-    let community_id = match created {
+    let community_id = match created.outcome {
         CreateCommunityWithOwnerResult::Created(record) => record.id,
         other => panic!("expected Created foreign community, got {other:?}"),
     };

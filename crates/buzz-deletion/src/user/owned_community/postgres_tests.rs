@@ -76,6 +76,7 @@ fn media(endpoint: String) -> Arc<MediaStorage> {
             s3_secret_key: "test".into(),
             s3_bucket: "test".into(),
             s3_region: "us-east-1".into(),
+            s3_prefix: String::new(),
             s3_addressing_style: S3AddressingStyle::Path,
             max_image_bytes: 1,
             max_gif_bytes: 1,

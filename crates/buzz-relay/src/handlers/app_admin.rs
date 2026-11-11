@@ -419,9 +419,7 @@ mod tests {
             .expect("ensure community");
         let tenant = TenantContext::resolved(record.id, host);
 
-        let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
-            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
-            .expect("redis pool config");
+        let redis_pool = buzz_pubsub::redis_connection(&config.redis_url).expect("redis pool");
         let pubsub = Arc::new(
             buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
                 .await
@@ -453,8 +451,15 @@ mod tests {
     async fn seed_role(state: &AppState, tenant: &TenantContext, keys: &Keys, role: &str) {
         state
             .db
-            .add_relay_member(tenant.community(), &keys.public_key().to_hex(), role, None)
+            .add_relay_member(
+                tenant.community(),
+                &keys.public_key().to_hex(),
+                role,
+                None,
+                &state.relay_keypair,
+            )
             .await
+            .map(|write| write.outcome)
             .expect("seed relay member");
     }
 
@@ -629,6 +634,7 @@ mod tests {
                 panic!("canvas conflict: {message}")
             }
             IngestError::Internal(message) => panic!("internal error: {message}"),
+            IngestError::Ban { .. } => panic!("member must be rejected, not refused as banned"),
         }
         let apps = state
             .db

@@ -190,9 +190,16 @@ async fn seed_owner(pool: &sqlx::PgPool, community_id: Uuid, keys: &Keys) {
     db.ensure_user(community, &pubkey_bytes(keys))
         .await
         .unwrap_or_else(|e| panic!("ensure owner user: {e}"));
-    db.add_relay_member(community, &keys.public_key().to_hex(), "owner", None)
-        .await
-        .unwrap_or_else(|e| panic!("add owner member: {e}"));
+    db.add_relay_member(
+        community,
+        &keys.public_key().to_hex(),
+        "owner",
+        None,
+        &Keys::generate(),
+    )
+    .await
+    .map(|write| write.outcome)
+    .unwrap_or_else(|e| panic!("add owner member: {e}"));
 }
 
 fn parse_command_response(body: &Value) -> Value {
@@ -799,10 +806,14 @@ async fn malformed_uuid_and_disabled_and_foreign_apps_are_not_found() {
     let host = format!("foreign-{}.example.test", Uuid::new_v4());
     let foreign_owner = Keys::generate();
     let created = db
-        .create_community_with_owner(&host, &foreign_owner.public_key().to_hex())
+        .create_community_with_owner(
+            &host,
+            &foreign_owner.public_key().to_hex(),
+            &Keys::generate(),
+        )
         .await
         .expect("foreign community");
-    let foreign_community = match created {
+    let foreign_community = match created.outcome {
         buzz_db::CreateCommunityWithOwnerResult::Created(record) => record.id,
         other => panic!("expected Created, got {other:?}"),
     };

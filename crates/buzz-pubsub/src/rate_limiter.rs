@@ -167,25 +167,23 @@ mod tests {
 
         let redis_url =
             std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
-        let pool = deadpool_redis::Config::from_url(redis_url)
-            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
-            .expect("redis pool");
+        let pool = crate::redis_connection(&redis_url).expect("redis connection");
         let limiter = RedisRateLimiter::new(pool.clone());
         for key in [&base, &different_community, &different_app, &different_ip] {
             limiter
                 .check_named_key(key, 60, 60)
                 .await
                 .expect("named App callback key must be admitted through the shared limiter");
-            let mut conn = pool.get().await.expect("redis conn");
+            let mut conn = pool.clone();
             let exists: i64 = redis::cmd("EXISTS")
                 .arg(key)
-                .query_async(&mut *conn)
+                .query_async(&mut conn)
                 .await
                 .expect("exists");
             assert_eq!(exists, 1, "exact key {key} must be the Redis counter");
             let _: () = redis::cmd("DEL")
                 .arg(key)
-                .query_async(&mut *conn)
+                .query_async(&mut conn)
                 .await
                 .expect("cleanup");
         }
