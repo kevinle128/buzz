@@ -748,7 +748,7 @@ pub enum MessagesCmd {
         #[arg(long)]
         reply_to: Option<String>,
     },
-    /// Edit a previously sent message
+    /// Edit a previously sent message by its event ID
     Edit {
         /// Event ID of the message to edit (64-char hex)
         #[arg(long)]
