@@ -1,20 +1,23 @@
 name: Fork Upstream Sync
 
-# Entry point of the fork's daily upstream sync. GitHub dispatches a workflow
-# from a branch only when the same file exists on the default branch, so this
-# file comes first with a manual trigger and no work. The sync itself replaces
-# this file. Only the fork runs this.
+# Merges block/buzz main into the fork's main every day, checks the merge,
+# pushes it, tags the next fork desktop release and starts MF Desktop Build.
+# A conflict, or a clean merge whose checks fail, opens one issue and reports
+# it through Buzz instead, and nothing is pushed. Only the fork runs this.
 
 on:
+  schedule:
+    # 21:17 UTC is 04:17 in Asia/Saigon.
+    - cron: "17 21 * * *"
   workflow_dispatch:
     inputs:
       force_build:
-        description: "Build even when upstream has nothing new and the fork has no unreleased commit."
+        description: "Release the fork head even when upstream has nothing new and the fork has no unreleased commit."
         required: false
         default: false
         type: boolean
       test_fork_sha:
-        description: "Test only: replay a conflict from this fork commit (40-character SHA). A test run never pushes or builds."
+        description: "Test only: replay a merge from this fork commit (40-character SHA). A test run never pushes to main, tags or builds."
         required: false
         default: ""
         type: string
@@ -29,14 +32,532 @@ on:
         default: false
         type: boolean
 
+# Two syncs must never overlap: both would merge and push main.
+concurrency:
+  group: fork-upstream-sync
+  cancel-in-progress: false
+
 permissions:
   contents: read
+
+env:
+  UPSTREAM_URL: https://github.com/block/buzz.git
+  UPSTREAM_REPO: block/buzz
+  CARGO_TERM_COLOR: never
 
 jobs:
   sync:
     if: github.repository == 'kevinle128/buzz'
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # A cold `cargo check --workspace --all-targets` sets this limit.
+    timeout-minutes: 90
+    permissions:
+      # Creates release tags and test base branches through the API. The push
+      # to main uses SYNC_PUSH_TOKEN, because GITHUB_TOKEN cannot push a merge
+      # that changes files under .github/workflows.
+      contents: write
+      issues: write
+      # Starts MF Desktop Build on the new tag.
+      actions: write
     steps:
-      - name: Report that the sync is not installed
-        run: echo "The upstream sync is not installed on this branch yet; nothing to do."
+      # A real run always merges into main and pushes HEAD:main, so it checks
+      # out main. A test run checks out the commit it was started from, so it
+      # uses the scripts of that commit and never pushes main. Only the push
+      # step gets a token that can write the repository.
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ (inputs.test_fork_sha != '' || inputs.test_upstream_sha != '') && github.sha || 'main' }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # A test run replays a known merge to prove the conflict and check paths.
+      # It never pushes main, tags or builds, so both test SHAs must be given
+      # together. Its issue names a test base branch, so a test resolve opens
+      # its pull request into that branch and never into main.
+      - name: Check test inputs
+        id: inputs
+        env:
+          TEST_FORK_SHA: ${{ inputs.test_fork_sha }}
+          TEST_UPSTREAM_SHA: ${{ inputs.test_upstream_sha }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$TEST_FORK_SHA" && -z "$TEST_UPSTREAM_SHA" ]]; then
+            echo "test=false" >> "$GITHUB_OUTPUT"
+            echo "fork_ref=main" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          sha='^[0-9a-f]{40}$'
+          if ! [[ "$TEST_FORK_SHA" =~ $sha && "$TEST_UPSTREAM_SHA" =~ $sha ]]; then
+            echo "::error::A test run needs both test_fork_sha and test_upstream_sha as 40-character SHAs."
+            exit 1
+          fi
+          echo "Test run: replay fork ${TEST_FORK_SHA:0:9} with upstream ${TEST_UPSTREAM_SHA:0:9}. Main is not pushed, nothing is tagged or built."
+          echo "test=true" >> "$GITHUB_OUTPUT"
+          echo "fork_ref=sync-test/$(TZ=Asia/Saigon date +%Y%m%d)-${GITHUB_RUN_NUMBER}-base" >> "$GITHUB_OUTPUT"
+
+      # While a conflict issue is open, its resolution is in progress, so a
+      # scheduled run stops here. A manual run goes on: the manual fix path in
+      # the issue dispatches the sync to close the issue. A test issue never
+      # pauses the real sync, and a real issue never pauses a test run.
+      - name: Check pause
+        id: pause
+        if: github.event_name == 'schedule' || steps.inputs.outputs.test == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TEST: ${{ steps.inputs.outputs.test }}
+        run: |
+          set -euo pipefail
+          open="$(gh issue list --label upstream-sync-conflict --state open --json number,url,labels \
+            | jq -r --arg test "$TEST" \
+              '[.[] | select(any(.labels[]; .name == "sync-test") == ($test == "true"))][0] // empty | "\(.number) \(.url)"')"
+          if [[ -n "$open" ]]; then
+            echo "Sync paused: conflict issue #${open%% *} is open (${open#* }). It closes when the resolution merges."
+            echo "paused=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge upstream
+        id: merge
+        if: steps.pause.outputs.paused != 'true'
+        env:
+          FORCE_BUILD: ${{ inputs.force_build }}
+          FORK_REPO: ${{ github.repository }}
+          FORK_REF: ${{ steps.inputs.outputs.fork_ref }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TEST: ${{ steps.inputs.outputs.test }}
+          TEST_FORK_SHA: ${{ inputs.test_fork_sha }}
+          TEST_UPSTREAM_SHA: ${{ inputs.test_upstream_sha }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch --no-tags upstream main
+          report_script="${GITHUB_WORKSPACE}/scripts/fork-sync-conflict-report.mjs"
+
+          if [[ "$TEST" == "true" ]]; then
+            for commit in "$TEST_FORK_SHA" "$TEST_UPSTREAM_SHA"; do
+              if ! git cat-file -e "${commit}^{commit}"; then
+                echo "::error::${commit} is not a commit of the fork or of upstream main."
+                exit 1
+              fi
+            done
+            # The replay gets its own worktree, so this job keeps today's scripts
+            # and actions while the old fork commit may have none of them.
+            upstream_ref="$TEST_UPSTREAM_SHA"
+            workdir="${RUNNER_TEMP}/replay"
+            git worktree add --detach "$workdir" "$TEST_FORK_SHA"
+            cd "$workdir"
+          else
+            upstream_ref=upstream/main
+            workdir="$GITHUB_WORKSPACE"
+          fi
+          echo "workdir=${workdir}" >> "$GITHUB_OUTPUT"
+          echo "upstream_ref=${upstream_ref}" >> "$GITHUB_OUTPUT"
+
+          new_upstream="$(git rev-parse --short=9 "$upstream_ref")"
+          old_upstream="$(git rev-parse --short=9 "$(git merge-base HEAD "$upstream_ref")")"
+          count="$(git rev-list --count "HEAD..${upstream_ref}")"
+          if [[ "$count" == "0" ]]; then
+            range="no new upstream commits (at ${new_upstream})"
+          else
+            range="${old_upstream}..${new_upstream} (${count} commits)"
+          fi
+          echo "range=${range}" >> "$GITHUB_OUTPUT"
+
+          if [[ "$TEST" != "true" ]]; then
+            # Any commit after the newest fork release tag on main is unreleased,
+            # including a merge that was pushed earlier and whose build failed.
+            last_tag="$(git describe --tags --abbrev=0 --match 'desktop-v*-mf.*' HEAD 2>/dev/null || true)"
+            if [[ -z "$last_tag" ]]; then
+              unreleased=1
+            else
+              unreleased="$(git rev-list --count "${last_tag}..HEAD")"
+            fi
+
+            if [[ "$count" == "0" && "$unreleased" == "0" && "$FORCE_BUILD" != "true" ]]; then
+              echo "No changes: upstream has nothing new and ${last_tag} is the fork head."
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+
+            if [[ "$count" == "0" ]]; then
+              echo "Upstream is already merged; releasing the fork head."
+              exit 0
+            fi
+          fi
+
+          if git merge --no-edit "$upstream_ref"; then
+            echo "merged=true" >> "$GITHUB_OUTPUT"
+            if [[ "$TEST" == "true" ]]; then
+              echo "Test merge is clean; the checks run and main is not pushed."
+            fi
+            exit 0
+          fi
+          files="$(git diff --name-only --diff-filter=U)"
+          # The report needs the conflict markers, so build it before the abort.
+          # A failure here must not hide the conflict: fall back to a short body.
+          report_dir="${RUNNER_TEMP}/sync-conflict"
+          mkdir -p "$report_dir"
+          report_args=(--body-out "${report_dir}/body.md" --title-out "${report_dir}/title.txt"
+            --run-url "$RUN_URL" --repo "$FORK_REPO" --fork-ref "$FORK_REF" --upstream-ref "$upstream_ref")
+          title_prefix=""
+          if [[ "$TEST" == "true" ]]; then
+            report_args+=(--test)
+            title_prefix="[test] "
+          fi
+          if ! node "$report_script" "${report_args[@]}"; then
+            echo "::warning::Could not build the detailed conflict report; using a short one."
+            files_json="$(printf '%s\n' "$files" | jq -R . | jq -sc .)"
+            {
+              # The same machine block as the detailed report, so automation
+              # needs one parser.
+              jq -cn \
+                --argjson test "$TEST" \
+                --arg upstream_repo "$UPSTREAM_REPO" \
+                --arg upstream_sha "$(git rev-parse "$upstream_ref")" \
+                --arg fork_repo "$FORK_REPO" \
+                --arg fork_ref "$FORK_REF" \
+                --arg fork_sha "$(git rev-parse HEAD)" \
+                --arg merge_base "$(git merge-base HEAD "$upstream_ref")" \
+                --argjson files "$files_json" \
+                --arg run_url "$RUN_URL" \
+                --arg detected "$(date -u +%Y-%m-%d)" \
+                '{schema: 1, label: "upstream-sync-conflict", kind: "conflict", test: $test, upstream_repo: $upstream_repo, upstream_sha: $upstream_sha, fork_repo: $fork_repo, fork_ref: $fork_ref, fork_sha: $fork_sha, merge_base: $merge_base, files: $files, run_url: $run_url, detected: $detected}' \
+                | sed 's/</\\u003c/g; s/>/\\u003e/g; s/^/<!-- fork-sync-conflict:v1 /; s/$/ -->/'
+              echo
+              echo "The daily sync could not merge upstream (${range}). The merge was aborted and nothing was pushed."
+              echo
+              echo "Run: ${RUN_URL}"
+              echo
+              echo "Conflicting files:"
+              while IFS= read -r name; do echo "- \`${name}\`"; done <<< "$files"
+            } > "${report_dir}/body.md"
+            echo "${title_prefix}Upstream sync conflict (upstream ${new_upstream})" > "${report_dir}/title.txt"
+          fi
+          git merge --abort
+          {
+            echo "conflict=true"
+            echo "conflict_files<<CONFLICT_EOF"
+            echo "$files"
+            echo "CONFLICT_EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "::error::Merge conflict in: $(echo "$files" | tr '\n' ' ')"
+          exit 1
+
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+        if: steps.merge.outputs.merged == 'true'
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+        if: steps.merge.outputs.merged == 'true'
+        with:
+          save-if: ${{ steps.inputs.outputs.test != 'true' }}
+
+      # A clean merge can still drop fork code or break the build, so it is
+      # pushed only when these checks pass. A failed check blocks the sync like
+      # a conflict: the merge commit stays in this runner and the issue names
+      # the failed checks.
+      - name: Check the merge
+        id: checks
+        if: steps.merge.outputs.merged == 'true'
+        working-directory: ${{ steps.merge.outputs.workdir }}
+        env:
+          CHECKS_DIR: ${{ runner.temp }}/sync-checks
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+          FORK_REPO: ${{ github.repository }}
+          FORK_REF: ${{ steps.inputs.outputs.fork_ref }}
+          UPSTREAM_REF: ${{ steps.merge.outputs.upstream_ref }}
+          RANGE: ${{ steps.merge.outputs.range }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TEST: ${{ steps.inputs.outputs.test }}
+        run: |
+          set -uo pipefail
+          mkdir -p "$CHECKS_DIR"
+          : > "${CHECKS_DIR}/failed.txt"
+
+          # No two migration files may share a version: the relay records
+          # migrations by version. run_check calls it by name.
+          # shellcheck disable=SC2329
+          migration_numbers() {
+            local versions duplicates
+            versions="$(find migrations -maxdepth 1 -name '[0-9][0-9][0-9][0-9]_*.sql' -exec basename {} \; | cut -c1-4 | sort)"
+            duplicates="$(uniq -d <<< "$versions")"
+            if [[ -n "$duplicates" ]]; then
+              echo "Migration versions used by more than one file:"
+              while IFS= read -r version; do
+                find migrations -maxdepth 1 -name "${version}_*.sql" | sort
+              done <<< "$duplicates"
+              return 1
+            fi
+            echo "$(wc -l <<< "$versions" | tr -d ' ') migrations, every version unique."
+          }
+
+          run_check() {
+            local name=$1
+            shift
+            local start=$SECONDS
+            echo "::group::${name}"
+            "$@" 2>&1 | tee "${CHECKS_DIR}/${name}.log"
+            local status=${PIPESTATUS[0]}
+            echo "::endgroup::"
+            if [[ "$status" == "0" ]]; then
+              echo "${name}: pass ($((SECONDS - start)) s)"
+            else
+              echo "${name}" >> "${CHECKS_DIR}/failed.txt"
+              echo "::error::${name} failed ($((SECONDS - start)) s)"
+            fi
+          }
+
+          run_check rust-fmt cargo fmt --all -- --check
+          run_check rust-check cargo check --workspace --all-targets
+          run_check migration-numbers migration_numbers
+
+          if [[ ! -s "${CHECKS_DIR}/failed.txt" ]]; then
+            exit 0
+          fi
+          failed="$(paste -sd ' ' "${CHECKS_DIR}/failed.txt")"
+          report_dir="${RUNNER_TEMP}/sync-conflict"
+          mkdir -p "$report_dir"
+          report_args=(--body-out "${report_dir}/body.md" --title-out "${report_dir}/title.txt"
+            --run-url "$RUN_URL" --repo "$FORK_REPO" --fork-ref "$FORK_REF" --upstream-ref "$UPSTREAM_REF"
+            --checks-failed "$CHECKS_DIR")
+          title_prefix=""
+          if [[ "$TEST" == "true" ]]; then
+            report_args+=(--test)
+            title_prefix="[test] "
+          fi
+          if ! node "${GITHUB_WORKSPACE}/scripts/fork-sync-conflict-report.mjs" "${report_args[@]}"; then
+            echo "::warning::Could not build the detailed report; using a short one."
+            {
+              jq -cn \
+                --argjson test "$TEST" \
+                --arg upstream_repo "$UPSTREAM_REPO" \
+                --arg upstream_sha "$(git rev-parse HEAD^2)" \
+                --arg fork_repo "$FORK_REPO" \
+                --arg fork_ref "$FORK_REF" \
+                --arg fork_sha "$(git rev-parse HEAD^1)" \
+                --arg merge_base "$(git merge-base HEAD^1 HEAD^2)" \
+                --argjson failed_checks "$(jq -R . "${CHECKS_DIR}/failed.txt" | jq -sc .)" \
+                --arg run_url "$RUN_URL" \
+                --arg detected "$(date -u +%Y-%m-%d)" \
+                '{schema: 1, label: "upstream-sync-conflict", kind: "checks_failed", test: $test, upstream_repo: $upstream_repo, upstream_sha: $upstream_sha, fork_repo: $fork_repo, fork_ref: $fork_ref, fork_sha: $fork_sha, merge_base: $merge_base, files: [], failed_checks: $failed_checks, run_url: $run_url, detected: $detected}' \
+                | sed 's/</\\u003c/g; s/>/\\u003e/g; s/^/<!-- fork-sync-conflict:v1 /; s/$/ -->/'
+              echo
+              echo "The daily sync merged upstream (${RANGE}) without a conflict, but these checks failed: ${failed}. Nothing was pushed."
+              echo
+              echo "Run: ${RUN_URL}"
+            } > "${report_dir}/body.md"
+            echo "${title_prefix}Upstream sync checks failed: ${failed// /, } (upstream $(git rev-parse --short=9 HEAD^2))" > "${report_dir}/title.txt"
+          fi
+          {
+            echo "checks_failed=true"
+            echo "failed_checks<<CHECKS_EOF"
+            cat "${CHECKS_DIR}/failed.txt"
+            echo "CHECKS_EOF"
+          } >> "$GITHUB_OUTPUT"
+          exit 1
+
+      - name: Open or update conflict issue
+        id: issue
+        if: ${{ failure() && (steps.merge.outputs.conflict == 'true' || steps.checks.outputs.checks_failed == 'true') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          LABEL: upstream-sync-conflict
+          FORCE_HUMAN_REVIEW: ${{ vars.SYNC_FORCE_HUMAN_REVIEW }}
+          FORK_REF: ${{ steps.inputs.outputs.fork_ref }}
+          TEST: ${{ steps.inputs.outputs.test }}
+          TEST_FORK_SHA: ${{ inputs.test_fork_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          report_dir="${RUNNER_TEMP}/sync-conflict"
+          title="$(cat "${report_dir}/title.txt")"
+          if [[ "$TEST" == "true" ]]; then
+            # A test resolve opens its pull request into this branch. A rerun of
+            # this run finds the branch at the same commit and keeps it.
+            if ! gh api "repos/${GH_REPO}/git/refs" -f ref="refs/heads/${FORK_REF}" -f sha="$TEST_FORK_SHA" > /dev/null; then
+              current="$(gh api "repos/${GH_REPO}/git/ref/heads/${FORK_REF}" --jq .object.sha)"
+              if [[ "$current" != "$TEST_FORK_SHA" ]]; then
+                echo "::error::Test base ${FORK_REF} exists at ${current}, not at ${TEST_FORK_SHA}."
+                exit 1
+              fi
+            fi
+            echo "Test base branch: ${FORK_REF} at ${TEST_FORK_SHA:0:9}"
+          fi
+          gh label create "$LABEL" --color B60205 \
+            --description "Daily upstream sync stopped on a merge conflict or failed checks" --force
+          labels=(--label "$LABEL")
+          if [[ "$TEST" == "true" ]]; then
+            gh label create sync-test --color C5DEF5 \
+              --description "Test run of the upstream sync automation" --force
+            labels+=(--label sync-test)
+          fi
+          # The resolver asks a human before it publishes when this label is on
+          # the issue at the start of its run, so the label goes on at creation.
+          if [[ "$FORCE_HUMAN_REVIEW" == "true" ]]; then
+            gh label create sync-force-human-review --color FBCA04 \
+              --description "The upstream sync resolver asks a human before it opens a pull request" --force
+            labels+=(--label sync-force-human-review)
+          fi
+          existing="$(gh issue list --label "$LABEL" --state open --json number,labels \
+            | jq -r --arg test "$TEST" \
+              '[.[] | select(any(.labels[]; .name == "sync-test") == ($test == "true"))][0].number // empty')"
+          if [[ -n "$existing" ]]; then
+            # Automation reads the machine block from the body, so the body
+            # always holds the newest report.
+            gh issue edit "$existing" --title "$title" --body-file "${report_dir}/body.md"
+            gh issue comment "$existing" --body "The report in the issue body was replaced by run ${RUN_URL}."
+            number="$existing"
+            url="${GITHUB_SERVER_URL}/${GH_REPO}/issues/${existing}"
+            created=false
+          else
+            url="$(gh issue create --title "$title" "${labels[@]}" --body-file "${report_dir}/body.md")"
+            number="${url##*/}"
+            created=true
+          fi
+          {
+            echo "url=${url}"
+            echo "number=${number}"
+            echo "created=${created}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Conflict issue: ${url}"
+
+      # Only a new issue mentions the resolver, so a repeated notice never starts
+      # a second resolve. A test notice mentions nobody unless asked, so a test
+      # never starts a real resolve.
+      - name: Compose sync blocked notice
+        id: blocked
+        if: ${{ failure() && (steps.merge.outputs.conflict == 'true' || steps.checks.outputs.checks_failed == 'true') }}
+        env:
+          TEST: ${{ steps.inputs.outputs.test }}
+          TEST_MENTION: ${{ inputs.test_mention }}
+          RESOLVER: ${{ vars.BUZZ_RESOLVER_NAME }}
+          RANGE: ${{ steps.merge.outputs.range }}
+          FILES: ${{ steps.merge.outputs.conflict_files }}
+          CHECKS: ${{ steps.checks.outputs.failed_checks }}
+          ISSUE_URL: ${{ steps.issue.outputs.url }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          CREATED: ${{ steps.issue.outputs.created }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$FILES" ]]; then
+            text="⚠️ Sync Buzz fork bị chặn: merge upstream ${RANGE} bị conflict ở các file sau:"$'\n'"${FILES}"
+            task="giải quyết conflict"
+          else
+            text="⚠️ Sync Buzz fork bị chặn: merge upstream ${RANGE} không conflict nhưng các bước kiểm tra sau bị lỗi:"$'\n'"${CHECKS}"
+            task="sửa các bước kiểm tra bị lỗi"
+          fi
+          if [[ -n "$ISSUE_URL" ]]; then
+            text+=$'\n'"Issue: ${ISSUE_URL}"
+          else
+            text+=$'\n'"Không tạo được issue; xem log của lần chạy."
+          fi
+          text+=$'\n'"Run: ${RUN_URL}"
+          if [[ "$TEST" == "true" ]]; then
+            text="[TEST] ${text}"
+          fi
+          if [[ "$CREATED" == "true" && ( "$TEST" != "true" || "$TEST_MENTION" == "true" ) ]]; then
+            if [[ -n "$RESOLVER" ]]; then
+              # The relay wakes a member only for "@" + the exact display name
+              # followed by a character that cannot be part of a name.
+              text+=$'\n'"@${RESOLVER} hãy ${task} ở issue #${ISSUE_NUMBER}: ${ISSUE_URL}"
+            else
+              echo "::warning::BUZZ_RESOLVER_NAME is not set; the notice mentions nobody."
+            fi
+          fi
+          delimiter="TEXT_$(openssl rand -hex 8)"
+          {
+            echo "text<<${delimiter}"
+            echo "$text"
+            echo "${delimiter}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Notify sync blocked
+        if: ${{ failure() && (steps.merge.outputs.conflict == 'true' || steps.checks.outputs.checks_failed == 'true') }}
+        uses: ./.github/actions/buzz-notify
+        with:
+          event_type: sync.blocked
+          content: ${{ steps.blocked.outputs.text }}
+          repository_name: ${{ vars.BUZZ_REPOSITORY_NAME }}
+          idempotency_key: ${{ github.run_id }}-${{ github.run_attempt }}-sync-blocked
+          callback_url: ${{ secrets.BUZZ_APP_CALLBACK_URL }}
+          app_secret: ${{ secrets.BUZZ_APP_SECRET }}
+          ts_oauth_client_id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          ts_oauth_secret: ${{ secrets.TS_OAUTH_SECRET }}
+
+      # A test run never writes main. Upstream merges often change files under
+      # .github/workflows, which a GITHUB_TOKEN push may not do, so this one
+      # step uses a token with the Workflows permission. The token stays in the
+      # environment of this step only.
+      - name: Push main
+        id: push
+        if: steps.merge.outputs.merged == 'true' && steps.inputs.outputs.test != 'true'
+        env:
+          SYNC_PUSH_TOKEN: ${{ secrets.SYNC_PUSH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$SYNC_PUSH_TOKEN" ]]; then
+            echo "::error::The SYNC_PUSH_TOKEN secret is not set; main is not pushed."
+            exit 1
+          fi
+          git push "https://x-access-token:${SYNC_PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:main
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # The conflict is resolved once a sync merges and pushes cleanly. A failure
+      # to close must not turn a pushed sync red, so it only warns.
+      - name: Close resolved conflict issues
+        if: steps.push.outcome == 'success'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          MERGED_SHA: ${{ steps.push.outputs.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          for number in $(gh issue list --label upstream-sync-conflict --state open --json number,labels \
+            | jq -r '.[] | select(all(.labels[]; .name != "sync-test")) | .number'); do
+            gh issue close "$number" --comment "Resolved: a later sync merged upstream and pushed \`${MERGED_SHA:0:9}\` to main. Run: ${RUN_URL}"
+          done
+
+      # MF Desktop Build reports its own result in Buzz.
+      - name: Tag the release and start the desktop build
+        id: release
+        if: steps.merge.outputs.changed == 'true' && steps.inputs.outputs.test != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: scripts/fork-desktop-release-tag.sh "$(git rev-parse HEAD)"
+
+      - name: Find failed stage
+        id: stage
+        if: ${{ failure() && steps.merge.outputs.conflict != 'true' && steps.checks.outputs.checks_failed != 'true' }}
+        env:
+          MERGE: ${{ steps.merge.outcome }}
+          CHECKS: ${{ steps.checks.outcome }}
+          PUSH: ${{ steps.push.outcome }}
+          RELEASE: ${{ steps.release.outcome }}
+        run: |
+          stage=setup
+          [[ "$MERGE" == "failure" ]] && stage=merge
+          [[ "$CHECKS" == "failure" ]] && stage=checks
+          [[ "$PUSH" == "failure" ]] && stage=push
+          [[ "$RELEASE" == "failure" ]] && stage=release
+          echo "name=${stage}" >> "$GITHUB_OUTPUT"
+
+      # A failed test run reports only in its own log.
+      - name: Notify sync failed
+        if: ${{ failure() && steps.merge.outputs.conflict != 'true' && steps.checks.outputs.checks_failed != 'true' && inputs.test_fork_sha == '' && inputs.test_upstream_sha == '' }}
+        uses: ./.github/actions/buzz-notify
+        with:
+          event_type: sync.failed
+          content: "❌ Sync Buzz fork thất bại ở bước ${{ steps.stage.outputs.name }}. Upstream ${{ steps.merge.outputs.range }}. Log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          repository_name: ${{ vars.BUZZ_REPOSITORY_NAME }}
+          idempotency_key: ${{ github.run_id }}-${{ github.run_attempt }}-sync-failed
+          callback_url: ${{ secrets.BUZZ_APP_CALLBACK_URL }}
+          app_secret: ${{ secrets.BUZZ_APP_SECRET }}
+          ts_oauth_client_id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          ts_oauth_secret: ${{ secrets.TS_OAUTH_SECRET }}
