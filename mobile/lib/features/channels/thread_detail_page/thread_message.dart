@@ -40,6 +40,7 @@ class _ThreadMessage extends HookConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final startsThreads = ref.watch(channelStartsThreadsProvider(channelId));
     final messageSnapshotKey = useMemoized(GlobalKey.new, const []);
     final swipeContentKey = useMemoized(GlobalKey.new, const []);
     final mediaOffset = useMessageMediaOffset(message.content, message.tags);
@@ -313,28 +314,13 @@ class _ThreadMessage extends HookConsumerWidget {
                                                 ),
                                               ),
                                             ),
-                                            if (message.edited) ...[
-                                              const SizedBox(width: Grid.half),
-                                              Text(
-                                                '(edited)',
-                                                style: context
-                                                    .textTheme
-                                                    .labelSmall
-                                                    ?.copyWith(
-                                                      color: context
-                                                          .colors
-                                                          .onSurfaceVariant,
-                                                      fontStyle:
-                                                          FontStyle.italic,
-                                                    ),
-                                              ),
-                                            ],
                                           ],
                                         ),
                                       ),
                                     MessageContent(
                                       key: swipeContentKey,
                                       content: message.content,
+                                      edited: message.edited,
                                       bubble: true,
                                       hasReactions:
                                           message.reactions.isNotEmpty,
@@ -353,7 +339,8 @@ class _ThreadMessage extends HookConsumerWidget {
                                       scaleEmojiOnly: true,
                                       mediaCarouselTrailingOverflow:
                                           Grid.gutter,
-                                      onMediaReply: allMessages == null
+                                      onMediaReply:
+                                          allMessages == null || !startsThreads
                                           ? null
                                           : () {
                                               if (!context.mounted) return;
@@ -373,6 +360,13 @@ class _ThreadMessage extends HookConsumerWidget {
                                                 ),
                                               );
                                             },
+                                      nativePhotoActions: nativeImageActions(
+                                        context: context,
+                                        ref: ref,
+                                        message: message,
+                                        channelId: channelId,
+                                        canManageMessage: canManageMessage,
+                                      ),
                                       onMediaMore: (viewerContext, imageUrl) =>
                                           showImageActions(
                                             context: viewerContext,
