@@ -412,7 +412,11 @@ mod postgres_tests {
             .await
             .expect("requires reachable Postgres");
         let db = buzz_db::Db::from_pool(pool.clone());
-        db.migrate().await.expect("migrate");
+        // The PostgreSQL lane gives each test a database built from the
+        // desired-state schema; migrating it again fails.
+        if std::env::var("BUZZ_TEST_SCHEMA_MODE").as_deref() != Ok("desired") {
+            db.migrate().await.expect("migrate");
+        }
         let record = db
             .ensure_configured_community(&host)
             .await
