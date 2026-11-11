@@ -372,7 +372,7 @@ async fn enqueue_lifecycle_audit(
 }
 
 #[cfg(test)]
-mod tests {
+mod postgres_tests {
     use std::sync::Arc;
 
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -602,6 +602,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires Postgres"]
     async fn app_admin_rejects_non_admin() {
         let (state, tenant) = test_state().await;
         let member = Keys::generate();
@@ -645,6 +646,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires Postgres"]
     async fn app_admin_create_returns_secret_once() {
         let (state, tenant) = test_state().await;
         let owner = Keys::generate();
@@ -717,6 +719,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires Postgres"]
     async fn app_admin_duplicate_does_not_rotate() {
         let (state, tenant) = test_state().await;
         let owner = Keys::generate();
@@ -761,6 +764,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires Postgres"]
     async fn app_admin_update_clears_optional_fields() {
         let (state, tenant) = test_state().await;
         let admin = Keys::generate();
@@ -814,6 +818,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires Postgres"]
     async fn app_admin_rotate_replaces_hash_without_metadata() {
         let (state, tenant) = test_state().await;
         let owner = Keys::generate();
@@ -868,6 +873,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires Postgres"]
     async fn app_admin_disable_keeps_metadata() {
         let (state, tenant) = test_state().await;
         let owner = Keys::generate();
@@ -908,6 +914,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires Postgres"]
     async fn app_metadata_contains_no_authority_or_secret_tags() {
         let (state, tenant) = test_state().await;
         let owner = Keys::generate();

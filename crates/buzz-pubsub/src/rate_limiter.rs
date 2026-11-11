@@ -140,6 +140,7 @@ mod tests {
     use uuid::Uuid;
 
     #[tokio::test]
+    #[ignore = "requires Redis"]
     async fn app_callback_rate_limit_key_is_fully_scoped() {
         let community_a = CommunityId::from_uuid(
             Uuid::parse_str("11111111-1111-1111-1111-111111111111").expect("community a"),
