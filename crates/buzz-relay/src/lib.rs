@@ -5,9 +5,6 @@
 /// Stdout access log: reads, auth attempts, and connection lifecycle.
 pub(crate) mod access;
 mod admission;
-mod app_sink;
-mod message_mentions;
-mod project_route;
 mod build_info;
 mod community_active;
 mod fenced_cache;
@@ -29,6 +26,8 @@ pub(crate) mod nip_fi_upgrade;
 
 /// REST API route handlers.
 pub mod api;
+/// Authenticated App callback sink — HTTP admission to a relay-signed kind 9.
+pub mod app_sink;
 /// WebSocket audio relay for huddle voice channels.
 pub mod audio;
 /// Operator-tunable concurrency caps, re-read from feature flags at runtime.
@@ -55,6 +54,8 @@ pub mod lifecycle;
 mod membership_cache;
 /// Inter-relay mesh startup wiring (`BUZZ_MESH` seam).
 pub mod mesh_boot;
+/// Shared `@Name` mention resolver for relay-signed messages.
+mod message_mentions;
 /// Prometheus metrics: recorder, upkeep, HTTP middleware.
 pub mod metrics;
 /// NIP-11 relay information document.
@@ -69,6 +70,8 @@ pub(crate) mod nip_fi_policy;
 pub mod nip_fi_resolver;
 /// Deployment-global operator-listener mention delivery worker.
 pub mod operator_listener;
+/// Repository identity resolution and project claim authorization.
+pub mod project_route;
 /// NIP-01 client/relay message parsing.
 pub mod protocol;
 /// Durable NIP-PL matcher and delivery worker.
@@ -98,6 +101,8 @@ mod test_support;
 pub mod tunnel;
 /// Webhook secret generation and constant-time comparison.
 pub mod webhook_secret;
+/// Serialized webhook admission for project-channel routing.
+mod workflow_admission;
 /// Workflow action sink — relay-side implementation of [`buzz_workflow::ActionSink`].
 pub mod workflow_sink;
 

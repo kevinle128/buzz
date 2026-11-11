@@ -424,10 +424,10 @@ async fn create_foreign_channel(pool: &sqlx::PgPool, channel_id: Uuid, keys: &Ke
     let host = format!("foreign-{}.example.test", Uuid::new_v4());
     let owner = Keys::generate();
     let created = db
-        .create_community_with_owner(&host, &owner.public_key().to_hex())
+        .create_community_with_owner(&host, &owner.public_key().to_hex(), &Keys::generate())
         .await
         .unwrap_or_else(|e| panic!("create foreign community: {e}"));
-    let community_id = match created {
+    let community_id = match created.outcome {
         CreateCommunityWithOwnerResult::Created(record) => record.id,
         other => panic!("expected Created foreign community, got {other:?}"),
     };
@@ -1256,7 +1256,10 @@ async fn pre_admission_failures_create_no_run() {
         &hook_body(&repo_d, &unique("pre-key"), "pre"),
     )
     .await;
-    assert_eq!(secret_status, StatusCode::UNAUTHORIZED, "{secret_body}");
+    // A wrong secret answers like a missing workflow, so the response does
+    // not reveal that the workflow exists.
+    assert_eq!(secret_status, StatusCode::NOT_FOUND, "{secret_body}");
+    assert_eq!(secret_body["error"].as_str(), Some("workflow not found"));
 
     assert_eq!(
         scoped_run_count(&fx.pool, fx.community_id, workflow_id).await,

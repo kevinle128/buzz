@@ -105,7 +105,9 @@ async fn publish_media(client: &BuzzClient, input: &str) -> Result<(), CliError>
     let (media_url, sha256) = canonical_media(client, input)?;
     client.head_media(&media_url).await?;
 
-    let event = client.sign_event(build_public_share_event(&media_url, &sha256)?).await?;
+    let event = client
+        .sign_event(build_public_share_event(&media_url, &sha256)?)
+        .await?;
     let share_event = event.id.to_hex();
     let public_url = public_share_url(&media_url, &share_event)?;
     let raw = client.submit_event(event).await?;

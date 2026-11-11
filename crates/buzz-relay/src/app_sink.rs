@@ -537,6 +537,7 @@ fn build_app_event(
         .map_err(|_| ())
 }
 
+#[allow(clippy::result_large_err)] // The Axum rejection response is the handler error type.
 async fn handle_inner(
     state: Arc<AppState>,
     peer_ip: IpAddr,
@@ -824,6 +825,7 @@ async fn handle_inner(
     }
 }
 
+#[allow(clippy::result_large_err)] // The Axum rejection response is the handler error type.
 async fn admit_vacant(
     state: Arc<AppState>,
     tenant: TenantContext,
@@ -941,6 +943,7 @@ async fn admit_vacant(
     ))
 }
 
+#[allow(clippy::result_large_err)] // The Axum rejection response is the handler error type.
 async fn reject_vacant(
     community_uuid: Uuid,
     app_id: Uuid,

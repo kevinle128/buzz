@@ -31,6 +31,9 @@ class MessageAuthorMeta extends StatelessWidget {
   /// Optional callback invoked when [displayName] is tapped.
   final VoidCallback? onAuthorTap;
 
+  /// Optional trailing badge, used for App attribution.
+  final Widget? badge;
+
   /// Optional key assigned to the display-name text.
   final Key? displayNameKey;
 
@@ -69,6 +72,7 @@ class MessageAuthorMeta extends StatelessWidget {
     this.showIdentity = true,
     this.timestampGap = Grid.xxs,
     this.onAuthorTap,
+    this.badge,
     this.displayNameKey,
     this.usernameKey,
     this.timestampKey,
@@ -109,6 +113,10 @@ class MessageAuthorMeta extends StatelessWidget {
 
         final children = <Widget>[
           if (showIdentity) Flexible(child: authorName),
+          if (showIdentity && badge != null) ...[
+            const SizedBox(width: Grid.half),
+            badge!,
+          ],
           if (showIdentity && showUsername) ...[
             const SizedBox(width: Grid.half),
             ConstrainedBox(

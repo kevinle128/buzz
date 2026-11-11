@@ -372,7 +372,7 @@ async fn enqueue_lifecycle_audit(
 }
 
 #[cfg(test)]
-mod tests {
+mod postgres_tests {
     use std::sync::Arc;
 
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -412,16 +412,18 @@ mod tests {
             .await
             .expect("requires reachable Postgres");
         let db = buzz_db::Db::from_pool(pool.clone());
-        db.migrate().await.expect("migrate");
+        // The PostgreSQL lane gives each test a database built from the
+        // desired-state schema; migrating it again fails.
+        if std::env::var("BUZZ_TEST_SCHEMA_MODE").as_deref() != Ok("desired") {
+            db.migrate().await.expect("migrate");
+        }
         let record = db
             .ensure_configured_community(&host)
             .await
             .expect("ensure community");
         let tenant = TenantContext::resolved(record.id, host);
 
-        let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
-            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
-            .expect("redis pool config");
+        let redis_pool = buzz_pubsub::redis_connection(&config.redis_url).expect("redis pool");
         let pubsub = Arc::new(
             buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
                 .await
@@ -453,8 +455,15 @@ mod tests {
     async fn seed_role(state: &AppState, tenant: &TenantContext, keys: &Keys, role: &str) {
         state
             .db
-            .add_relay_member(tenant.community(), &keys.public_key().to_hex(), role, None)
+            .add_relay_member(
+                tenant.community(),
+                &keys.public_key().to_hex(),
+                role,
+                None,
+                &state.relay_keypair,
+            )
             .await
+            .map(|write| write.outcome)
             .expect("seed relay member");
     }
 
@@ -597,6 +606,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires Postgres"]
     async fn app_admin_rejects_non_admin() {
         let (state, tenant) = test_state().await;
         let member = Keys::generate();
@@ -629,6 +639,7 @@ mod tests {
                 panic!("canvas conflict: {message}")
             }
             IngestError::Internal(message) => panic!("internal error: {message}"),
+            IngestError::Ban { .. } => panic!("member must be rejected, not refused as banned"),
         }
         let apps = state
             .db
@@ -639,6 +650,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires Postgres"]
     async fn app_admin_create_returns_secret_once() {
         let (state, tenant) = test_state().await;
         let owner = Keys::generate();
@@ -711,6 +723,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires Postgres"]
     async fn app_admin_duplicate_does_not_rotate() {
         let (state, tenant) = test_state().await;
         let owner = Keys::generate();
@@ -755,6 +768,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires Postgres"]
     async fn app_admin_update_clears_optional_fields() {
         let (state, tenant) = test_state().await;
         let admin = Keys::generate();
@@ -808,6 +822,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires Postgres"]
     async fn app_admin_rotate_replaces_hash_without_metadata() {
         let (state, tenant) = test_state().await;
         let owner = Keys::generate();
@@ -862,6 +877,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires Postgres"]
     async fn app_admin_disable_keeps_metadata() {
         let (state, tenant) = test_state().await;
         let owner = Keys::generate();
@@ -902,6 +918,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires Postgres"]
     async fn app_metadata_contains_no_authority_or_secret_tags() {
         let (state, tenant) = test_state().await;
         let owner = Keys::generate();
