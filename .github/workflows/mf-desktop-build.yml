@@ -1,12 +1,15 @@
 name: MF Desktop Build
 
-# Fork-only desktop build. macOS and Linux run on self-hosted runners; Windows
-# runs on a GitHub-hosted runner because the fork has no Windows host. Upstream
-# release.yml is gated to block/buzz, so this file owns desktop builds for the
-# fork and never conflicts with upstream merges.
+# Fork-only desktop build. Every job runs on a GitHub-hosted runner: the fork
+# is public, so they cost nothing, and a near-daily build never loads the
+# fork's own servers. Upstream release.yml is gated to block/buzz, so this file
+# owns desktop builds for the fork and never conflicts with upstream merges.
 #
-# Trigger: push tag desktop-v<X.Y.Z>-mf.<N>. The tag supplies the version;
-# set-version-from-tag.mjs patches the manifests at build time.
+# Trigger: push tag desktop-v<X.Y.Z>-mf.<N>, or run this workflow on that tag
+# (`gh workflow run mf-desktop-build.yml --ref <tag>`). The fork sync creates
+# its tags with GITHUB_TOKEN, which starts no workflow, so it uses the second
+# form. Either way the tag supplies the version; set-version-from-tag.mjs
+# patches the manifests at build time.
 #
 # macOS builds are ad-hoc signed (no Apple Developer ID, no notarization).
 # Windows installers have no Authenticode signature, so SmartScreen warns on
@@ -20,6 +23,7 @@ on:
   push:
     tags:
       - 'desktop-v[0-9]*-mf.[0-9]*'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -36,7 +40,7 @@ jobs:
   setup:
     name: Setup
     if: github.repository == 'kevinle128/buzz'
-    runs-on: [self-hosted, Linux, X64, buzz]
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -84,12 +88,11 @@ jobs:
 
   build-macos:
     name: Build macOS (${{ matrix.arch }})
-    runs-on: [self-hosted, macOS, ARM64, buzz]
+    runs-on: macos-latest
     needs: setup
     timeout-minutes: 90
     strategy:
       fail-fast: false
-      max-parallel: 1
       matrix:
         include:
           # Upstream ships mesh-llm (Metal) only on Apple Silicon.
@@ -116,13 +119,6 @@ jobs:
 
       - name: Verify tag-bound source
         run: scripts/verify-release-ref.sh desktop-v "$VERSION"
-
-      # Keep Hermit packages and the pnpm store inside the job temp dir so the
-      # clean step removes them and shared caches on the host stay untouched.
-      - name: Use job-local caches
-        run: |
-          echo "HERMIT_STATE_DIR=$RUNNER_TEMP/mf-cache/hermit" >> "$GITHUB_ENV"
-          echo "pnpm_config_store_dir=$RUNNER_TEMP/mf-cache/pnpm-store" >> "$GITHUB_ENV"
 
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
 
@@ -181,8 +177,8 @@ jobs:
           LLAMA_STAGE_BACKEND: metal
           LLAMA_STAGE_BUILD_DIR: ${{ github.workspace }}/.cache/mesh-llama/build-stage-abi-metal
           SKIPPY_LLAMA_AUTO_BUILD: "0"
-          # No TAURI_BUNDLER_DMG_IGNORE_CI: the Finder layout step needs a GUI session
-          # and Automation permission, which the launchd runner does not have.
+          # No TAURI_BUNDLER_DMG_IGNORE_CI: on CI Tauri then skips the Finder
+          # layout step, so the DMG keeps its plain layout.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
@@ -224,19 +220,10 @@ jobs:
             ${{ steps.artifacts.outputs.archive }}
             ${{ steps.artifacts.outputs.sig }}
 
-      # Self-hosted runners keep the workspace between runs; free the disk after every build.
-      - name: Clean workspace
-        if: always()
-        run: |
-          find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
-          # Hermit installs packages read-only; make them writable before removal.
-          if [[ -d "$RUNNER_TEMP/mf-cache" ]]; then chmod -R u+w "$RUNNER_TEMP/mf-cache"; fi
-          rm -rf "$RUNNER_TEMP/mf-cache"
-
   build-linux:
     name: Build Linux (x64)
-    runs-on: [self-hosted, Linux, X64, buzz]
-    # Clean, pinned build environment on the shared server.
+    runs-on: ubuntu-latest
+    # Pinned build environment, the same image as upstream release.yml.
     container: ubuntu:24.04@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517
     needs: setup
     timeout-minutes: 90
@@ -270,13 +257,6 @@ jobs:
 
       - name: Verify tag-bound source
         run: scripts/verify-release-ref.sh desktop-v "$VERSION"
-
-      # Keep Hermit packages and the pnpm store inside the job temp dir so the
-      # clean step removes them and shared caches on the host stay untouched.
-      - name: Use job-local caches
-        run: |
-          echo "HERMIT_STATE_DIR=$RUNNER_TEMP/mf-cache/hermit" >> "$GITHUB_ENV"
-          echo "pnpm_config_store_dir=$RUNNER_TEMP/mf-cache/pnpm-store" >> "$GITHUB_ENV"
 
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
 
@@ -354,17 +334,6 @@ jobs:
             ${{ steps.artifacts.outputs.appimage }}
             ${{ steps.artifacts.outputs.archive }}
             ${{ steps.artifacts.outputs.sig }}
-
-      # Files in the container are owned by root, so clean them here, not on the host.
-      - name: Clean workspace
-        if: always()
-        run: |
-          find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
-          # Hermit installs packages read-only; make them writable before removal.
-          if [[ -d "$RUNNER_TEMP/mf-cache" ]]; then chmod -R u+w "$RUNNER_TEMP/mf-cache"; fi
-          rm -rf "$RUNNER_TEMP/mf-cache"
-          # The container HOME is a host bind mount; remove what tools cached there.
-          find "$HOME" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
 
   build-windows:
     name: Build Windows (x64)
@@ -522,6 +491,7 @@ jobs:
           cat latest.json
 
           echo "manifest=s3://${WASABI_BUCKET}/${prefix}/latest.json" >> "$GITHUB_OUTPUT"
+          echo "prefix=${prefix}" >> "$GITHUB_OUTPUT"
 
       - name: Publish latest.json
         env:
@@ -532,3 +502,84 @@ jobs:
             --content-type application/json \
             --cache-control no-cache \
             --only-show-errors
+
+      # Keeps only the newest fork versions in the release storage. latest.json
+      # now names this version, so the plan deletes nothing unless this version
+      # is among those kept. Only whole v<version>/ folders go, never a file at
+      # the prefix root such as latest.json. A failed prune never turns a
+      # published release red.
+      - name: Delete older versions
+        id: prune
+        continue-on-error: true
+        env:
+          PREFIX: ${{ steps.upload.outputs.prefix }}
+          KEEP: "3"
+        run: |
+          set -euo pipefail
+          listing="${RUNNER_TEMP}/release-listing.txt"
+          delete_list="${RUNNER_TEMP}/release-delete.txt"
+          if ! aws s3 ls "s3://${WASABI_BUCKET}/${PREFIX}/" --endpoint-url "$WASABI_ENDPOINT" > "${listing}.raw"; then
+            echo "::warning::Could not list the release storage; nothing is deleted."
+            exit 0
+          fi
+          # Version folders are v<version>/; the plan works on bare versions and
+          # never sees a folder without the prefix.
+          sed -n 's#^\([[:space:]]*PRE \)v\(.*/\)$#\1\2#p' "${listing}.raw" > "$listing"
+          node scripts/fork-desktop-backup-prune.mjs --listing "$listing" --keep "$KEEP" \
+            --current "$VERSION" --out "$delete_list"
+          while IFS= read -r version; do
+            [[ -n "$version" ]] || continue
+            aws s3 rm "s3://${WASABI_BUCKET}/${PREFIX}/v${version}/" --recursive \
+              --endpoint-url "$WASABI_ENDPOINT" --only-show-errors
+            echo "Deleted v${version}"
+          done < "$delete_list"
+
+  notify:
+    name: Notify Buzz
+    needs: [setup, publish]
+    if: ${{ always() && github.repository == 'kevinle128/buzz' && needs.setup.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          sparse-checkout: .github/actions
+          persist-credentials: false
+
+      - name: Compose message
+        id: compose
+        env:
+          PUBLISH_RESULT: ${{ needs.publish.result }}
+          VERSION: ${{ needs.setup.outputs.version }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [[ "$PUBLISH_RESULT" == "success" ]]; then
+            event=release.published
+            key=release-published
+            text="🚀 Buzz fork desktop ${VERSION} đã sẵn sàng. Các bản desktop đã cài sẽ tự cập nhật."$'\n'"Run: ${RUN_URL}"
+          else
+            event=build.failed
+            key=build-failed
+            text="❌ Build Buzz fork desktop ${VERSION:+${VERSION} }thất bại (${PUBLISH_RESULT}). Log: ${RUN_URL}"
+          fi
+          delimiter="TEXT_$(openssl rand -hex 8)"
+          {
+            echo "event=${event}"
+            echo "key=${key}"
+            echo "text<<${delimiter}"
+            echo "$text"
+            echo "${delimiter}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Notify Buzz
+        uses: ./.github/actions/buzz-notify
+        with:
+          event_type: ${{ steps.compose.outputs.event }}
+          content: ${{ steps.compose.outputs.text }}
+          repository_name: ${{ vars.BUZZ_REPOSITORY_NAME }}
+          idempotency_key: ${{ github.run_id }}-${{ github.run_attempt }}-${{ steps.compose.outputs.key }}
+          callback_url: ${{ secrets.BUZZ_APP_CALLBACK_URL }}
+          app_secret: ${{ secrets.BUZZ_APP_SECRET }}
+          ts_oauth_client_id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          ts_oauth_secret: ${{ secrets.TS_OAUTH_SECRET }}

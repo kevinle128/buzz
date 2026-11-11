@@ -1,0 +1,68 @@
+name: Fork Sync Resume
+
+# A person merges the pull request that resolves an upstream sync conflict.
+# That push ends the pause of the daily sync, tags the next fork desktop
+# release and starts its build. Every other push to main starts nothing, so
+# nothing builds twice: the daily sync pushes its own merges and starts their
+# builds itself. Only the fork runs this.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  resume:
+    if: github.repository == 'kevinle128/buzz'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      # The release tag is created through the API.
+      contents: write
+      issues: write
+      pull-requests: read
+      actions: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Close the conflict issue and start the build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          resume="$(mktemp)"
+          trap 'rm -f "$resume"' EXIT
+          cat > "$resume" <<'RESUME'
+          #!/bin/bash
+          set -euo pipefail
+          head="$(gh api "repos/${GH_REPO}/commits/${SHA}/pulls" | jq -r \
+            '[.[] | select(.merged_at != null and .base.ref == "main" and (.head.ref | startswith("sync/upstream-")))][0].head.ref // empty')"
+          if [[ -z "$head" ]]; then
+            echo "Push ${SHA:0:9} is not a sync pull request merge; nothing to start."
+            exit 0
+          fi
+          # The merge proves the fix when it contains the upstream commit that the
+          # issue names, so the build does not wait for the closing keyword of the
+          # pull request. A squash merge drops that commit and keeps the pause.
+          for number in $(gh issue list --label upstream-sync-conflict --state open --json number,labels \
+              | jq -r '.[] | select(all(.labels[]; .name != "sync-test")) | .number'); do
+            block="$(gh issue view "$number" --json body | jq -r .body \
+              | sed -n 's/^<!-- fork-sync-conflict:v1 \({.*}\) -->$/\1/p' | head -n 1)"
+            upstream_sha="$(jq -r '.upstream_sha // empty' <<< "${block:-null}")"
+            if [[ -n "$upstream_sha" ]] && git merge-base --is-ancestor "$upstream_sha" "$SHA"; then
+              gh issue close "$number" --comment "Resolved by ${head}: main ${SHA:0:9} contains upstream ${upstream_sha:0:9}."
+            else
+              echo "Issue #${number} names upstream ${upstream_sha:-unknown}, which ${SHA:0:9} does not contain; the sync stays paused and no build starts."
+              exit 0
+            fi
+          done
+          scripts/fork-desktop-release-tag.sh "$SHA"
+          RESUME
+          bash "$resume"

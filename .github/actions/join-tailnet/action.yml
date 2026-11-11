@@ -1,0 +1,20 @@
+name: Join tailnet
+description: Joins the Tailscale tailnet as tag:ci so the step can reach tailnet-only hosts, such as the Buzz relay App callback.
+
+inputs:
+  ts_oauth_client_id:
+    description: Tailscale OAuth client id (pass the TS_OAUTH_CLIENT_ID secret).
+    required: true
+  ts_oauth_secret:
+    description: Tailscale OAuth client secret (pass the TS_OAUTH_SECRET secret).
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Join tailnet
+      uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c # v4
+      with:
+        oauth-client-id: ${{ inputs.ts_oauth_client_id }}
+        oauth-secret: ${{ inputs.ts_oauth_secret }}
+        tags: tag:ci

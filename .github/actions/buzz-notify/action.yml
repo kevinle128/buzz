@@ -1,0 +1,81 @@
+name: Buzz notify
+description: Joins the tailnet and posts one event to the Buzz App callback. Fails unless the relay answers 202.
+
+inputs:
+  event_type:
+    description: Event name, for example release.published, sync.blocked, sync.failed, build.failed.
+    required: true
+  content:
+    description: Message body.
+    required: true
+  idempotency_key:
+    description: Unique key for this event. Use the run id, the run attempt and the event name.
+    required: true
+  repository_name:
+    description: Repository name that the relay resolves to a project and its channel (pass the BUZZ_REPOSITORY_NAME variable).
+    required: true
+  callback_url:
+    description: Buzz App callback URL (pass the BUZZ_APP_CALLBACK_URL secret).
+    required: true
+  app_secret:
+    description: Buzz App webhook secret (pass the BUZZ_APP_SECRET secret).
+    required: true
+  ts_oauth_client_id:
+    description: Tailscale OAuth client id (pass the TS_OAUTH_CLIENT_ID secret).
+    required: true
+  ts_oauth_secret:
+    description: Tailscale OAuth client secret (pass the TS_OAUTH_SECRET secret).
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # An empty route name never resolves, so stop before joining the tailnet.
+    - name: Check route name
+      shell: bash
+      env:
+        REPOSITORY_NAME: ${{ inputs.repository_name }}
+      run: |
+        if [[ -z "$REPOSITORY_NAME" ]]; then
+          echo "::error::repository_name is empty. Set the BUZZ_REPOSITORY_NAME repository variable."
+          exit 1
+        fi
+
+    # The relay is reachable only inside the tailnet.
+    - name: Join tailnet
+      uses: ./.github/actions/join-tailnet
+      with:
+        ts_oauth_client_id: ${{ inputs.ts_oauth_client_id }}
+        ts_oauth_secret: ${{ inputs.ts_oauth_secret }}
+
+    - name: Post to Buzz
+      shell: bash
+      env:
+        BUZZ_APP_CALLBACK_URL: ${{ inputs.callback_url }}
+        BUZZ_APP_SECRET: ${{ inputs.app_secret }}
+        EVENT_TYPE: ${{ inputs.event_type }}
+        CONTENT: ${{ inputs.content }}
+        IDEMPOTENCY_KEY: ${{ inputs.idempotency_key }}
+        REPOSITORY_NAME: ${{ inputs.repository_name }}
+      run: |
+        set -euo pipefail
+        body="$(mktemp)"
+        response="$(mktemp)"
+        trap 'rm -f "$body" "$response"' EXIT
+        jq -n \
+          --arg idempotency_key "$IDEMPOTENCY_KEY" \
+          --arg repository_name "$REPOSITORY_NAME" \
+          --arg event_type "$EVENT_TYPE" \
+          --arg content "$CONTENT" \
+          '{idempotency_key: $idempotency_key, repository_name: $repository_name, event_type: $event_type, content: $content}' > "$body"
+        status="$(curl -sS -o "$response" -w '%{http_code}' -X POST "$BUZZ_APP_CALLBACK_URL" \
+          -H "X-Webhook-Secret: $BUZZ_APP_SECRET" \
+          -H 'Content-Type: application/json' \
+          --data @"$body")"
+        if [[ "$status" != "202" ]]; then
+          echo "::error::Buzz callback answered HTTP ${status} for ${EVENT_TYPE}, expected 202"
+          head -c 500 "$response" || true
+          echo
+          exit 1
+        fi
+        echo "Buzz accepted ${EVENT_TYPE} (HTTP 202)"
