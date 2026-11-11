@@ -748,7 +748,7 @@ pub enum MessagesCmd {
         #[arg(long)]
         reply_to: Option<String>,
     },
-    /// Edit a previously sent message by its event ID
+    /// Edit a previously sent message by event ID, retaining its current attachments
     Edit {
         /// Event ID of the message to edit (64-char hex)
         #[arg(long)]
@@ -756,6 +756,9 @@ pub enum MessagesCmd {
         /// New message content
         #[arg(long)]
         content: String,
+        /// Remove all attachments on kinds 9/40002/40008/45001/45003 (later edits keep them removed)
+        #[arg(long)]
+        clear_attachments: bool,
     },
     /// Delete a message by event ID
     Delete {
