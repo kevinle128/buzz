@@ -1256,7 +1256,10 @@ async fn pre_admission_failures_create_no_run() {
         &hook_body(&repo_d, &unique("pre-key"), "pre"),
     )
     .await;
-    assert_eq!(secret_status, StatusCode::UNAUTHORIZED, "{secret_body}");
+    // A wrong secret answers like a missing workflow, so the response does
+    // not reveal that the workflow exists.
+    assert_eq!(secret_status, StatusCode::NOT_FOUND, "{secret_body}");
+    assert_eq!(secret_body["error"].as_str(), Some("workflow not found"));
 
     assert_eq!(
         scoped_run_count(&fx.pool, fx.community_id, workflow_id).await,
