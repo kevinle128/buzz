@@ -220,7 +220,8 @@ fn spawn_admitted_run(
         let def: WorkflowDef = match serde_json::from_value(definition) {
             Ok(d) => d,
             Err(e) => {
-                let _ = db
+                tracing::error!("webhook: failed to parse definition: {e}");
+                if let Err(db_err) = db
                     .update_workflow_run(
                         community_id,
                         run_id,
@@ -232,7 +233,10 @@ fn spawn_admitted_run(
                             message: &format!("definition parse error: {e}"),
                         }),
                     )
-                    .await;
+                    .await
+                {
+                    tracing::error!("webhook: failed to mark run as failed: {db_err}");
+                }
                 return;
             }
         };
@@ -275,7 +279,7 @@ pub(crate) async fn handle_workflow_webhook(
         .get(axum::http::header::HOST)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let tenant = crate::tenant::bind_community(&state.db, raw_host)
+    let tenant = crate::tenant::bind_community(&*state, raw_host)
         .await
         .map_err(|_| not_found("workflow not found"))?;
     let community_id = tenant.community();
@@ -300,6 +304,7 @@ pub(crate) async fn handle_workflow_webhook(
     if !stored_secret
         .is_some_and(|secret| crate::webhook_secret::verify_secret(&provided_secret, &secret))
     {
+        tracing::warn!("webhook: missing or invalid secret for workflow {id}");
         record_admission_observation(AdmissionObservation::without_run(
             Some(id),
             Some(*community_id.as_uuid()),
@@ -367,9 +372,10 @@ async fn handle_static_webhook(
     // executes with the workflow **owner's** standing authority — so the
     // secret alone is insufficient. Immediately before run creation, reject
     // disabled/inactive workflows and recheck the owner's current channel
-    // membership (and role, for exfiltration-capable definitions). Fail
-    // closed with the same generic 404 as the lookups above so a
-    // revoked-owner workflow is indistinguishable from a nonexistent one.
+    // membership (and role, for exfiltration-capable definitions) and that
+    // the owner is not banned. Fail closed with the same generic 404 as the
+    // lookups above so a revoked-owner workflow is indistinguishable from a
+    // nonexistent one.
     if !workflow.enabled || workflow.status != buzz_db::workflow::WorkflowStatus::Active {
         return Err(not_found("workflow not found"));
     }
