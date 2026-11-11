@@ -14,7 +14,7 @@
 //! Different flag keys can normalize to the same environment variable name
 //! (for example `a-b` and `a_b`), so callers must keep normalized names unique.
 
-use std::{
+use  std::{
     collections::{BTreeSet, HashMap},
     ffi::OsString,
     fmt::{Debug, Formatter},
