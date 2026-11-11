@@ -251,6 +251,10 @@ jobs:
           key: playwright-${{ runner.os }}-${{ steps.pw-version.outputs.version }}
       - name: Install Playwright Chromium
         if: steps.playwright-cache.outputs.cache-hit != 'true'
+        # ubuntu-latest is Ubuntu 26.04, for which this Playwright version has no
+        # browser build and refuses to install. The Ubuntu 24.04 build runs there.
+        env:
+          PLAYWRIGHT_HOST_PLATFORM_OVERRIDE: ubuntu24.04-x64
         run: cd desktop && pnpm exec playwright install chromium
       - name: Install Playwright system dependencies
         run: cd desktop && ../scripts/ci-apt-retry.sh pnpm exec playwright install-deps chromium
