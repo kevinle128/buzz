@@ -152,6 +152,23 @@ fn pool_with(client: AcpClient) -> (AgentPool, mpsc::Receiver<WakeFrame>) {
     (pool, rx)
 }
 
+/// A stub child with the route of worker 0 attached before `initialize`.
+///
+/// The pool attaches its route only after `initialize`, and the reader
+/// answers busy to a wake request that arrives first. A child that sends
+/// its request right after the initialize response must have the route
+/// before that response, or the test depends on task scheduling.
+async fn routed_stub_client(
+    record: &std::path::Path,
+    body: &str,
+    tx: &mpsc::Sender<WakeFrame>,
+) -> AcpClient {
+    let mut client = stub_client(record, body).await;
+    assert!(client.wake_link().attach(WakeRoute::new(tx.clone(), 0)));
+    client.initialize().await.expect("initialize");
+    client
+}
+
 async fn next_frame(rx: &mut mpsc::Receiver<WakeFrame>) -> WakeFrame {
     tokio::time::timeout(Duration::from_secs(10), rx.recv())
         .await
@@ -505,9 +522,9 @@ async fn wake_from_old_child_generation_ignored() {
     let record = record_path();
     let wake = wake_line("goclaw-19", wake_params("w-old", channel_id, &root));
     let body = format!("rec; printf '%s\\n' '{WAKE_INIT}'; printf '%s\\n' '{wake}'; sleep 5");
-    let mut old = stub_client(&record, &body).await;
-    old.initialize().await.expect("initialize");
-    let (mut pool, mut frames) = pool_with(old);
+    let (tx, mut frames) = mpsc::channel(AGENT_WAKE_QUEUE);
+    let old = routed_stub_client(&record, &body, &tx).await;
+    let mut pool = AgentPool::from_slots(vec![Some(agent_with(old, 0))]);
     let frame = next_frame(&mut frames).await;
     assert!(frame.is_current());
 
@@ -515,15 +532,13 @@ async fn wake_from_old_child_generation_ignored() {
     let mut old = pool.try_claim(None).expect("idle worker");
     old.acp.shutdown().await;
     let new_record = record_path();
-    let mut new = stub_client(&new_record, &body).await;
-    new.initialize().await.expect("initialize");
+    let (tx, mut new_frames) = mpsc::channel(4);
+    let new = routed_stub_client(&new_record, &body, &tx).await;
     assert_ne!(
         new.wake_link().generation(),
         old.acp.wake_link().generation()
     );
     pool.return_agent(agent_with(new, 0));
-    let (tx, mut new_frames) = mpsc::channel(4);
-    pool.attach_wake_routes(&tx);
 
     let subscribed = HashSet::from([channel_id]);
     let info = channel_info(channel_id, "stream");
