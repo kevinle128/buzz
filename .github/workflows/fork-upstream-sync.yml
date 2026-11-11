@@ -49,8 +49,9 @@ jobs:
   sync:
     if: github.repository == 'kevinle128/buzz'
     runs-on: ubuntu-latest
-    # A cold `cargo check --workspace --all-targets` sets this limit.
-    timeout-minutes: 90
+    # A cold `cargo check --workspace --all-targets` took 7 minutes and the
+    # whole job 8 minutes (2026-11-11); this limit leaves room for a slow day.
+    timeout-minutes: 30
     permissions:
       # Creates release tags and test base branches through the API. The push
       # to main uses SYNC_PUSH_TOKEN, because GITHUB_TOKEN cannot push a merge
@@ -358,34 +359,55 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           exit 1
 
+      # A test resolve opens its pull request into this branch, which points
+      # at the replayed fork commit. That commit has workflow files that differ
+      # from main, and GitHub lets only a token with the Workflows permission
+      # create such a ref, so this step uses the push token. It runs only for a
+      # test run and creates nothing but a sync-test/ branch. A rerun of this
+      # run finds the branch at the same commit and keeps it.
+      - name: Create test base branch
+        id: test_base
+        if: ${{ failure() && steps.inputs.outputs.test == 'true' && (steps.merge.outputs.conflict == 'true' || steps.checks.outputs.checks_failed == 'true') }}
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PUSH_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          FORK_REF: ${{ steps.inputs.outputs.fork_ref }}
+          TEST_FORK_SHA: ${{ inputs.test_fork_sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$FORK_REF" =~ ^sync-test/[0-9]{8}-[0-9]+-base$ ]]; then
+            echo "::error::${FORK_REF} is not a test base branch; nothing is created."
+            exit 1
+          fi
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "::error::The SYNC_PUSH_TOKEN secret is not set; the test base branch is not created."
+            exit 1
+          fi
+          if ! gh api "repos/${GH_REPO}/git/refs" -f ref="refs/heads/${FORK_REF}" -f sha="$TEST_FORK_SHA" > /dev/null; then
+            current="$(gh api "repos/${GH_REPO}/git/ref/heads/${FORK_REF}" --jq .object.sha)"
+            if [[ "$current" != "$TEST_FORK_SHA" ]]; then
+              echo "::error::Test base ${FORK_REF} exists at ${current}, not at ${TEST_FORK_SHA}."
+              exit 1
+            fi
+          fi
+          echo "Test base branch: ${FORK_REF} at ${TEST_FORK_SHA:0:9}"
+
+      # A test issue names its base branch, so it is opened only when that
+      # branch exists.
       - name: Open or update conflict issue
         id: issue
-        if: ${{ failure() && (steps.merge.outputs.conflict == 'true' || steps.checks.outputs.checks_failed == 'true') }}
+        if: ${{ failure() && steps.test_base.outcome != 'failure' && (steps.merge.outputs.conflict == 'true' || steps.checks.outputs.checks_failed == 'true') }}
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           LABEL: upstream-sync-conflict
           FORCE_HUMAN_REVIEW: ${{ vars.SYNC_FORCE_HUMAN_REVIEW }}
-          FORK_REF: ${{ steps.inputs.outputs.fork_ref }}
           TEST: ${{ steps.inputs.outputs.test }}
-          TEST_FORK_SHA: ${{ inputs.test_fork_sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
           report_dir="${RUNNER_TEMP}/sync-conflict"
           title="$(cat "${report_dir}/title.txt")"
-          if [[ "$TEST" == "true" ]]; then
-            # A test resolve opens its pull request into this branch. A rerun of
-            # this run finds the branch at the same commit and keeps it.
-            if ! gh api "repos/${GH_REPO}/git/refs" -f ref="refs/heads/${FORK_REF}" -f sha="$TEST_FORK_SHA" > /dev/null; then
-              current="$(gh api "repos/${GH_REPO}/git/ref/heads/${FORK_REF}" --jq .object.sha)"
-              if [[ "$current" != "$TEST_FORK_SHA" ]]; then
-                echo "::error::Test base ${FORK_REF} exists at ${current}, not at ${TEST_FORK_SHA}."
-                exit 1
-              fi
-            fi
-            echo "Test base branch: ${FORK_REF} at ${TEST_FORK_SHA:0:9}"
-          fi
           gh label create "$LABEL" --color B60205 \
             --description "Daily upstream sync stopped on a merge conflict or failed checks" --force
           labels=(--label "$LABEL")
