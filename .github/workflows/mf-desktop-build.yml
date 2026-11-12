@@ -21,6 +21,12 @@ name: MF Desktop Build
 # A manual run with publish=false is a dry run: it builds only the macOS apps
 # from the chosen branch (version <core>-mf.0, no tag needed), keeps them as
 # workflow artifacts, and publishes and announces nothing.
+#
+# A manual run with channel=canary builds every platform from the chosen branch
+# as version <core>-canary.<run number> (no tag), bakes the canary feed
+# buzz-desktop-canary/latest.json into the app, and publishes only under that
+# CDN folder. It prunes nothing and sends no notice. The production feed and
+# folder stay untouched.
 
 concurrency:
   group: mf-desktop-build-${{ github.ref }}
@@ -42,6 +48,14 @@ on:
         required: false
         default: false
         type: boolean
+      channel:
+        description: "Update feed. canary builds from the chosen branch and publishes to the buzz-desktop-canary/ CDN folder for update tests."
+        required: false
+        default: production
+        type: choice
+        options:
+          - production
+          - canary
 
 permissions:
   contents: read
@@ -49,13 +63,14 @@ permissions:
 env:
   # The Wasabi account blocks anonymous reads, so clients download through a
   # CDN that serves the bucket root: https://<cdn>/<key> maps to s3://<bucket>/<key>.
-  BUZZ_UPDATER_ENDPOINT: https://gamestudio.mobigame.vn/buzz-desktop/latest.json
+  BUZZ_UPDATER_ENDPOINT: ${{ github.event_name == 'workflow_dispatch' && inputs.channel == 'canary' && 'https://gamestudio.mobigame.vn/buzz-desktop-canary/latest.json' || 'https://gamestudio.mobigame.vn/buzz-desktop/latest.json' }}
   WASABI_ENDPOINT: https://s3.ap-southeast-1.wasabisys.com
   WASABI_BUCKET: game-mobile-registry
   BUZZ_UPDATER_PUBLIC_KEY: ${{ secrets.BUZZ_UPDATER_PUBLIC_KEY }}
   # Tag pushes have no inputs, so both values are false for them.
   MF_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && !inputs.publish }}
   MF_MACOS_SIGNING: ${{ github.event_name == 'workflow_dispatch' && inputs.macos_signing }}
+  MF_CANARY: ${{ github.event_name == 'workflow_dispatch' && inputs.channel == 'canary' }}
 
 jobs:
   setup:
@@ -69,7 +84,7 @@ jobs:
     steps:
       - name: Determine version
         id: version
-        if: env.MF_DRY_RUN != 'true'
+        if: env.MF_DRY_RUN != 'true' && env.MF_CANARY != 'true'
         run: |
           VERSION="${GITHUB_REF_NAME#desktop-v}"
           if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+-mf\.[0-9]+$'; then
@@ -83,19 +98,25 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # Untagged builds: a dry run is <core>-mf.0; a canary is
+      # <core>-canary.<run number>, so each canary is newer than the last.
       - name: Determine dry-run version
         id: dry_version
-        if: env.MF_DRY_RUN == 'true'
+        if: env.MF_DRY_RUN == 'true' || env.MF_CANARY == 'true'
         run: |
           core=$(jq -r .version desktop/src-tauri/tauri.conf.json)
-          echo "version=${core}-mf.0" >> "$GITHUB_OUTPUT"
+          if [[ "$MF_CANARY" == true ]]; then
+            echo "version=${core}-canary.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${core}-mf.0" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Verify tag-bound source
         id: source
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          if [[ "$MF_DRY_RUN" != true ]]; then
+          if [[ "$MF_DRY_RUN" != true && "$MF_CANARY" != true ]]; then
             scripts/verify-release-ref.sh desktop-v "$VERSION"
           fi
           echo "source_sha=$(git rev-parse 'HEAD^{commit}')" >> "$GITHUB_OUTPUT"
@@ -184,7 +205,7 @@ jobs:
           persist-credentials: false
 
       - name: Verify tag-bound source
-        if: env.MF_DRY_RUN != 'true'
+        if: env.MF_DRY_RUN != 'true' && env.MF_CANARY != 'true'
         run: scripts/verify-release-ref.sh desktop-v "$VERSION"
 
       # Keep Hermit packages and the pnpm store inside the job temp dir so the
@@ -294,7 +315,12 @@ jobs:
             export APPLE_SIGNING_IDENTITY="-"
           fi
           unset FORK_APPLE_CERTIFICATE FORK_APPLE_CERTIFICATE_PASSWORD FORK_APPLE_API_KEY_P8_BASE64
-          cd desktop && pnpm tauri build --verbose --target "$TARGET" ${{ matrix.features }} --config src-tauri/tauri.release.conf.json
+          # Tauri's verbose log prints the password of its temporary signing
+          # keychain, so a signed build runs without --verbose.
+          verbose_flag=--verbose
+          if [[ "$MF_MACOS_SIGNING" == true ]]; then verbose_flag=; fi
+          # shellcheck disable=SC2086 # an empty flag must expand to no argument.
+          cd desktop && pnpm tauri build $verbose_flag --target "$TARGET" ${{ matrix.features }} --config src-tauri/tauri.release.conf.json
         env:
           FORK_APPLE_CERTIFICATE: ${{ env.MF_MACOS_SIGNING == 'true' && secrets.APPLE_CERTIFICATE || '' }}
           FORK_APPLE_CERTIFICATE_PASSWORD: ${{ env.MF_MACOS_SIGNING == 'true' && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
@@ -694,6 +720,7 @@ jobs:
       # published release red.
       - name: Delete older versions
         id: prune
+        if: env.MF_CANARY != 'true'
         continue-on-error: true
         env:
           PREFIX: ${{ steps.upload.outputs.prefix }}
@@ -721,7 +748,7 @@ jobs:
   notify:
     name: Notify Buzz
     needs: [setup, publish]
-    if: ${{ always() && github.repository == 'kevinle128/buzz' && needs.setup.result != 'skipped' && (github.event_name != 'workflow_dispatch' || inputs.publish) }}
+    if: ${{ always() && github.repository == 'kevinle128/buzz' && needs.setup.result != 'skipped' && (github.event_name != 'workflow_dispatch' || (inputs.publish && inputs.channel != 'canary')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
