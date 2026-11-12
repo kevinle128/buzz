@@ -311,6 +311,21 @@ impl ActionSink for RelayActionSink {
                     "workflow owner cannot post in destination channel".into(),
                 ));
             }
+            crate::handlers::ingest::check_agent_dm_write(
+                tenant.community(),
+                &state,
+                channel_uuid,
+                &author_pubkey_bytes,
+                &channel,
+            )
+            .await
+            .map_err(|e| {
+                if e == crate::handlers::ingest::AGENT_DM_REFUSED {
+                    ActionSinkError::InvalidInput(e)
+                } else {
+                    ActionSinkError::Database(e)
+                }
+            })?;
 
             // 3. Build kind:9 Nostr event
             //    - Signed by relay keypair (event.pubkey = relay pubkey)
