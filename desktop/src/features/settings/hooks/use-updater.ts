@@ -16,7 +16,7 @@ export type UpdateStatus =
   | {
       state: "manual-required";
       version: string;
-      /** GitHub releases page for the update. */
+      /** Download URL of the update's .deb on the fork's CDN. */
       releaseUrl: string;
     };
 
@@ -30,7 +30,26 @@ const BACKGROUND_BLOCKED_STATES = new Set<UpdateStatus["state"]>([
   "manual-required",
 ]);
 
-const GITHUB_RELEASES_URL = "https://github.com/block/buzz/releases/latest";
+// Fork releases live on the CDN as <base>/v<version>/, not on GitHub. The
+// .deb sits next to the AppImage that the feed names for linux-x86_64, so it
+// follows the feed the build reads (production or canary).
+const FORK_RELEASES_BASE_URL = "https://gamestudio.mobigame.vn/buzz-desktop";
+
+function forkDebUrl(update: Pick<Update, "version" | "rawJson">): string {
+  // rawJson can be missing (for example in test doubles of the updater).
+  const rawJson = update.rawJson as Record<string, unknown> | null | undefined;
+  const platforms = rawJson?.platforms as
+    | Record<string, { url?: unknown } | undefined>
+    | undefined;
+  const appImageUrl = platforms?.["linux-x86_64"]?.url;
+  if (
+    typeof appImageUrl === "string" &&
+    /\.AppImage(\.tar\.gz)?$/.test(appImageUrl)
+  ) {
+    return appImageUrl.replace(/\.AppImage(\.tar\.gz)?$/, ".deb");
+  }
+  return `${FORK_RELEASES_BASE_URL}/v${update.version}/Buzz_${update.version}_amd64.deb`;
+}
 
 function toErrorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
@@ -168,7 +187,7 @@ export function useUpdater() {
             setStatus({
               state: "manual-required",
               version: update.version,
-              releaseUrl: GITHUB_RELEASES_URL,
+              releaseUrl: forkDebUrl(update),
             });
           }
         } else if (shouldShowQuietResult) {
