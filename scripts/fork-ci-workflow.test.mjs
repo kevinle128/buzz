@@ -46,6 +46,22 @@ function stepRunScript(source, id) {
   return body.map((line) => line.slice(indent)).join("\n");
 }
 
+// Returns the lines of each job, keyed by job id.
+function jobBlocks(source) {
+  const jobs = new Map();
+  let current;
+  for (const line of source.split("\njobs:\n")[1].split("\n")) {
+    const match = /^ {2}([a-z0-9_-]+):\s*$/.exec(line);
+    if (match) {
+      current = match[1];
+      jobs.set(current, []);
+    } else if (current) {
+      jobs.get(current).push(line);
+    }
+  }
+  return jobs;
+}
+
 // Returns the YAML of one step, from its `- ` line to the next step.
 function stepBlock(source, id) {
   const lines = source.split("\n");
@@ -971,23 +987,48 @@ test("the resume releases only after a sync pull request merge that contains the
   }
 });
 
-test("the desktop build runs on GitHub-hosted runners and can be started on a tag", () => {
+test("the desktop build runs macOS on the Mac runner, cleans it, and can be started on a tag", () => {
   assert.match(
     buildWorkflow,
     /on:\n {2}push:\n {4}tags:\n {6}- 'desktop-v\[0-9\]\*-mf\.\[0-9\]\*'\n {2}workflow_dispatch:\n/,
   );
-  assert.doesNotMatch(buildWorkflow, /self-hosted/);
   const runners = [...buildWorkflow.matchAll(/runs-on: (.+)/g)].map(
     (match) => match[1],
   );
   assert.deepEqual(runners, [
     "ubuntu-latest",
-    "macos-latest",
+    "[self-hosted, macOS, ARM64, buzz]",
     "ubuntu-latest",
     "windows-latest",
     "ubuntu-latest",
     "ubuntu-latest",
   ]);
+  // The Mac runner keeps its disk between jobs, so the macOS job keeps Hermit
+  // and pnpm under the job temp dir and always removes them and the workspace.
+  const macos = jobBlocks(buildWorkflow).get("build-macos").join("\n");
+  assert.match(macos, /max-parallel: 1/);
+  assert.match(macos, /HERMIT_STATE_DIR=\$RUNNER_TEMP\/mf-cache\/hermit/);
+  assert.match(
+    macos,
+    /pnpm_config_store_dir=\$RUNNER_TEMP\/mf-cache\/pnpm-store/,
+  );
+  assert.match(
+    macos,
+    /- name: Clean workspace\n\s+if: always\(\)\n\s+run: \|\n\s+find "\$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf \{\} \+[\s\S]*rm -rf "\$RUNNER_TEMP\/mf-cache"/,
+  );
+  for (const name of [
+    "build-linux",
+    "build-windows",
+    "publish",
+    "notify",
+    "setup",
+  ]) {
+    assert.doesNotMatch(
+      jobBlocks(buildWorkflow).get(name).join("\n"),
+      /self-hosted/,
+      name,
+    );
+  }
 });
 
 test("the release prune keeps the newest versions and deletes only older version folders", async (t) => {
