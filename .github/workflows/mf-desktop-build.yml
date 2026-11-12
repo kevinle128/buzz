@@ -249,6 +249,31 @@ jobs:
           security list-keychains -d user | tr -d '"' | xargs -n1 > "$RUNNER_TEMP/keychain-search-list.txt"
           security default-keychain -d user | tr -d '" ' > "$RUNNER_TEMP/keychain-default.txt"
 
+      # codesign must build the chain leaf -> Developer ID G2 -> Apple Root CA.
+      # The Mac has only the root. Tauri imports the .p12 (with G2) into a new
+      # keychain for each signing pass and deletes it afterwards; the second
+      # pass, for the DMG, then failed with "unable to build chain to
+      # self-signed root" (errSecInternalComponent). A job keychain holding the
+      # public G2 certificate from Apple stays in the search list for the whole
+      # job; the clean step deletes it with the other added keychains.
+      - name: Add the Developer ID G2 certificate authority
+        if: env.MF_MACOS_SIGNING == 'true'
+        run: |
+          set -euo pipefail
+          cert="$RUNNER_TEMP/DeveloperIDG2CA.cer"
+          curl -fsSL --retry 3 -o "$cert" https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer
+          echo "f16cd3c54c7f83cea4bf1a3e6a0819c8aaa8e4a1528fd144715f350643d2df3a  $cert" | shasum -a 256 -c -
+          keychain="$RUNNER_TEMP/developer-id-ca.keychain-db"
+          password=$(openssl rand -hex 24)
+          echo "::add-mask::$password"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security add-certificates -k "$keychain" "$cert"
+          # shellcheck disable=SC2046
+          security list-keychains -d user -s $(cat "$RUNNER_TEMP/keychain-search-list.txt") "$keychain"
+          security list-keychains -d user
+
       # Without macos_signing, Tauri signs ad hoc with Entitlements.plist. With
       # it, Tauri imports the Developer ID certificate, signs the sidecars and
       # the app with the hardened runtime, then notarizes and staples the app;
