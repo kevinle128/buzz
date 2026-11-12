@@ -13,7 +13,8 @@ name: MF Desktop Build
 # form. Either way the tag supplies the version; set-version-from-tag.mjs
 # patches the manifests at build time.
 #
-# macOS builds are ad-hoc signed unless the macos_signing input is on; then
+# macOS is built for Apple silicon only, so latest.json has no darwin-x86_64
+# entry and Intel installs stop updating. macOS builds are ad-hoc signed unless the macos_signing input is on; then
 # they are signed with the fork's Developer ID certificate and notarized.
 # Windows installers have no Authenticode signature, so SmartScreen warns on
 # first install. Both still carry the Tauri updater signature.
@@ -150,15 +151,12 @@ jobs:
       max-parallel: 1
       matrix:
         include:
-          # Upstream ships mesh-llm (Metal) only on Apple Silicon.
+          # The fork ships macOS for Apple silicon only; Intel Macs get no
+          # build. Upstream ships mesh-llm (Metal) only on Apple Silicon.
           - arch: aarch64
             target: aarch64-apple-darwin
             features: --features mesh-llm
             mesh: true
-          - arch: x64
-            target: x86_64-apple-darwin
-            features: ""
-            mesh: false
     env:
       VERSION: ${{ needs.setup.outputs.version }}
       TARGET: ${{ matrix.target }}
@@ -678,7 +676,6 @@ jobs:
             echo "${matches[0]}"
           }
           mac_arm=$(one "Buzz_${VERSION}_aarch64.app.tar.gz")
-          mac_x64=$(one "Buzz_${VERSION}_x64.app.tar.gz")
           # Tauri 2.11+ signs the AppImage directly; older versions wrap it in a tar.gz.
           if find dist -type f -name '*.AppImage.tar.gz' | grep -q .; then
             linux=$(one '*.AppImage.tar.gz')
@@ -694,7 +691,6 @@ jobs:
 
           desktop/scripts/generate-oss-latest-json.sh "$VERSION" \
             "darwin-aarch64:${mac_arm}.sig:${base_url}/$(basename "$mac_arm")" \
-            "darwin-x86_64:${mac_x64}.sig:${base_url}/$(basename "$mac_x64")" \
             "linux-x86_64:${linux}.sig:${base_url}/$(basename "$linux")" \
             "windows-x86_64:${windows}.sig:${base_url}/$(basename "$windows")" \
             > latest.json
