@@ -36,7 +36,9 @@ const BACKGROUND_BLOCKED_STATES = new Set<UpdateStatus["state"]>([
 const FORK_RELEASES_BASE_URL = "https://gamestudio.mobigame.vn/buzz-desktop";
 
 function forkDebUrl(update: Pick<Update, "version" | "rawJson">): string {
-  const platforms = update.rawJson.platforms as
+  // rawJson can be missing (for example in test doubles of the updater).
+  const rawJson = update.rawJson as Record<string, unknown> | null | undefined;
+  const platforms = rawJson?.platforms as
     | Record<string, { url?: unknown } | undefined>
     | undefined;
   const appImageUrl = platforms?.["linux-x86_64"]?.url;
