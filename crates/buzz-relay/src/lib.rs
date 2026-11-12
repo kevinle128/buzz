@@ -114,3 +114,4 @@ pub use state::AppState;
 pub mod verified_profiles;
 
 mod observer;
+mod single_community;

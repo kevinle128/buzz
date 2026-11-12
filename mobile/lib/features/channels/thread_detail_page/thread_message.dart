@@ -40,11 +40,18 @@ class _ThreadMessage extends HookConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final startsThreads = ref.watch(channelStartsThreadsProvider(channelId));
     final messageSnapshotKey = useMemoized(GlobalKey.new, const []);
     final swipeContentKey = useMemoized(GlobalKey.new, const []);
     final mediaOffset = useMessageMediaOffset(message.content, message.tags);
     final pk = message.pubkey.toLowerCase();
     final ownMessage = currentPubkey?.toLowerCase() == pk;
+    final showSenderIdentity = showMessageAuthorName(
+      ref,
+      channelId,
+      message.pubkey,
+      currentPubkey,
+    );
     final profile =
         ref.watch(userCacheProvider.select((cache) => cache[pk])) ??
         ref.read(userCacheProvider.notifier).get(pk);
@@ -181,7 +188,7 @@ class _ThreadMessage extends HookConsumerWidget {
                           child: Padding(
                             padding: EdgeInsets.only(
                               right: ownMessage ? Grid.xxs : 0,
-                              left: ownMessage
+                              left: ownMessage || !showSenderIdentity
                                   ? 0
                                   : messageAvatarSize +
                                         messageAvatarContentGap +
@@ -215,9 +222,9 @@ class _ThreadMessage extends HookConsumerWidget {
                               : TextDirection.ltr,
                           crossAxisAlignment: CrossAxisAlignment.end,
                           children: [
-                            if (!ownMessage)
+                            if (!ownMessage && showSenderIdentity)
                               const SizedBox(width: messageAvatarSize),
-                            if (!ownMessage)
+                            if (!ownMessage && showSenderIdentity)
                               const SizedBox(width: messageAvatarContentGap),
                             Expanded(
                               child: Padding(
@@ -242,12 +249,7 @@ class _ThreadMessage extends HookConsumerWidget {
                                               child: MessageAuthorMeta(
                                                 timestampGap: Grid.half,
                                                 showIdentity:
-                                                    showMessageAuthorName(
-                                                      ref,
-                                                      channelId,
-                                                      message.pubkey,
-                                                      currentPubkey,
-                                                    ),
+                                                    showSenderIdentity,
                                                 showTimestamp: true,
                                                 reversed: false,
                                                 alignment: ownMessage
@@ -313,29 +315,19 @@ class _ThreadMessage extends HookConsumerWidget {
                                                 ),
                                               ),
                                             ),
-                                            if (message.edited) ...[
-                                              const SizedBox(width: Grid.half),
-                                              Text(
-                                                '(edited)',
-                                                style: context
-                                                    .textTheme
-                                                    .labelSmall
-                                                    ?.copyWith(
-                                                      color: context
-                                                          .colors
-                                                          .onSurfaceVariant,
-                                                      fontStyle:
-                                                          FontStyle.italic,
-                                                    ),
-                                              ),
-                                            ],
                                           ],
                                         ),
                                       ),
                                     MessageContent(
                                       key: swipeContentKey,
                                       content: message.content,
+                                      edited: message.edited,
                                       bubble: true,
+                                      additionalTextWidth:
+                                          !ownMessage && !showSenderIdentity
+                                          ? messageAvatarSize +
+                                                messageAvatarContentGap
+                                          : 0,
                                       hasReactions:
                                           message.reactions.isNotEmpty,
                                       bubbleEnd: showAvatar,
@@ -353,7 +345,8 @@ class _ThreadMessage extends HookConsumerWidget {
                                       scaleEmojiOnly: true,
                                       mediaCarouselTrailingOverflow:
                                           Grid.gutter,
-                                      onMediaReply: allMessages == null
+                                      onMediaReply:
+                                          allMessages == null || !startsThreads
                                           ? null
                                           : () {
                                               if (!context.mounted) return;
@@ -373,6 +366,13 @@ class _ThreadMessage extends HookConsumerWidget {
                                                 ),
                                               );
                                             },
+                                      nativePhotoActions: nativeImageActions(
+                                        context: context,
+                                        ref: ref,
+                                        message: message,
+                                        channelId: channelId,
+                                        canManageMessage: canManageMessage,
+                                      ),
                                       onMediaMore: (viewerContext, imageUrl) =>
                                           showImageActions(
                                             context: viewerContext,
@@ -414,7 +414,7 @@ class _ThreadMessage extends HookConsumerWidget {
                             ),
                           ],
                         ),
-                        if (showAvatar && !ownMessage)
+                        if (showAvatar && !ownMessage && showSenderIdentity)
                           Positioned(
                             left: ownMessage ? null : 0,
                             right: ownMessage ? 0 : null,
