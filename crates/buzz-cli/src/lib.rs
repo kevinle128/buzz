@@ -748,7 +748,7 @@ pub enum MessagesCmd {
         #[arg(long)]
         reply_to: Option<String>,
     },
-    /// Edit a previously sent message
+    /// Edit a previously sent message, retaining its current attachments
     Edit {
         /// Event ID of the message to edit (64-char hex)
         #[arg(long)]
@@ -756,6 +756,9 @@ pub enum MessagesCmd {
         /// New message content
         #[arg(long)]
         content: String,
+        /// Remove all attachments on kinds 9/40002/40008/45001/45003 (later edits keep them removed)
+        #[arg(long)]
+        clear_attachments: bool,
     },
     /// Delete a message by event ID
     Delete {
@@ -841,7 +844,7 @@ pub enum MessagesCmd {
     },
     /// Full-text search across messages
     #[command(
-        after_help = "Examples:\n  buzz messages search --query checkout\n  buzz messages search --author npub1... --since 1783497600\n  buzz messages search --author Aaron --query checkout --limit 20"
+        after_help = "Examples:\n  buzz messages search --query checkout\n  buzz messages search --author npub1... --since 1783497600\n  buzz messages search --author Aaron --query checkout --limit 20\n  buzz messages search --author npub1... --before 1783584000 --before-id <last result id> --limit 100"
     )]
     Search {
         /// Search query string (optional when --author is given)
@@ -853,6 +856,14 @@ pub enum MessagesCmd {
         /// Unix timestamp — return messages after this time
         #[arg(long)]
         since: Option<i64>,
+        /// Unix timestamp cursor — return messages created at or before this time.
+        /// To page back, pass the last result's `created_at` here and its `id` as --before-id.
+        #[arg(long)]
+        before: Option<i64>,
+        /// Event ID cursor — with --before, resume after this event, so events from the
+        /// same second are neither repeated nor skipped. Not allowed with --query.
+        #[arg(long, requires = "before")]
+        before_id: Option<String>,
         /// Maximum number of results to return
         #[arg(long)]
         limit: Option<u32>,
@@ -2907,6 +2918,26 @@ mod tests {
             event.as_str(),
         ])
         .is_ok());
+    }
+
+    #[test]
+    fn messages_search_parses_cursor_and_requires_before_for_before_id() {
+        let search = |extra: &[&str]| {
+            let mut argv = vec!["buzz", "messages", "search", "--author", "x"];
+            argv.extend_from_slice(extra);
+            Cli::try_parse_from(argv)
+        };
+        let id = "a".repeat(64);
+        match search(&["--before", "200", "--before-id", &id]).map(|c| c.command) {
+            Ok(Cmd::Messages(MessagesCmd::Search {
+                before, before_id, ..
+            })) => {
+                assert_eq!(before, Some(200));
+                assert_eq!(before_id.as_deref(), Some(id.as_str()));
+            }
+            _ => panic!("messages search should parse --before and --before-id"),
+        }
+        assert!(search(&["--before-id", &id]).is_err());
     }
 
     #[test]

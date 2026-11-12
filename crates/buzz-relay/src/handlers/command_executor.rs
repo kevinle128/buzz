@@ -27,7 +27,10 @@ use buzz_workflow::executor::TriggerContext;
 use crate::state::AppState;
 use crate::webhook_secret;
 
-use super::ingest::{extract_channel_id, IngestAuth, IngestError, IngestResult};
+use super::ingest::{
+    agent_dm_allowed, agent_owner_cached, extract_channel_id, IngestAuth, IngestError,
+    IngestResult, AGENT_DM_REFUSED,
+};
 use super::side_effects::{
     emit_group_discovery_events, emit_membership_notification, emit_system_message,
     publish_dm_visibility_snapshot,
@@ -294,6 +297,25 @@ fn compute_definition_hash(json_str: &str) -> Vec<u8> {
     Sha256::digest(json_str.as_bytes()).to_vec()
 }
 
+/// An agent may only open or widen a DM into one whose participants are
+/// exactly itself and its owner. Humans pass untouched.
+async fn check_agent_dm_participants(
+    tenant: &TenantContext,
+    state: &AppState,
+    self_bytes: &[u8],
+    participants: &[Vec<u8>],
+) -> Result<(), IngestError> {
+    let owner = agent_owner_cached(state, tenant.community(), self_bytes)
+        .await
+        .map_err(|e| IngestError::Internal(format!("error: agent owner lookup: {e}")))?;
+    match owner {
+        Some(owner) if !agent_dm_allowed(self_bytes, &owner, participants) => {
+            Err(IngestError::Rejected(AGENT_DM_REFUSED.into()))
+        }
+        _ => Ok(()),
+    }
+}
+
 async fn handle_dm_open(
     tenant: &TenantContext,
     state: &Arc<AppState>,
@@ -331,6 +353,8 @@ async fn handle_dm_open(
             all_bytes.push(ob.clone());
         }
     }
+
+    check_agent_dm_participants(tenant, state, &self_bytes, &all_bytes).await?;
 
     // Persist the command event (idempotency) — returns open transaction
     let tx = match persist_command_event(&state.db, tenant, event, None).await? {
@@ -493,6 +517,7 @@ async fn handle_dm_add_member(
             "invalid: DM supports at most 9 participants".into(),
         ));
     }
+    check_agent_dm_participants(tenant, state, &self_bytes, &all_bytes).await?;
 
     // Persist the command event — returns open transaction
     let tx = match persist_command_event(&state.db, tenant, event, None).await? {
@@ -700,7 +725,7 @@ async fn handle_workflow_def(
             .map_err(|e| IngestError::Internal(format!("error: role check: {e}")))?;
         if !matches!(role.as_deref(), Some("owner") | Some("admin")) {
             return Err(IngestError::Rejected(
-                "forbidden: workflows with call_webhook actions require the owner or admin role"
+                "forbidden: workflows with call_webhook actions require the channel owner or admin role"
                     .into(),
             ));
         }

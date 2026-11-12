@@ -260,26 +260,43 @@ final class BuzzPushNotificationResolverTests: XCTestCase {
     XCTAssertNil(result)
   }
 
-  func testPreviewBodySanitizesCodeLinksAndWhitespace() {
-    let content = """
-      Before   ```swift
-      print("secret")
-      ``` `inline` [docs](https://example.com/docs)
-      ![image](https://example.com/image.png) https://example.com/raw
-      After
-      """
+  /// The shared cases every mobile platform's notification body must match.
+  func testPreviewBodyMatchesSharedNotificationBodyCases() throws {
+    struct Fixture: Decodable {
+      struct Case: Decodable {
+        let name: String
+        let input: String
+        let expected: String
+      }
+      let maxLength: Int
+      let cases: [Case]
+    }
+    let url = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent()
+      .appendingPathComponent("../../../../../test-fixtures/notification-body.json")
+      .standardizedFileURL
+    let fixture = try JSONDecoder().decode(Fixture.self, from: Data(contentsOf: url))
 
-    XCTAssertEqual(
-      BuzzPushNotificationResolver.previewBody(content),
-      "Before [code] inline docs image [link] After"
-    )
+    XCTAssertEqual(BuzzPushNotificationResolver.previewBodyLimit, fixture.maxLength)
+    XCTAssertFalse(fixture.cases.isEmpty)
+    for testCase in fixture.cases {
+      XCTAssertEqual(
+        BuzzPushNotificationResolver.previewBody(testCase.input), testCase.expected, testCase.name)
+    }
   }
 
-  func testPreviewBodyTruncatesTo178CharactersIncludingEllipsis() {
-    let preview = BuzzPushNotificationResolver.previewBody(String(repeating: "x", count: 200))
+  func testPreviewBodyBoundsLongUnclosedMarkup() {
+    // Unclosed bold markers make the bold regex scan to the end of the line
+    // for each opener; without the input cut this takes minutes.
+    let body = BuzzPushNotificationResolver.previewBody(
+      String(repeating: " **a", count: 64 * 1024))
+    XCTAssertLessThanOrEqual(body.utf16.count, BuzzPushNotificationResolver.previewBodyLimit)
+    XCTAssertTrue(body.hasSuffix("…"))
+  }
 
-    XCTAssertEqual(preview.count, 178)
-    XCTAssertEqual(preview, String(repeating: "x", count: 177) + "…")
+  func testPreviewBodyMarksCutInputEvenWhenShort() {
+    let content = "Hi" + String(repeating: " ", count: 5000) + "there"
+    XCTAssertEqual(BuzzPushNotificationResolver.previewBody(content), "Hi…")
   }
 
   func testDecodeResolutionUsesLowestIDWhenCreatedAtTies() {
@@ -311,7 +328,7 @@ final class BuzzPushNotificationResolverTests: XCTestCase {
 
       XCTAssertEqual(result?.0.title, sender.title, "pubkey: \(sender.pubkey)")
       XCTAssertEqual(result?.0.body, "Preview", "pubkey: \(sender.pubkey)")
-      XCTAssertEqual(result?.0.subtitle, "Community", "pubkey: \(sender.pubkey)")
+      XCTAssertNil(result?.0.subtitle, "pubkey: \(sender.pubkey)")
       XCTAssertEqual(result?.0.senderPubkey, sender.pubkey, "pubkey: \(sender.pubkey)")
       XCTAssertEqual(result?.0.threadIdentifier, "community-id", "pubkey: \(sender.pubkey)")
     }
@@ -367,7 +384,7 @@ final class BuzzPushNotificationResolverTests: XCTestCase {
     XCTAssertNotEqual(result.body, Self.gatewayBody)
     XCTAssertEqual(result.title, "")
     XCTAssertEqual(result.body, "Hello Buzz")
-    XCTAssertEqual(result.subtitle, "Community")
+    XCTAssertNil(result.subtitle)
     XCTAssertEqual(
       result.threadIdentifier,
       BuzzPushPresentationIdentity.conversation(
@@ -1024,7 +1041,7 @@ final class BuzzPushNotificationResolverTests: XCTestCase {
 
     XCTAssertEqual(result.title, "")
     XCTAssertNil(result.conversationDisplayName)
-    XCTAssertEqual(result.subtitle, "Community")
+    XCTAssertNil(result.subtitle)
     XCTAssertEqual(result.body, "Fallback content")
   }
 

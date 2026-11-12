@@ -1433,7 +1433,7 @@ dependencies = [
 
 [[package]]
 name = "buzz-relay"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1443,6 +1443,7 @@ dependencies = [
  "base64 0.22.1",
  "buzz-audit",
  "buzz-auth",
+ "buzz-cli",
  "buzz-conformance",
  "buzz-core",
  "buzz-datastore-tracing",
@@ -1976,7 +1977,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2830,7 +2831,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3053,7 +3054,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3888,9 +3889,9 @@ dependencies = [
 
 [[package]]
 name = "hickory-proto"
-version = "0.26.3"
+version = "0.26.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12b92608f679a6fa515dd1d15c1ff89443026e391200a2c840c7afcba482893d"
+checksum = "7e2da0694c15b44c6f68a6b05e0233617008c54080e31d6eb848d858a9c5b38d"
 dependencies = [
  "data-encoding",
  "idna",
@@ -6659,7 +6660,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -8878,7 +8879,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -8937,7 +8938,7 @@ dependencies = [
  "security-framework 3.7.0",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -9264,7 +9265,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5b55fb86dfd3a2f5f76ea78310a88f96c4ea21a3031f8d212443d56123fd0521"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -9924,7 +9925,7 @@ dependencies = [
 [[package]]
 name = "sqlx"
 version = "0.9.0"
-source = "git+https://github.com/launchbadge/sqlx?rev=f1e94ec34dd5f11ad6488a3a8ac7988439a3f757#f1e94ec34dd5f11ad6488a3a8ac7988439a3f757"
+source = "git+https://github.com/launchbadge/sqlx?rev=c3735abf034689bb1fab9d7bf9f040e492de28cf#c3735abf034689bb1fab9d7bf9f040e492de28cf"
 dependencies = [
  "sqlx-core",
  "sqlx-macros",
@@ -9936,7 +9937,7 @@ dependencies = [
 [[package]]
 name = "sqlx-core"
 version = "0.9.0"
-source = "git+https://github.com/launchbadge/sqlx?rev=f1e94ec34dd5f11ad6488a3a8ac7988439a3f757#f1e94ec34dd5f11ad6488a3a8ac7988439a3f757"
+source = "git+https://github.com/launchbadge/sqlx?rev=c3735abf034689bb1fab9d7bf9f040e492de28cf#c3735abf034689bb1fab9d7bf9f040e492de28cf"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -9973,7 +9974,7 @@ dependencies = [
 [[package]]
 name = "sqlx-macros"
 version = "0.9.0"
-source = "git+https://github.com/launchbadge/sqlx?rev=f1e94ec34dd5f11ad6488a3a8ac7988439a3f757#f1e94ec34dd5f11ad6488a3a8ac7988439a3f757"
+source = "git+https://github.com/launchbadge/sqlx?rev=c3735abf034689bb1fab9d7bf9f040e492de28cf#c3735abf034689bb1fab9d7bf9f040e492de28cf"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -9985,7 +9986,7 @@ dependencies = [
 [[package]]
 name = "sqlx-macros-core"
 version = "0.9.0"
-source = "git+https://github.com/launchbadge/sqlx?rev=f1e94ec34dd5f11ad6488a3a8ac7988439a3f757#f1e94ec34dd5f11ad6488a3a8ac7988439a3f757"
+source = "git+https://github.com/launchbadge/sqlx?rev=c3735abf034689bb1fab9d7bf9f040e492de28cf#c3735abf034689bb1fab9d7bf9f040e492de28cf"
 dependencies = [
  "cfg-if 1.0.4",
  "dotenvy",
@@ -10010,7 +10011,7 @@ dependencies = [
 [[package]]
 name = "sqlx-mysql"
 version = "0.9.0"
-source = "git+https://github.com/launchbadge/sqlx?rev=f1e94ec34dd5f11ad6488a3a8ac7988439a3f757#f1e94ec34dd5f11ad6488a3a8ac7988439a3f757"
+source = "git+https://github.com/launchbadge/sqlx?rev=c3735abf034689bb1fab9d7bf9f040e492de28cf#c3735abf034689bb1fab9d7bf9f040e492de28cf"
 dependencies = [
  "bitflags 2.13.0",
  "byteorder",
@@ -10037,7 +10038,7 @@ dependencies = [
 [[package]]
 name = "sqlx-postgres"
 version = "0.9.0"
-source = "git+https://github.com/launchbadge/sqlx?rev=f1e94ec34dd5f11ad6488a3a8ac7988439a3f757#f1e94ec34dd5f11ad6488a3a8ac7988439a3f757"
+source = "git+https://github.com/launchbadge/sqlx?rev=c3735abf034689bb1fab9d7bf9f040e492de28cf#c3735abf034689bb1fab9d7bf9f040e492de28cf"
 dependencies = [
  "atoi",
  "base64 0.22.1",
@@ -10073,7 +10074,7 @@ dependencies = [
 [[package]]
 name = "sqlx-sqlite"
 version = "0.9.0"
-source = "git+https://github.com/launchbadge/sqlx?rev=f1e94ec34dd5f11ad6488a3a8ac7988439a3f757#f1e94ec34dd5f11ad6488a3a8ac7988439a3f757"
+source = "git+https://github.com/launchbadge/sqlx?rev=c3735abf034689bb1fab9d7bf9f040e492de28cf#c3735abf034689bb1fab9d7bf9f040e492de28cf"
 dependencies = [
  "atoi",
  "chrono",
@@ -10476,7 +10477,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -11815,7 +11816,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
