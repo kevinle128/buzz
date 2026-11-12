@@ -462,6 +462,7 @@ jobs:
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Verify tag-bound source
+        if: env.MF_CANARY != 'true'
         run: scripts/verify-release-ref.sh desktop-v "$VERSION"
 
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
@@ -561,6 +562,7 @@ jobs:
           persist-credentials: false
 
       - name: Verify tag-bound source
+        if: env.MF_CANARY != 'true'
         run: scripts/verify-release-ref.sh desktop-v "$VERSION"
 
       # Hermit has no Windows support, so pin the toolchain the same way as
