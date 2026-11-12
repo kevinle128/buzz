@@ -23,7 +23,8 @@ env:
 jobs:
   desktop-build-macos:
     name: Desktop Build (macOS)
-    runs-on: macos-latest
+    # Fork: FORK_MACOS_RUNNER (JSON labels) picks a self-hosted Mac, only for a push or a pull request from this repository.
+    runs-on: ${{ vars.FORK_MACOS_RUNNER != '' && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.FORK_MACOS_RUNNER) || 'macos-latest' }}
     timeout-minutes: 45
     if: github.event_name == 'push' || inputs.desktop || inputs.desktop_rust || inputs.rust
     permissions:
