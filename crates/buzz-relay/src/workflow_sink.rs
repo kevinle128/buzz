@@ -1465,6 +1465,7 @@ mod postgres_tests {
                 "hi",
                 &agent_hex,
                 None,
+                None,
             )
             .await
             .expect_err("an agent's workflow must not post in a DM with a stranger");

@@ -48,6 +48,8 @@ pub mod feature_flags;
 /// WebSocket message handlers for NIP-01 client commands.
 pub mod handlers;
 /// Stateless HMAC-signed relay invite tokens (mint/verify).
+pub mod invite_preview;
+/// Stateless HMAC-signed relay invite tokens (mint/verify).
 pub mod invite_token;
 /// Fixed-schema evidence for the relay's earliest startup steps.
 pub mod lifecycle;
