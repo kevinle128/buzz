@@ -1480,6 +1480,7 @@ mod postgres_tests {
             "hi",
             &agent_hex,
             None,
+            None,
         )
         .await
         .expect("an agent's workflow may post in its owner-only DM");
