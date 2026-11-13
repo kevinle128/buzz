@@ -160,8 +160,8 @@ impl ObserverHandle {
         payload: serde_json::Value,
     ) {
         let mut event = ObserverEvent {
-            seq: self.inner.seq.fetch_add(1, Ordering::Relaxed),
-            timestamp: chrono::Utc::now().to_rfc3339(),
+            seq: 0,
+            timestamp: String::new(),
             kind: kind.into(),
             agent_index,
             channel_id: context.channel_id.clone(),
