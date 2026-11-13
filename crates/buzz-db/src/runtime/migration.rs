@@ -902,7 +902,7 @@ mod postgres_tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 88);
+        assert_eq!(migrations.len(), 90);
         assert!(migrations[83]
             .sql
             .as_str()
@@ -923,15 +923,13 @@ mod postgres_tests {
             .sql
             .as_str()
             .contains("VALIDATE CONSTRAINT workflow_runs_cause_pubkey_check"));
-        for (index, migration) in migrations.iter().enumerate() {
-            assert_eq!(migration.version, (index + 1) as i64);
-        } // The fork's two migrations sit at 0089 and 0090, after upstream's
-          // 0087 and 0088, which arrive with the next upstream merge.
+        // The fork's two migrations sit at 0089 and 0090, after upstream's
+        // 0087 and 0088.
         let versions: Vec<i64> = migrations
             .iter()
             .map(|migration| migration.version)
             .collect();
-        assert_eq!(versions, (1..=86).chain([89, 90]).collect::<Vec<i64>>());
+        assert_eq!(versions, (1..=90).collect::<Vec<i64>>());
 
         assert!(migrations[79]
             .sql
@@ -1011,14 +1009,14 @@ mod postgres_tests {
             .contains("CREATE FUNCTION profile_name_fields"));
         // Fork-only migrations sit after the newest upstream version. When an
         // upstream sync adds versions, move them past upstream again.
-        assert_eq!(migrations[86].version, 89);
+        assert_eq!(migrations[88].version, 89);
         assert_eq!(
-            &*migrations[86].description,
+            &*migrations[88].description,
             "workflow run route idempotency"
         );
-        assert_eq!(migrations[87].version, 90);
-        assert_eq!(&*migrations[87].description, "app callback notifications");
-        assert!(migrations[87].sql.as_str().contains("CREATE TABLE apps"));
+        assert_eq!(migrations[89].version, 90);
+        assert_eq!(&*migrations[89].description, "app callback notifications");
+        assert!(migrations[89].sql.as_str().contains("CREATE TABLE apps"));
         assert_eq!(migrations[55].version, 56);
         assert!(migrations[55]
             .sql
