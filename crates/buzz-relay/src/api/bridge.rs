@@ -2899,6 +2899,7 @@ pub async fn workflow_webhook(
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
     crate::workflow_admission::handle_workflow_webhook(state, id_str, query.secret, headers, body)
         .await
+
 }
 
 /// If all filters target kind:20001 or kind:40902 with authors, synthesize

@@ -12,6 +12,9 @@
 use std::collections::HashMap;
 
 use buzz_core::tenant::CommunityId;
+use buzz_db::workflow::RunCause;
+
+use crate::AgentMentions;
 use evalexpr::HashMapContext;
 use nostr::ToBech32;
 use serde_json::Value as JsonValue;
@@ -528,6 +531,51 @@ fn resolve_send_message_channel(
     Ok(trigger_channel.trim().to_string())
 }
 
+/// Whether every step of `def` is an action that takes no input from outside
+/// the owner's control. An allowlist: any other action, including one added
+/// later, makes the definition ineligible to direct agents.
+pub fn definition_may_direct_agents(def: &WorkflowDef) -> bool {
+    def.steps.iter().all(|step| {
+        matches!(
+            step.action,
+            ActionDef::SendMessage { .. } | ActionDef::Delay { .. }
+        )
+    })
+}
+
+/// Whether a run's recorded cause lets its messages direct the owner's agents:
+/// a timer, or an event or manual trigger signed by the owner. Webhook calls
+/// and runs with no recorded cause never qualify.
+pub fn cause_may_direct_agents(cause: Option<&RunCause>, owner_pubkey: &[u8]) -> bool {
+    match cause {
+        Some(RunCause::Schedule) => true,
+        Some(RunCause::Event(pubkey) | RunCause::Manual(pubkey)) => pubkey == owner_pubkey,
+        Some(RunCause::Webhook) | None => false,
+    }
+}
+
+/// Why a `send_message` step withholds `buzz:workflow-mention` tags, in the
+/// order recorded in its trace: `cause` (not started by the owner or a timer),
+/// `steps` (the definition has a step other than `send_message` or `delay`),
+/// and `resumed` (the run resumed after an approval). Empty when the message
+/// may direct agents, which is always the case in [`AgentMentions::Any`].
+pub fn agent_mentions_withheld_reasons(
+    mode: AgentMentions,
+    cause_may_direct_agents: bool,
+    definition_may_direct_agents: bool,
+    resumed: bool,
+) -> Vec<&'static str> {
+    if mode == AgentMentions::Any {
+        return Vec::new();
+    }
+    [
+        (!cause_may_direct_agents, "cause"),
+        (!definition_may_direct_agents, "steps"),
+        (resumed, "resumed"),
+    ]
+    .into_iter()
+    .filter_map(|(applies, reason)| applies.then_some(reason))
+    .collect()
 fn resolve_send_message_channel_for_run(
     run_community_id: CommunityId,
     explicit_channel: Option<&str>,
@@ -548,6 +596,7 @@ fn resolve_send_message_channel_for_run(
         return Ok(snapshot.channel_id.to_string());
     }
     resolve_send_message_channel(explicit_channel, trigger_channel, workflow_channel_id)
+
 }
 
 /// Dispatch a resolved action and return its output.
@@ -557,6 +606,7 @@ fn resolve_send_message_channel_for_run(
 ///
 /// `RequestApproval` returns `StepResult::Suspended` — the caller must
 /// persist state and stop the execution loop.
+#[allow(clippy::too_many_arguments)]
 pub async fn dispatch_action(
     step: &Step,
     action: &ActionDef,
@@ -564,6 +614,8 @@ pub async fn dispatch_action(
     community_id: CommunityId,
     run_id: Uuid,
     trigger_ctx: &TriggerContext,
+    definition_may_direct_agents: bool,
+    resumed: bool,
 ) -> Result<StepResult, WorkflowError> {
     use ActionDef::*;
 
@@ -640,6 +692,20 @@ pub async fn dispatch_action(
                         (None, _) => None,
                     };
                     let owner_pubkey_hex = hex::encode(&workflow.owner_pubkey);
+<<<<<<< ours
+                    let withheld_reasons = agent_mentions_withheld_reasons(
+                        engine.config.agent_mentions,
+                        cause_may_direct_agents(wf_run.cause.as_ref(), &workflow.owner_pubkey),
+                        definition_may_direct_agents,
+                        resumed,
+                    );
+
+                    // Thread the reply onto the triggering message when requested.
+                    // The trigger must carry the event to reply to; schema
+                    // validation already forbids `reply_in_thread` on triggers
+                    // that have no message, so an empty id here is a real fault.
+=======
+
                     let reply_to = if *reply_in_thread {
                         if trigger_ctx.message_id.is_empty() {
                             return Err(WorkflowError::InvalidDefinition(
@@ -659,6 +725,9 @@ pub async fn dispatch_action(
                             ));
                         }
                     };
+<<<<<<< ours
+                    let sent = engine
+=======
 
                     info!(
                         run_id = %run_id,
@@ -669,12 +738,14 @@ pub async fn dispatch_action(
                     );
 
                     let event_id = engine
+
                         .action_sink()?
                         .send_message(
                             community_id,
                             &channel_id,
                             text,
                             authored_text,
+                            withheld_reasons.is_empty(),
                             &owner_pubkey_hex,
                             reply_to,
                             route,
@@ -682,10 +753,33 @@ pub async fn dispatch_action(
                         .await
                         .map_err(WorkflowError::from)?;
 
-                    Ok(StepResult::Completed(serde_json::json!({
+                    let mut output = serde_json::json!({
                         "sent": true,
-                        "event_id": event_id,
-                    })))
+                        "event_id": sent.event_id,
+                    });
+                    if sent.agent_mentions_withheld {
+                        info!(
+                            target: crate::AGENT_MENTIONS_LOG_TARGET,
+                            community = %community_id,
+                            workflow = %wf_run.workflow_id,
+                            run_id = %run_id,
+                            step = step_id,
+                            reasons = ?withheld_reasons,
+                            "owner-only agent mentions withheld buzz:workflow-mention tags"
+                        );
+                        for reason in &withheld_reasons {
+                            metrics::counter!(
+                                "buzz_workflow_agent_mentions_withheld_total",
+                                "reason" => *reason
+                            )
+                            .increment(1);
+                        }
+                        output["agent_mentions"] = serde_json::json!({
+                            "withheld": true,
+                            "reasons": withheld_reasons,
+                        });
+                    }
+                    Ok(StepResult::Completed(output))
                 }
 
                 SendDm { to: _, text: _ } => {
@@ -1126,10 +1220,11 @@ pub async fn execute_run(
             )
         })?;
 
-    execute_steps(engine, community_id, run_id, def, trigger_ctx, 0, None).await
+    execute_steps(engine, community_id, run_id, def, trigger_ctx, None).await
 }
 
-/// Resume execution from a specific step index (used for approval resume).
+/// Resume a run after its approval was granted, from a specific step index.
+/// With owner-only agent mentions, messages from a resumed run never direct agents.
 ///
 /// Acquires a concurrency permit from `engine.run_semaphore` before executing —
 /// returns [`WorkflowError::CapacityExceeded`] immediately if all permits are
@@ -1194,13 +1289,13 @@ pub async fn execute_from_step(
         run_id,
         def,
         trigger_ctx,
-        start_index,
-        initial_outputs,
+        Some((start_index, initial_outputs.unwrap_or_default())),
     )
     .await
 }
 
-/// Internal: execute workflow steps starting from `start_index`, without
+/// Internal: execute workflow steps from the start, or from `resume`'s step
+/// index with its restored outputs, without
 /// acquiring the semaphore. Called by both [`execute_run`] and
 /// [`execute_from_step`] after they have already acquired a permit.
 ///
@@ -1212,10 +1307,13 @@ async fn execute_steps(
     run_id: Uuid,
     def: &WorkflowDef,
     trigger_ctx: &TriggerContext,
-    start_index: usize,
-    initial_outputs: Option<HashMap<String, JsonValue>>,
+    resume: Option<(usize, HashMap<String, JsonValue>)>,
 ) -> Result<ExecutionResult, (WorkflowError, crate::error::PartialProgress)> {
-    let mut step_outputs: HashMap<String, JsonValue> = initial_outputs.unwrap_or_default();
+    // A resumed run continues on restored outputs and on a definition that
+    // may have changed since the approval, so it never directs agents.
+    let resumed = resume.is_some();
+    let definition_may_direct_agents = definition_may_direct_agents(def);
+    let (start_index, mut step_outputs) = resume.unwrap_or_default();
     let mut trace: Vec<JsonValue> = Vec::new();
 
     for (i, step) in def.steps.iter().enumerate() {
@@ -1276,6 +1374,8 @@ async fn execute_steps(
                 community_id,
                 run_id,
                 trigger_ctx,
+                definition_may_direct_agents,
+                resumed,
             ),
         )
         .await;
@@ -2016,6 +2116,96 @@ mod tests {
                 .expect("override should be accepted");
         assert_eq!(resolved, override_channel_id.to_string());
     }
+<<<<<<< ours
+    fn def_with_steps(steps: &str) -> WorkflowDef {
+        crate::WorkflowEngine::parse_yaml(&format!(
+            "name: eligibility\ntrigger:\n  on: message_posted\nsteps:\n{steps}"
+        ))
+        .expect("parse definition")
+        .0
+    }
+
+    #[test]
+    fn only_send_message_and_delay_definitions_may_direct_agents() {
+        let send = "  - id: send\n    action: send_message\n    text: '@Agent go'\n";
+        let delay = "  - id: wait\n    action: delay\n    duration: 1m\n";
+        assert!(definition_may_direct_agents(&def_with_steps(&format!(
+            "{send}{delay}"
+        ))));
+
+        // A webhook response can choose fixed text through `if:` without
+        // contributing any rendered characters; the whole definition is out.
+        let webhook_selects_text = format!(
+            "  - id: hook\n    action: call_webhook\n    url: https://example.com/x\n\
+             {send}    if: steps.hook.output.status == 200\n"
+        );
+        assert!(!definition_may_direct_agents(&def_with_steps(
+            &webhook_selects_text
+        )));
+
+        for other in [
+            "  - id: approve\n    action: request_approval\n    from: '@manager'\n    message: ok?\n",
+            "  - id: react\n    action: add_reaction\n    emoji: eyes\n",
+            "  - id: dm\n    action: send_dm\n    to: '@manager'\n    text: hi\n",
+            "  - id: topic\n    action: set_channel_topic\n    topic: hi\n",
+        ] {
+            assert!(
+                !definition_may_direct_agents(&def_with_steps(&format!("{send}{other}"))),
+                "{other}"
+            );
+        }
+    }
+
+    #[test]
+    fn owner_mode_lists_every_withheld_reason_in_order() {
+        use AgentMentions::{Any, Owner};
+        assert!(agent_mentions_withheld_reasons(Any, false, false, true).is_empty());
+        assert!(agent_mentions_withheld_reasons(Owner, true, true, false).is_empty());
+        assert_eq!(
+            agent_mentions_withheld_reasons(Owner, false, true, false),
+            ["cause"]
+        );
+        assert_eq!(
+            agent_mentions_withheld_reasons(Owner, true, false, false),
+            ["steps"]
+        );
+        assert_eq!(
+            agent_mentions_withheld_reasons(Owner, true, true, true),
+            ["resumed"]
+        );
+        assert_eq!(
+            agent_mentions_withheld_reasons(Owner, false, false, true),
+            ["cause", "steps", "resumed"]
+        );
+    }
+
+    #[test]
+    fn only_owner_and_timer_causes_may_direct_agents() {
+        let owner = vec![1u8; 32];
+        let other = vec![2u8; 32];
+        assert!(cause_may_direct_agents(Some(&RunCause::Schedule), &owner));
+        assert!(cause_may_direct_agents(
+            Some(&RunCause::Event(owner.clone())),
+            &owner
+        ));
+        assert!(cause_may_direct_agents(
+            Some(&RunCause::Manual(owner.clone())),
+            &owner
+        ));
+        assert!(!cause_may_direct_agents(
+            Some(&RunCause::Event(other.clone())),
+            &owner
+        ));
+        assert!(!cause_may_direct_agents(
+            Some(&RunCause::Manual(other)),
+            &owner
+        ));
+        assert!(!cause_may_direct_agents(Some(&RunCause::Webhook), &owner));
+        assert!(
+            !cause_may_direct_agents(None, &owner),
+            "legacy runs have no cause"
+        );
+=======
 
     #[test]
     fn dynamic_send_message_uses_snapshot_channel_and_rejects_override() {
@@ -2087,5 +2277,6 @@ mod tests {
         )
         .expect("static bound channel");
         assert_eq!(resolved, workflow_channel_id.to_string());
+
     }
 }
