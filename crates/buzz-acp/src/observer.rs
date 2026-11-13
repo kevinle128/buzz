@@ -159,7 +159,7 @@ impl ObserverHandle {
         authorization: Option<AuthorizationEnvelope>,
         payload: serde_json::Value,
     ) {
-        let event = ObserverEvent {
+        let mut event = ObserverEvent {
             seq: self.inner.seq.fetch_add(1, Ordering::Relaxed),
             timestamp: chrono::Utc::now().to_rfc3339(),
             kind: kind.into(),

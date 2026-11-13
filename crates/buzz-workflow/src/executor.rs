@@ -576,6 +576,8 @@ pub fn agent_mentions_withheld_reasons(
     .into_iter()
     .filter_map(|(applies, reason)| applies.then_some(reason))
     .collect()
+}
+
 fn resolve_send_message_channel_for_run(
     run_community_id: CommunityId,
     explicit_channel: Option<&str>,
@@ -596,7 +598,6 @@ fn resolve_send_message_channel_for_run(
         return Ok(snapshot.channel_id.to_string());
     }
     resolve_send_message_channel(explicit_channel, trigger_channel, workflow_channel_id)
-
 }
 
 /// Dispatch a resolved action and return its output.
@@ -692,7 +693,6 @@ pub async fn dispatch_action(
                         (None, _) => None,
                     };
                     let owner_pubkey_hex = hex::encode(&workflow.owner_pubkey);
-<<<<<<< ours
                     let withheld_reasons = agent_mentions_withheld_reasons(
                         engine.config.agent_mentions,
                         cause_may_direct_agents(wf_run.cause.as_ref(), &workflow.owner_pubkey),
@@ -704,7 +704,6 @@ pub async fn dispatch_action(
                     // The trigger must carry the event to reply to; schema
                     // validation already forbids `reply_in_thread` on triggers
                     // that have no message, so an empty id here is a real fault.
-=======
 
                     let reply_to = if *reply_in_thread {
                         if trigger_ctx.message_id.is_empty() {
@@ -725,10 +724,6 @@ pub async fn dispatch_action(
                             ));
                         }
                     };
-<<<<<<< ours
-                    let sent = engine
-=======
-
                     info!(
                         run_id = %run_id,
                         step = step_id,
@@ -737,8 +732,7 @@ pub async fn dispatch_action(
                         "SendMessage"
                     );
 
-                    let event_id = engine
-
+                    let sent = engine
                         .action_sink()?
                         .send_message(
                             community_id,
@@ -2116,7 +2110,6 @@ mod tests {
                 .expect("override should be accepted");
         assert_eq!(resolved, override_channel_id.to_string());
     }
-<<<<<<< ours
     fn def_with_steps(steps: &str) -> WorkflowDef {
         crate::WorkflowEngine::parse_yaml(&format!(
             "name: eligibility\ntrigger:\n  on: message_posted\nsteps:\n{steps}"
@@ -2205,7 +2198,7 @@ mod tests {
             !cause_may_direct_agents(None, &owner),
             "legacy runs have no cause"
         );
-=======
+    }
 
     #[test]
     fn dynamic_send_message_uses_snapshot_channel_and_rejects_override() {
@@ -2277,6 +2270,5 @@ mod tests {
         )
         .expect("static bound channel");
         assert_eq!(resolved, workflow_channel_id.to_string());
-
     }
 }

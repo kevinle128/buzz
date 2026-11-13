@@ -925,8 +925,8 @@ mod postgres_tests {
             .contains("VALIDATE CONSTRAINT workflow_runs_cause_pubkey_check"));
         for (index, migration) in migrations.iter().enumerate() {
             assert_eq!(migration.version, (index + 1) as i64);
-        }        // The fork's two migrations sit at 0089 and 0090, after upstream's
-        // 0087 and 0088, which arrive with the next upstream merge.
+        } // The fork's two migrations sit at 0089 and 0090, after upstream's
+          // 0087 and 0088, which arrive with the next upstream merge.
         let versions: Vec<i64> = migrations
             .iter()
             .map(|migration| migration.version)

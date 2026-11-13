@@ -1698,7 +1698,7 @@ impl AcpClient {
         let line = serde_json::to_string(value)?;
         tokio::time::timeout(
             WRITE_TIMEOUT,
-            frame_writer::write_frame(&mut self.stdin, line.as_bytes()),
+            frame_writer::write_frame(&mut self.child.stdin, line.as_bytes()),
         )
         .await
         .map_err(|_| AcpError::WriteTimeout(WRITE_TIMEOUT))?

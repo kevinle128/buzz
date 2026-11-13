@@ -391,7 +391,13 @@ async fn handle_static_webhook(
 
     let run_id = state
         .db
-        .create_workflow_run(community_id, id, None, trigger_ctx_json.as_ref())
+        .create_workflow_run(
+            community_id,
+            id,
+            None,
+            trigger_ctx_json.as_ref(),
+            &buzz_db::workflow::RunCause::Webhook,
+        )
         .await
         .map_err(|e| internal_error(&format!("db error: {e}")))?;
 
@@ -623,6 +629,7 @@ mod tests {
             current_step: 0,
             execution_trace: serde_json::json!([]),
             trigger_context: None,
+            cause: None,
             started_at: None,
             completed_at: None,
             error_message: error_code.map(|_| "redacted".to_string()),

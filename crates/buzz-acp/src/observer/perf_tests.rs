@@ -115,6 +115,7 @@ fn publish_queue_probe() {
         session_id: None,
         turn_id: None,
         started_at: None,
+        authorization: None,
         payload: json!({"body": (0..fields).map(|n|
             "x".repeat(payload_bytes / fields + usize::from(n < payload_bytes % fields))
         ).collect::<Vec<_>>() }),

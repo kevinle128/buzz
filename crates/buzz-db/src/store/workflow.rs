@@ -2562,9 +2562,16 @@ pub(crate) mod tests {
                 .expect("claim wins");
 
             // Create the run the won claim is responsible for, then attach it.
-            let run_id = create_workflow_run(&pool, community, workflow_id, None, None)
-                .await
-                .expect("create run ok");
+            let run_id = create_workflow_run(
+                &pool,
+                community,
+                workflow_id,
+                None,
+                None,
+                &RunCause::Schedule,
+            )
+            .await
+            .expect("create run ok");
 
             let attached =
                 attach_scheduled_workflow_run(&pool, community, workflow_id, scheduled_for, run_id)
@@ -2591,9 +2598,16 @@ pub(crate) mod tests {
 
             // A second attach is a no-op: the `workflow_run_id IS NULL` guard means
             // an already-linked claim is never re-pointed to a different run.
-            let other_run = create_workflow_run(&pool, community, workflow_id, None, None)
-                .await
-                .expect("create second run ok");
+            let other_run = create_workflow_run(
+                &pool,
+                community,
+                workflow_id,
+                None,
+                None,
+                &RunCause::Schedule,
+            )
+            .await
+            .expect("create second run ok");
             let reattached = attach_scheduled_workflow_run(
                 &pool,
                 community,
@@ -2884,12 +2898,26 @@ pub(crate) mod tests {
             insert_workflow_with_ids(&pool, community_a, workflow_id, channel_id, "wf-A").await;
             insert_workflow_with_ids(&pool, community_b, workflow_id, Uuid::new_v4(), "wf-B").await;
 
-            let run_a = create_workflow_run(&pool, community_a, workflow_id, None, None)
-                .await
-                .expect("run A");
-            let run_b = create_workflow_run(&pool, community_b, workflow_id, None, None)
-                .await
-                .expect("run B");
+            let run_a = create_workflow_run(
+                &pool,
+                community_a,
+                workflow_id,
+                None,
+                None,
+                &RunCause::Schedule,
+            )
+            .await
+            .expect("run A");
+            let run_b = create_workflow_run(
+                &pool,
+                community_b,
+                workflow_id,
+                None,
+                None,
+                &RunCause::Schedule,
+            )
+            .await
+            .expect("run B");
 
             let token = "shared-approval-token";
             let expires = Utc::now() + chrono::Duration::hours(1);

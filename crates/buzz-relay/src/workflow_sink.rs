@@ -10,8 +10,8 @@ use std::sync::{Arc, Weak};
 
 use buzz_core::kind::KIND_STREAM_MESSAGE;
 use buzz_core::tenant::CommunityId;
-use buzz_workflow::action_sink::{ActionSink, ActionSinkError, SentMessage};use buzz_workflow::action_sink::{
-    route_provenance_tags, ActionSink, ActionSinkError, WorkflowMessageRoute,
+use buzz_workflow::action_sink::{
+    route_provenance_tags, ActionSink, ActionSinkError, SentMessage, WorkflowMessageRoute,
 };
 
 use chrono::Utc;
@@ -220,12 +220,8 @@ impl ActionSink for RelayActionSink {
         may_direct_agents: bool,
         author_pubkey: &str,
         reply_to: Option<&str>,
-<<<<<<< ours
-    ) -> Pin<Box<dyn Future<Output = Result<SentMessage, ActionSinkError>> + Send + '_>> {
-=======
         route: Option<WorkflowMessageRoute>,
-    ) -> Pin<Box<dyn Future<Output = Result<String, ActionSinkError>> + Send + '_>> {
-
+    ) -> Pin<Box<dyn Future<Output = Result<SentMessage, ActionSinkError>> + Send + '_>> {
         let channel_id = channel_id.to_owned();
         let text = text.to_owned();
         let authored_text = authored_text.to_owned();

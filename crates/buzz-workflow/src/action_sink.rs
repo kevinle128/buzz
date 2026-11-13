@@ -108,7 +108,10 @@ pub trait ActionSink: Send + Sync {
     /// - `route`: verified project and workflow context for provenance tags.
     ///
     /// Returns the sent message on success.
-    #[expect(clippy::too_many_arguments, reason = "Keep the workflow action sink contract.")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Keep the workflow action sink contract."
+    )]
     fn send_message(
         &self,
         community_id: CommunityId,
