@@ -247,7 +247,7 @@ pub struct AcpClient {
     child: Child,
     /// Handle to the sole stdin writer task. A frame write that is
     /// interrupted or fails closes stdin; later writes then fail.
-    writer: child_io::StdinWriter,
+    _writer: child_io::StdinWriter,
     /// The agent's stdout lines from the reader task. The task reads the pipe
     /// with `LinesCodec::new_with_max_length` (MAX_LINE_SIZE), so a rogue agent
     /// writing endless bytes without a newline cannot exhaust memory. It sends
@@ -787,7 +787,7 @@ impl AcpClient {
         let io = child_io::start(stdout, stdin);
         Ok(Self {
             child,
-            writer: io.writer,
+            _writer: io.writer,
             reader: io.lines,
             wake: io.link,
             turn_thread: None,
@@ -1696,10 +1696,13 @@ impl AcpClient {
     ) -> Result<(), AcpError> {
         const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
         let line = serde_json::to_string(value)?;
-        tokio::time::timeout(WRITE_TIMEOUT, self.writer.write_line(line))
-            .await
-            .map_err(|_| AcpError::WriteTimeout(WRITE_TIMEOUT))?
-            .map_err(AcpError::Io)?;
+        tokio::time::timeout(
+            WRITE_TIMEOUT,
+            frame_writer::write_frame(&mut self.child.stdin, line.as_bytes()),
+        )
+        .await
+        .map_err(|_| AcpError::WriteTimeout(WRITE_TIMEOUT))?
+        .map_err(AcpError::Io)?;
         if emit_observe {
             self.observe_with("acp_write", || value.clone());
         }
@@ -4709,7 +4712,7 @@ mod tests {
         let mut client =
             spawn_script(r#"while IFS= read -r line; do printf '%s\n' "$line"; done"#).await;
         // A second handle to the stdin writer task, usable while the read loop borrows the client.
-        let stdin = client.writer.clone();
+        let stdin = client._writer.clone();
         client.observe_with("acp_read", || panic!("disabled observer copied payload"));
         let observer = ObserverHandle::in_process();
         let mut events = observer.subscribe();
