@@ -241,16 +241,9 @@ fn spawn_admitted_run(
             }
         };
 
-        let result = buzz_workflow::executor::execute_from_step(
-            &engine,
-            community_id,
-            run_id,
-            &def,
-            &trigger_ctx,
-            0,
-            None,
-        )
-        .await;
+        let result =
+            buzz_workflow::executor::execute_run(&engine, community_id, run_id, &def, &trigger_ctx)
+                .await;
         engine
             .finalize_run(community_id, run_id, result, None)
             .await;

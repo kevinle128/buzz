@@ -28,12 +28,12 @@ const SELECT_EXISTING_RUN: &str = r#"
 const INSERT_ADMITTED_RUN: &str = r#"
             INSERT INTO workflow_runs (
                 community_id, id, workflow_id, status, trigger_event_id, current_step,
-                execution_trace, trigger_context, started_at, completed_at,
+                execution_trace, trigger_context, cause_source, started_at, completed_at,
                 error_code, error_message, idempotency_key_hash, payload_hash, route_snapshot
             )
             VALUES (
                 $1, $2, $3, $4::run_status, NULL, 0,
-                '[]'::jsonb, $5, NULL,
+                '[]'::jsonb, $5, 'webhook', NULL,
                 CASE WHEN $4 = 'failed' THEN NOW() ELSE NULL END,
                 $6, $7, $8, $9, $10
             )
