@@ -14,8 +14,9 @@ name: MF Desktop Build
 # patches the manifests at build time.
 #
 # macOS is built for Apple silicon only, so latest.json has no darwin-x86_64
-# entry and Intel installs stop updating. macOS builds are ad-hoc signed unless the macos_signing input is on; then
-# they are signed with the fork's Developer ID certificate and notarized.
+# entry and Intel installs stop updating. macOS releases are signed with the
+# fork's Developer ID certificate; the app and the DMG are notarized and
+# stapled. Only a manual run with macos_signing=false builds an ad-hoc app.
 # Windows installers have no Authenticode signature, so SmartScreen warns on
 # first install. Both still carry the Tauri updater signature.
 #
@@ -45,9 +46,9 @@ on:
         default: true
         type: boolean
       macos_signing:
-        description: "Sign the macOS apps with the Developer ID certificate and notarize them."
+        description: "Sign the macOS app and DMG with the Developer ID certificate and notarize them. Releases are signed; false builds an ad-hoc test app."
         required: false
-        default: false
+        default: true
         type: boolean
       channel:
         description: "Update feed. canary builds from the chosen branch and publishes to the buzz-desktop-canary/ CDN folder for update tests."
@@ -68,9 +69,11 @@ env:
   WASABI_ENDPOINT: https://s3.ap-southeast-1.wasabisys.com
   WASABI_BUCKET: game-mobile-registry
   BUZZ_UPDATER_PUBLIC_KEY: ${{ secrets.BUZZ_UPDATER_PUBLIC_KEY }}
-  # Tag pushes have no inputs, so both values are false for them.
+  # Tag pushes have no inputs: they publish and they sign.
   MF_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && !inputs.publish }}
-  MF_MACOS_SIGNING: ${{ github.event_name == 'workflow_dispatch' && inputs.macos_signing }}
+  # Tag pushes and runs started on a release tag sign; only a manual run can
+  # turn signing off.
+  MF_MACOS_SIGNING: ${{ github.event_name != 'workflow_dispatch' || inputs.macos_signing }}
   MF_CANARY: ${{ github.event_name == 'workflow_dispatch' && inputs.channel == 'canary' }}
 
 jobs:
@@ -361,9 +364,33 @@ jobs:
           grep -q 'source=Notarized Developer ID' <<< "$spctl_out" \
             || { echo "::error::Gatekeeper does not report a notarized Developer ID app"; exit 1; }
           xcrun stapler validate "$APP"
+
+      # Tauri signs the DMG but notarizes only the app, so the downloaded DMG
+      # would fail Gatekeeper. It is notarized and stapled here; latest.json
+      # does not name the DMG, so nothing else changes.
+      - name: Notarize and staple the DMG
+        if: env.MF_MACOS_SIGNING == 'true'
+        env:
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -euo pipefail
+          key="$RUNNER_TEMP/private_keys/AuthKey_${APPLE_API_KEY_ID}.p8"
+          [[ -s "$key" ]] || { echo "::error::The App Store Connect key file is missing"; exit 1; }
           for dmg in "desktop/src-tauri/target/${TARGET}"/release/bundle/dmg/*.dmg; do
-            codesign --verify --verbose=2 "$dmg" || echo "::warning::$(basename "$dmg") has no valid signature"
-            xcrun stapler validate "$dmg" || echo "::warning::$(basename "$dmg") has no stapled ticket"
+            result="$(xcrun notarytool submit "$dmg" --key "$key" --key-id "$APPLE_API_KEY_ID" \
+              --issuer "$APPLE_API_ISSUER" --wait --output-format json)"
+            status="$(jq -r .status <<< "$result")"
+            echo "$(basename "$dmg"): notarization ${status} ($(jq -r .id <<< "$result"))"
+            [[ "$status" == Accepted ]] || { echo "::error::Apple did not accept $(basename "$dmg")"; exit 1; }
+            xcrun stapler staple "$dmg"
+            codesign --verify --verbose=2 "$dmg"
+            xcrun stapler validate "$dmg"
+            # The check Gatekeeper runs when a user opens the downloaded DMG.
+            dmg_out="$(spctl -a -vvv -t open --context context:primary-signature "$dmg" 2>&1)" || true
+            echo "$dmg_out"
+            grep -q 'source=Notarized Developer ID' <<< "$dmg_out" \
+              || { echo "::error::Gatekeeper does not accept $(basename "$dmg") as a notarized Developer ID disk image"; exit 1; }
           done
 
       - name: Locate build artifacts
