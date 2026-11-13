@@ -192,7 +192,7 @@ mod tests {
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0]["method"], "session/prompt");
         assert_eq!(frames[1]["method"], "session/cancel");
-        assert!(client.writer.is_open());
+        assert!(client._writer.is_open());
         client.shutdown().await;
         std::fs::remove_dir_all(dir).unwrap();
     }

@@ -247,7 +247,7 @@ pub struct AcpClient {
     child: Child,
     /// Handle to the sole stdin writer task. A frame write that is
     /// interrupted or fails closes stdin; later writes then fail.
-    writer: child_io::StdinWriter,
+    _writer: child_io::StdinWriter,
     /// The agent's stdout lines from the reader task. The task reads the pipe
     /// with `LinesCodec::new_with_max_length` (MAX_LINE_SIZE), so a rogue agent
     /// writing endless bytes without a newline cannot exhaust memory. It sends
@@ -787,7 +787,7 @@ impl AcpClient {
         let io = child_io::start(stdout, stdin);
         Ok(Self {
             child,
-            writer: io.writer,
+            _writer: io.writer,
             reader: io.lines,
             wake: io.link,
             turn_thread: None,
@@ -872,12 +872,16 @@ impl AcpClient {
 
     /// Emit a semantic event to the local observer feed, if enabled.
     pub fn observe(&self, kind: impl Into<String>, payload: serde_json::Value) {
+        self.observe_with(kind, || payload);
+    }
+
+    fn observe_with(&self, kind: impl Into<String>, payload: impl FnOnce() -> serde_json::Value) {
         if let Some(observer) = &self.observer {
             observer.emit(
                 kind,
                 self.observer_agent_index,
                 &self.observer_context,
-                payload,
+                payload(),
             );
         }
     }
@@ -1692,12 +1696,12 @@ impl AcpClient {
     ) -> Result<(), AcpError> {
         const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
         let line = serde_json::to_string(value)?;
-        tokio::time::timeout(WRITE_TIMEOUT, self.writer.write_line(line))
+        tokio::time::timeout(WRITE_TIMEOUT, self._writer.write_line(line))
             .await
             .map_err(|_| AcpError::WriteTimeout(WRITE_TIMEOUT))?
             .map_err(AcpError::Io)?;
         if emit_observe {
-            self.observe("acp_write", value.clone());
+            self.observe_with("acp_write", || value.clone());
         }
         Ok(())
     }
@@ -1859,7 +1863,7 @@ impl AcpClient {
                     continue;
                 }
             };
-            self.observe("acp_read", msg.clone());
+            self.observe_with("acp_read", || msg.clone());
 
             // Check if this is a response to our expected request (has matching id
             // AND no `method` field — a `method` field means it's an agent-initiated
@@ -2456,15 +2460,13 @@ impl AcpClient {
                             continue;
                         }
                     };
-                    // Suppress the generic `acp_read` for `session/request_permission`
-                    // under the `ask` policy — `handle_permission_request` emits the
-                    // single enveloped frame instead (spec §6 "one frame per request").
+                    // Suppress the generic `acp_read` for permission requests under ask policy.
                     let is_ask_permission_request =
                         matches!(self.permission_config.policy, PermissionPolicy::Ask)
                             && msg.get("method").and_then(|v| v.as_str())
                                 == Some("session/request_permission");
                     if !is_ask_permission_request {
-                        self.observe("acp_read", msg.clone());
+                        self.observe_with("acp_read", || msg.clone());
                     }
 
                     let activity_now = Instant::now();
@@ -4706,9 +4708,9 @@ mod tests {
     async fn assert_activity_resets_idle(update: serde_json::Value) {
         let mut client =
             spawn_script(r#"while IFS= read -r line; do printf '%s\n' "$line"; done"#).await;
-        // A second handle to the stdin writer task, usable while the read
-        // loop below borrows the client.
-        let stdin = client.writer.clone();
+        // A second handle to the stdin writer task, usable while the read loop borrows the client.
+        let stdin = client._writer.clone();
+        client.observe_with("acp_read", || panic!("disabled observer copied payload"));
         let observer = ObserverHandle::in_process();
         let mut events = observer.subscribe();
         client.set_observer(Some(observer), 0);
@@ -4750,6 +4752,10 @@ mod tests {
                     );
                     if let Ok(event) = events.try_recv() {
                         assert_eq!(event.kind, "acp_read");
+                        assert_eq!(
+                            event.payload,
+                            serde_json::from_str::<serde_json::Value>(&frame).unwrap()
+                        );
                         break;
                     }
                     assert!(

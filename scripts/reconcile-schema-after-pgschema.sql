@@ -181,6 +181,22 @@ BEGIN
     END IF;
 END $$;
 
+-- pgschema drops multi-column CHECK constraints. Restore the workflow route
+-- admission shape from schema/schema.sql (and migration 0089) verbatim.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'workflow_runs'::regclass
+          AND conname = 'workflow_runs_route_requires_hashes'
+    ) THEN
+        ALTER TABLE workflow_runs
+            ADD CONSTRAINT workflow_runs_route_requires_hashes CHECK (
+                route_snapshot IS NULL OR idempotency_key_hash IS NOT NULL
+            );
+    END IF;
+END $$;
+
 -- pgschema moves the partition key to the front of a partitioned table's
 -- primary key when it creates the table, so events gets
 -- PRIMARY KEY (created_at, community_id, id) instead of the declared

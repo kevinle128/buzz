@@ -66,6 +66,16 @@ impl From<ActionSinkError> for crate::WorkflowError {
     }
 }
 
+/// A message an [`ActionSink`] posted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SentMessage {
+    /// Hex event ID.
+    pub event_id: String,
+    /// Whether at least one agent-authority tag was left off because the run
+    /// may not direct agents.
+    pub agent_mentions_withheld: bool,
+}
+
 /// Interface for workflow actions that produce side effects.
 ///
 /// Implemented by the relay to provide direct DB/event access to the executor.
@@ -84,9 +94,12 @@ pub trait ActionSink: Send + Sync {
     ///   even though the side effect has no inbound connection to bind.
     /// - `channel_id`: UUID string of the target channel
     /// - `text`: rendered message body (must not be empty/whitespace-only)
-    /// - `authored_text`: the workflow owner's stored, unrendered step template;
-    ///   consumers must use this rather than trigger-controlled rendered output
-    ///   when attaching authority-bearing metadata
+    /// - `authored_text`: the workflow owner's stored, unrendered step
+    ///   template. Consumers attach authority-bearing metadata only for
+    ///   targets named in this text, never from trigger-controlled rendered
+    ///   output alone.
+    /// - `may_direct_agents`: whether this run may attach that metadata; when
+    ///   `false`, the consumer withholds it.
     /// - `author_pubkey`: hex-encoded pubkey of the workflow owner (used for
     ///   the `p` attribution tag; the relay keypair signs the event)
     /// - `reply_to`: when `Some(event_id_hex)`, the message is posted as a
@@ -94,10 +107,10 @@ pub trait ActionSink: Send + Sync {
     ///   metadata); when `None`, it is a top-level channel message.
     /// - `route`: verified project and workflow context for provenance tags.
     ///
-    /// Returns the event ID hex string on success.
+    /// Returns the sent message on success.
     #[expect(
         clippy::too_many_arguments,
-        reason = "Keep the existing public workflow action sink contract."
+        reason = "Keep the workflow action sink contract."
     )]
     fn send_message(
         &self,
@@ -105,8 +118,9 @@ pub trait ActionSink: Send + Sync {
         channel_id: &str,
         text: &str,
         authored_text: &str,
+        may_direct_agents: bool,
         author_pubkey: &str,
         reply_to: Option<&str>,
         route: Option<WorkflowMessageRoute>,
-    ) -> Pin<Box<dyn Future<Output = Result<String, ActionSinkError>> + Send + '_>>;
+    ) -> Pin<Box<dyn Future<Output = Result<SentMessage, ActionSinkError>> + Send + '_>>;
 }

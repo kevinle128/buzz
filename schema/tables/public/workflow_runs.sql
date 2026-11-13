@@ -7,6 +7,8 @@ CREATE TABLE workflow_runs (
     current_step        INT NOT NULL DEFAULT 0,
     execution_trace     JSONB NOT NULL DEFAULT '[]',
     trigger_context     JSONB,
+    cause_source      TEXT,
+    cause_pubkey        BYTEA,
     started_at          TIMESTAMPTZ,
     completed_at        TIMESTAMPTZ,
     error_message       TEXT,
@@ -16,6 +18,10 @@ CREATE TABLE workflow_runs (
     payload_hash        BYTEA,
     route_snapshot      JSONB,
     PRIMARY KEY (community_id, id),
+    CONSTRAINT workflow_runs_cause_source_check
+        CHECK (cause_source IN ('event', 'schedule', 'webhook', 'manual')),
+    CONSTRAINT workflow_runs_cause_pubkey_check
+        CHECK (length(cause_pubkey) = 32),
     FOREIGN KEY (community_id, workflow_id)
         REFERENCES workflows (community_id, id) ON DELETE CASCADE,
     CONSTRAINT workflow_runs_idempotency_key_hash_len
@@ -29,3 +35,7 @@ CREATE TABLE workflow_runs (
 );
 
 CREATE INDEX idx_workflow_runs_workflow ON workflow_runs (community_id, workflow_id);
+CREATE INDEX idx_workflow_runs_status ON workflow_runs (community_id, status);
+CREATE UNIQUE INDEX idx_workflow_runs_idempotency
+    ON workflow_runs (community_id, workflow_id, idempotency_key_hash)
+    WHERE (idempotency_key_hash IS NOT NULL);
