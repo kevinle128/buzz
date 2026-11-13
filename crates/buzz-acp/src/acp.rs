@@ -245,6 +245,7 @@ async fn pending_elicitation_reply(
 pub struct AcpClient {
     /// The agent child process (kept alive to prevent zombie).
     child: Child,
+    stdin: Option<tokio::process::ChildStdin>,
     /// Handle to the sole stdin writer task. A frame write that is
     /// interrupted or fails closes stdin; later writes then fail.
     _writer: child_io::StdinWriter,
@@ -787,6 +788,7 @@ impl AcpClient {
         let io = child_io::start(stdout, stdin);
         Ok(Self {
             child,
+            stdin: Some(stdin),
             _writer: io.writer,
             reader: io.lines,
             wake: io.link,
@@ -1698,7 +1700,7 @@ impl AcpClient {
         let line = serde_json::to_string(value)?;
         tokio::time::timeout(
             WRITE_TIMEOUT,
-            frame_writer::write_frame(&mut self.child.stdin, line.as_bytes()),
+            frame_writer::write_frame(&mut self.stdin, line.as_bytes()),
         )
         .await
         .map_err(|_| AcpError::WriteTimeout(WRITE_TIMEOUT))?
