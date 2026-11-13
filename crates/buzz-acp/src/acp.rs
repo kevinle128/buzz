@@ -1696,13 +1696,10 @@ impl AcpClient {
     ) -> Result<(), AcpError> {
         const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
         let line = serde_json::to_string(value)?;
-        tokio::time::timeout(
-            WRITE_TIMEOUT,
-            frame_writer::write_frame(&mut self.child.stdin, line.as_bytes()),
-        )
-        .await
-        .map_err(|_| AcpError::WriteTimeout(WRITE_TIMEOUT))?
-        .map_err(AcpError::Io)?;
+        tokio::time::timeout(WRITE_TIMEOUT, self.writer.write_line(line))
+            .await
+            .map_err(|_| AcpError::WriteTimeout(WRITE_TIMEOUT))?
+            .map_err(AcpError::Io)?;
         if emit_observe {
             self.observe_with("acp_write", || value.clone());
         }
