@@ -3117,6 +3117,7 @@ pub(crate) mod tests {
                 created.error_message.as_deref(),
                 Some("repository could not be resolved")
             );
+            assert_eq!(created.cause, Some(RunCause::Webhook));
 
             let second = begin_workflow_admission(&pool, community, workflow_id, &key, &payload)
                 .await
@@ -3125,6 +3126,7 @@ pub(crate) mod tests {
                 panic!("same payload must return existing");
             };
             assert_eq!(existing.id, created.id);
+            assert_eq!(existing.cause, Some(RunCause::Webhook));
         }
 
         #[tokio::test]
