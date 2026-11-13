@@ -19,7 +19,8 @@ const MATCHED_IDENTITY_TIERS: &[&str] = &["d_tag", "alias", "clone_basename", "d
 const SELECT_EXISTING_RUN: &str = r#"
         SELECT community_id, id, workflow_id, status::text AS status,
                trigger_event_id, current_step, execution_trace, trigger_context, started_at, completed_at,
-               error_message, error_code, created_at, idempotency_key_hash, payload_hash, route_snapshot
+               error_message, error_code, created_at, cause_source, cause_pubkey,
+               idempotency_key_hash, payload_hash, route_snapshot
         FROM workflow_runs
         WHERE community_id = $1 AND workflow_id = $2 AND idempotency_key_hash = $3
         "#;
@@ -38,7 +39,8 @@ const INSERT_ADMITTED_RUN: &str = r#"
             )
             RETURNING community_id, id, workflow_id, status::text AS status,
                       trigger_event_id, current_step, execution_trace, trigger_context, started_at, completed_at,
-                      error_message, error_code, created_at, idempotency_key_hash, payload_hash, route_snapshot
+                      error_message, error_code, created_at, cause_source, cause_pubkey,
+                      idempotency_key_hash, payload_hash, route_snapshot
             "#;
 
 /// Server-resolved destination captured when a dynamic webhook run is admitted.
