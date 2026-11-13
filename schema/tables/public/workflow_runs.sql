@@ -35,3 +35,7 @@ CREATE TABLE workflow_runs (
 );
 
 CREATE INDEX idx_workflow_runs_workflow ON workflow_runs (community_id, workflow_id);
+CREATE INDEX idx_workflow_runs_status ON workflow_runs (community_id, status);
+CREATE UNIQUE INDEX idx_workflow_runs_idempotency
+    ON workflow_runs (community_id, workflow_id, idempotency_key_hash)
+    WHERE (idempotency_key_hash IS NOT NULL);
