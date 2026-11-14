@@ -265,7 +265,9 @@ async fn concurrent_identical_requests_create_one_row_and_one_event() {
             let begin =
                 begin_app_admission(&pool, community, app_id, &key, &payload, EVENT_TYPE).await?;
             let record = match begin {
-                BeginAppAdmission::Vacant(guard) => guard.deliver(&event, &route).await?.record,
+                BeginAppAdmission::Vacant(guard) => {
+                    guard.deliver(&event, &route, None).await?.record
+                }
                 BeginAppAdmission::Existing(record) => record,
                 BeginAppAdmission::PayloadConflict { .. } => {
                     panic!("identical payloads must not conflict")
@@ -552,7 +554,7 @@ async fn deliver_commits_event_and_delivery_atomically() {
         panic!("first admission must be vacant");
     };
     let delivery_id = guard.delivery_id();
-    let commit = guard.deliver(&event, &route).await.expect("deliver");
+    let commit = guard.deliver(&event, &route, None).await.expect("deliver");
 
     assert_eq!(commit.record.id, delivery_id);
     assert_eq!(commit.record.status, AppDeliveryStatus::Delivered);
@@ -592,7 +594,7 @@ async fn deliver_inserts_event_mentions() {
         panic!("first admission must be vacant");
     };
     let commit = guard
-        .deliver(&event, &route)
+        .deliver(&event, &route, None)
         .await
         .expect("deliver with mention");
     let stored = mention_pubkeys(
@@ -643,7 +645,7 @@ async fn failed_delivery_insert_rolls_back_event() {
     .expect("insert colliding delivery id");
 
     let err = guard
-        .deliver(&event, &route)
+        .deliver(&event, &route, None)
         .await
         .expect_err("duplicate delivery id must fail the final insert");
     assert!(

@@ -19,7 +19,7 @@ use buzz_core::{CommunityId, StoredEvent};
 use buzz_datastore_tracing::datastore_span;
 
 use crate::error::{DbError, Result};
-use crate::event::insert_event_with_thread_metadata_tx;
+use crate::event::{insert_event_with_thread_metadata_tx, ThreadMetadataParams};
 use crate::Db;
 
 const SELECT_EXISTING_DELIVERY: &str = r#"
@@ -247,7 +247,10 @@ impl AppAdmissionGuard {
         self.finalize(None, None, Some(failure.code)).await
     }
 
-    /// Persist the root event, mentions, and delivered row atomically, then commit.
+    /// Persist the event, mentions, and delivered row atomically, then commit.
+    ///
+    /// `thread_meta` is `Some` when the event is a threaded reply, so the
+    /// thread tables and reply counters change in the same transaction.
     ///
     /// Returns the final record and stored event for post-commit dispatch. The
     /// delivery UUID is the one allocated when this vacant guard was created.
@@ -255,12 +258,17 @@ impl AppAdmissionGuard {
         self,
         event: &Event,
         route: &AppRouteSnapshot,
+        thread_meta: Option<ThreadMetadataParams<'_>>,
     ) -> Result<AppDeliveryCommit> {
         let community_id = self.community_id;
         let mut tx = self.tx;
-        let (stored_event, was_inserted) =
-            insert_event_with_thread_metadata_tx(&mut tx, event, Some(route.channel_id), None)
-                .await?;
+        let (stored_event, was_inserted) = insert_event_with_thread_metadata_tx(
+            &mut tx,
+            event,
+            Some(route.channel_id),
+            thread_meta,
+        )
+        .await?;
         if !was_inserted {
             return Err(DbError::InvalidData(
                 "app callback event id already exists".into(),

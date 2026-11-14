@@ -368,7 +368,7 @@ impl ActionSink for RelayActionSink {
                         &state,
                     )
                     .await
-                    .map_err(ActionSinkError::InvalidInput)?,
+                    .map_err(|e| ActionSinkError::InvalidInput(e.to_string()))?,
                 ),
                 None => None,
             };

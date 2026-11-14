@@ -1351,3 +1351,250 @@ async fn rate_limit_covers_valid_and_invalid_secrets() {
     }
     assert!(saw_429, "expected 429 within 61 mixed secret attempts");
 }
+
+async fn publish_channel_message(
+    keys: &Keys,
+    channel_id: Uuid,
+    content: &str,
+    tags: &[Tag],
+) -> String {
+    let mut all_tags = vec![Tag::parse(["h", &channel_id.to_string()]).unwrap()];
+    all_tags.extend(tags.iter().cloned());
+    let event = EventBuilder::new(Kind::Custom(9), content)
+        .tags(all_tags)
+        .sign_with_keys(keys)
+        .unwrap();
+    let id = event.id.to_hex();
+    publish_accepted(keys, event, "channel message").await;
+    id
+}
+
+async fn query_thread(http: &str, reader_keys: &Keys, channel_id: Uuid, root: &str) -> Vec<Value> {
+    let url = format!("{http}/query");
+    let body = serde_json::to_string(&json!([{
+        "kinds": [9],
+        "#h": [channel_id.to_string()],
+        "#e": [root],
+        "limit": 100,
+    }]))
+    .expect("serialize thread query");
+    let payload_hash = hex::encode(Sha256::digest(body.as_bytes()));
+    let nip98 = EventBuilder::new(Kind::Custom(27_235), "")
+        .tags(vec![
+            Tag::parse(["u", &url]).unwrap(),
+            Tag::parse(["method", "POST"]).unwrap(),
+            Tag::parse(["payload", &payload_hash]).unwrap(),
+            Tag::parse(["nonce", &Uuid::new_v4().to_string()]).unwrap(),
+        ])
+        .sign_with_keys(reader_keys)
+        .expect("sign NIP-98");
+    use base64::Engine;
+    let auth = format!(
+        "Nostr {}",
+        base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_string(&nip98).expect("serialize NIP-98"))
+    );
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .header("Host", request_host(http))
+        .header("Authorization", auth)
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("POST /query failed: {e}"));
+    let status = resp.status();
+    let text = resp.text().await.expect("read /query body");
+    assert!(status.is_success(), "POST /query failed: {status} {text}");
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse /query JSON: {e} ({text})"))
+}
+
+/// `(parent_event_id, root_event_id, depth)` from `thread_metadata`.
+async fn thread_row(
+    pool: &sqlx::PgPool,
+    community_id: Uuid,
+    event_id: &str,
+) -> Option<(Vec<u8>, Vec<u8>, i32)> {
+    sqlx::query(
+        "SELECT parent_event_id, root_event_id, depth FROM thread_metadata \
+         WHERE community_id = $1 AND event_id = $2",
+    )
+    .bind(community_id)
+    .bind(hex::decode(event_id).expect("event id hex"))
+    .fetch_optional(pool)
+    .await
+    .unwrap_or_else(|e| panic!("thread metadata lookup: {e}"))
+    .map(|row| {
+        (
+            row.get("parent_event_id"),
+            row.get("root_event_id"),
+            row.get("depth"),
+        )
+    })
+}
+
+fn e_markers(event: &Value) -> Vec<(String, String)> {
+    event_tags(event)
+        .into_iter()
+        .filter(|tag| tag.first().map(String::as_str) == Some("e"))
+        .map(|tag| {
+            (
+                tag.get(1).cloned().unwrap_or_default(),
+                tag.get(3).cloned().unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+fn reply_body(repo: &str, key: &str, content: &str, reply_to: &str) -> Value {
+    let mut body = callback_body(repo, key, content);
+    body["reply_to"] = json!(reply_to);
+    body
+}
+
+#[tokio::test]
+#[ignore = "requires a running relay"]
+async fn callback_reply_to_threads_into_same_channel() {
+    let fx = setup_routed_app().await;
+    let root = publish_channel_message(&fx.repo_owner, fx.channel, "thread root", &[]).await;
+    let member_reply = publish_channel_message(
+        &fx.repo_owner,
+        fx.channel,
+        "member reply",
+        &[Tag::parse(["e", &root, "", "reply"]).unwrap()],
+    )
+    .await;
+
+    let (status, direct) = post_callback(
+        &fx.http,
+        fx.app_id,
+        &fx.secret,
+        &reply_body(
+            &fx.repo_d,
+            &unique("reply-root"),
+            "app reply to root",
+            &root,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "direct reply: {direct}");
+    let direct_id = direct["event_id"].as_str().expect("event_id").to_string();
+
+    let (status, nested) = post_callback(
+        &fx.http,
+        fx.app_id,
+        &fx.secret,
+        &reply_body(
+            &fx.repo_d,
+            &unique("reply-nested"),
+            "app reply to reply",
+            &member_reply,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "nested reply: {nested}");
+    let nested_id = nested["event_id"].as_str().expect("event_id").to_string();
+
+    let root_bytes = hex::decode(&root).unwrap();
+    let member_bytes = hex::decode(&member_reply).unwrap();
+    assert_eq!(
+        thread_row(&fx.pool, fx.community_id, &direct_id).await,
+        Some((root_bytes.clone(), root_bytes.clone(), 1)),
+        "direct app reply must be indexed under the root"
+    );
+    assert_eq!(
+        thread_row(&fx.pool, fx.community_id, &nested_id).await,
+        Some((member_bytes, root_bytes, 2)),
+        "nested app reply must keep the thread root and the referenced parent"
+    );
+
+    let thread = query_thread(&fx.http, &fx.repo_owner, fx.channel, &root).await;
+    let find = |id: &str| {
+        thread
+            .iter()
+            .find(|event| event["id"].as_str() == Some(id))
+            .unwrap_or_else(|| panic!("thread query missing {id}: {thread:?}"))
+            .clone()
+    };
+    let direct_event = find(&direct_id);
+    assert_eq!(
+        e_markers(&direct_event),
+        vec![(root.clone(), "reply".to_string())]
+    );
+    assert!(has_tag(
+        &direct_event,
+        "buzz:app",
+        Some(&fx.app_id.to_string())
+    ));
+    let nested_event = find(&nested_id);
+    assert_eq!(
+        e_markers(&nested_event),
+        vec![
+            (root.clone(), "root".to_string()),
+            (member_reply.clone(), "reply".to_string()),
+        ]
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a running relay"]
+async fn callback_reply_to_rejects_foreign_and_unknown_targets() {
+    let fx = setup_routed_app().await;
+    let other_channel = create_channel(&fx.repo_owner, "app-other").await;
+    let foreign = publish_channel_message(&fx.repo_owner, other_channel, "elsewhere", &[]).await;
+    let unknown = "ab".repeat(32);
+
+    for (target, what) in [(foreign.as_str(), "foreign"), (unknown.as_str(), "unknown")] {
+        let body = reply_body(&fx.repo_d, &unique(what), "should not post", target);
+        let (first_status, first) = post_callback(&fx.http, fx.app_id, &fx.secret, &body).await;
+        assert_code(
+            first_status,
+            &first,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "reply_target_invalid",
+        );
+        let (replay_status, replay) = post_callback(&fx.http, fx.app_id, &fx.secret, &body).await;
+        assert_code(
+            replay_status,
+            &replay,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "reply_target_invalid",
+        );
+    }
+
+    let (status, body) = post_callback(
+        &fx.http,
+        fx.app_id,
+        &fx.secret,
+        &reply_body(&fx.repo_d, &unique("bad-hex"), "x", "NOT-HEX"),
+    )
+    .await;
+    assert_code(
+        status,
+        &body,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "invalid_control_fields",
+    );
+
+    assert!(
+        query_kind9(&fx.http, &fx.repo_owner, fx.channel)
+            .await
+            .is_empty(),
+        "rejected replies must not post into the routed channel"
+    );
+    assert_eq!(
+        query_kind9(&fx.http, &fx.repo_owner, other_channel)
+            .await
+            .len(),
+        1,
+        "rejected replies must not post into the foreign channel"
+    );
+    let rows = delivery_rows(&fx.pool, fx.community_id, fx.app_id).await;
+    assert_eq!(rows.len(), 2, "one rejected row per idempotency key");
+    for row in rows {
+        let status: String = row.get("status");
+        let code: Option<String> = row.get("failure_code");
+        assert_eq!(status, "rejected");
+        assert_eq!(code.as_deref(), Some("reply_target_invalid"));
+    }
+}
