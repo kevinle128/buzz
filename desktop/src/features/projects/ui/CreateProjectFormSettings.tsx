@@ -40,7 +40,15 @@ export function CreateProjectFormSettings({
   templateId,
   templates,
   channelVisibility,
-}: CreateProjectFormSettingsState & { disabled: boolean }) {
+  createsChannel = true,
+}: CreateProjectFormSettingsState & {
+  disabled: boolean;
+  /**
+   * False when the project reuses a channel: that channel keeps its own
+   * visibility and canvas, so the channel visibility and template rows hide.
+   */
+  createsChannel?: boolean;
+}) {
   const [isCreateTemplateOpen, setIsCreateTemplateOpen] = React.useState(false);
   const selectedPersona = personas.find(
     (persona) => persona.id === agentPersonaId,
@@ -56,66 +64,70 @@ export function CreateProjectFormSettings({
 
   return (
     <>
-      <ChannelPermissionsSettings
-        disabled={disabled}
-        onVisibilityChange={setChannelVisibility}
-        testIdPrefix="create-project-channel"
-        visibility={channelVisibility}
-      />
-
-      <div className={cn(SETTINGS_ROW_CLASS, disabled && "opacity-50")}>
-        <span className="text-sm font-medium text-foreground">
-          Template
-          <span className="ml-1 text-xs font-normal text-muted-foreground/50">
-            Project home by default
-          </span>
-        </span>
-        <DropdownMenu modal={false}>
-          <DropdownMenuTrigger asChild>
-            <Button
-              aria-label={`Template: ${selectedTemplate?.name ?? "None"}`}
-              className="-mr-2.5 ml-auto h-9 min-w-0 max-w-[60%] justify-end px-2.5 text-right text-sm font-medium text-foreground hover:bg-muted/50"
-              data-testid="create-project-template"
-              disabled={disabled}
-              type="button"
-              variant="ghost"
-            >
-              <span className="truncate text-right">
-                {selectedTemplate?.name ?? "None"}
-              </span>
-              <ChevronDown className="size-4 shrink-0 text-muted-foreground/70" />
-            </Button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="end">
-            <DropdownMenuRadioGroup
-              onValueChange={(value) =>
-                handleTemplateChange(value === NO_TEMPLATE_VALUE ? "" : value)
-              }
-              value={templateId || NO_TEMPLATE_VALUE}
-            >
-              <DropdownMenuRadioItem value={NO_TEMPLATE_VALUE}>
-                None
-              </DropdownMenuRadioItem>
-              {templates.map((template) => (
-                <DropdownMenuRadioItem key={template.id} value={template.id}>
-                  {template.name}
-                </DropdownMenuRadioItem>
-              ))}
-            </DropdownMenuRadioGroup>
-            <DropdownMenuSeparator />
-            <DropdownMenuItem onSelect={() => setIsCreateTemplateOpen(true)}>
-              <Plus className="size-4" />
-              Create new channel template…
-            </DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
-        <TemplateFormDialog
-          onCreated={handleTemplateCreated}
-          onOpenChange={setIsCreateTemplateOpen}
-          open={isCreateTemplateOpen}
-          template={null}
+      {createsChannel ? (
+        <ChannelPermissionsSettings
+          disabled={disabled}
+          onVisibilityChange={setChannelVisibility}
+          testIdPrefix="create-project-channel"
+          visibility={channelVisibility}
         />
-      </div>
+      ) : null}
+
+      {createsChannel ? (
+        <div className={cn(SETTINGS_ROW_CLASS, disabled && "opacity-50")}>
+          <span className="text-sm font-medium text-foreground">
+            Template
+            <span className="ml-1 text-xs font-normal text-muted-foreground/50">
+              Project home by default
+            </span>
+          </span>
+          <DropdownMenu modal={false}>
+            <DropdownMenuTrigger asChild>
+              <Button
+                aria-label={`Template: ${selectedTemplate?.name ?? "None"}`}
+                className="-mr-2.5 ml-auto h-9 min-w-0 max-w-[60%] justify-end px-2.5 text-right text-sm font-medium text-foreground hover:bg-muted/50"
+                data-testid="create-project-template"
+                disabled={disabled}
+                type="button"
+                variant="ghost"
+              >
+                <span className="truncate text-right">
+                  {selectedTemplate?.name ?? "None"}
+                </span>
+                <ChevronDown className="size-4 shrink-0 text-muted-foreground/70" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              <DropdownMenuRadioGroup
+                onValueChange={(value) =>
+                  handleTemplateChange(value === NO_TEMPLATE_VALUE ? "" : value)
+                }
+                value={templateId || NO_TEMPLATE_VALUE}
+              >
+                <DropdownMenuRadioItem value={NO_TEMPLATE_VALUE}>
+                  None
+                </DropdownMenuRadioItem>
+                {templates.map((template) => (
+                  <DropdownMenuRadioItem key={template.id} value={template.id}>
+                    {template.name}
+                  </DropdownMenuRadioItem>
+                ))}
+              </DropdownMenuRadioGroup>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem onSelect={() => setIsCreateTemplateOpen(true)}>
+                <Plus className="size-4" />
+                Create new channel template…
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+          <TemplateFormDialog
+            onCreated={handleTemplateCreated}
+            onOpenChange={setIsCreateTemplateOpen}
+            open={isCreateTemplateOpen}
+            template={null}
+          />
+        </div>
+      ) : null}
 
       <div className={cn(SETTINGS_ROW_CLASS, teamDisabled && "opacity-50")}>
         <span className="text-sm font-medium text-foreground">

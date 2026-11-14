@@ -38,6 +38,15 @@ export type CreateProjectInput = {
   templateId?: string;
   /** Optional default-repository name; omitted keeps the project slug. */
   repositoryName?: string;
+  /**
+   * Channel to use as the project home. Omitted creates a new channel; a
+   * given channel keeps its own visibility, canvas, and members.
+   */
+  existingChannelId?: string;
+  /** Clone URL of a repository hosted outside the relay. */
+  cloneUrl?: string;
+  /** Web page of that repository on its git host. */
+  webUrl?: string;
 };
 
 export type CreateProjectResult = {
@@ -143,11 +152,13 @@ async function ensureDefaultRepository({
   project: Project;
 }): Promise<Project> {
   const repositoryTemplate = buildDefaultProjectRepositoryTemplate({
+    cloneUrl: input.cloneUrl,
     description: input.description,
     name: input.name,
     ownerPubkey,
     projectChannelId: channelId,
     repositoryName: input.repositoryName,
+    webUrl: input.webUrl,
   });
   const existingRepository =
     project.repositories.find(
@@ -284,8 +295,9 @@ export async function createProject(
   }
 
   resume.projectIds.add(projectId);
-  let channel = resume.channels.get(projectId);
-  if (!channel) {
+  const existingChannelId = input.existingChannelId?.trim();
+  let channel = existingChannelId ? null : resume.channels.get(projectId);
+  if (!existingChannelId && !channel) {
     channel = await createChannel({
       channelType: "stream",
       description: input.description,
@@ -294,14 +306,17 @@ export async function createProject(
     });
     resume.channels.set(projectId, channel);
   }
+  const projectChannelId = existingChannelId || channel?.id || "";
 
   const templates = buildProjectBootstrapTemplates({
+    cloneUrl: input.cloneUrl,
     description: input.description,
     name: input.name,
     ownerPubkey: identity.pubkey,
-    projectChannelId: channel.id,
+    projectChannelId,
     projectVisibility: input.projectVisibility ?? "listed",
     repositoryName: input.repositoryName,
+    webUrl: input.webUrl,
   });
   const existingRepositoryEvent = await fetchOwnHead(
     KIND_REPO_ANNOUNCEMENT,
@@ -319,5 +334,5 @@ export async function createProject(
   }
 
   const project = readCreatedProject(projectEvent, repositoryEvent);
-  return finishCreate(channel, project, input, resume, projectId);
+  return finishCreate(channel ?? null, project, input, resume, projectId);
 }
