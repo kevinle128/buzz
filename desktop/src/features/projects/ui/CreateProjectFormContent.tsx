@@ -1,6 +1,7 @@
 import { ArrowLeft } from "lucide-react";
 import * as React from "react";
 
+import { useChannelsQuery } from "@/features/channels/hooks";
 import type { CreateProjectInput } from "@/features/projects/useCreateProject";
 import { CREATE_PROJECT_REFOCUS_DELAY_MS } from "@/features/projects/ui/createProjectFormFocus";
 import { CreateProjectFormSettings } from "@/features/projects/ui/CreateProjectFormSettings";
@@ -36,15 +37,32 @@ export function CreateProjectFormContent({
   const [name, setName] = React.useState("");
   const [description, setDescription] = React.useState("");
   const [repositoryName, setRepositoryName] = React.useState("");
+  const [existingChannelId, setExistingChannelId] = React.useState("");
+  const [cloneUrl, setCloneUrl] = React.useState("");
+  const [webUrl, setWebUrl] = React.useState("");
   const [errorMessage, setErrorMessage] = React.useState<string | null>(null);
   const nameInputRef = React.useRef<HTMLInputElement>(null);
   const settings = useCreateProjectFormSettings(active, setDescription);
+  const channelsQuery = useChannelsQuery({ enabled: active });
+  const existingChannels = React.useMemo(
+    () =>
+      (channelsQuery.data ?? []).filter(
+        (channel) =>
+          channel.isMember &&
+          !channel.archivedAt &&
+          channel.channelType !== "dm",
+      ),
+    [channelsQuery.data],
+  );
 
   React.useEffect(() => {
     if (!active) return;
     setName(initialName);
     setDescription("");
     setRepositoryName("");
+    setExistingChannelId("");
+    setCloneUrl("");
+    setWebUrl("");
     setErrorMessage(null);
 
     const timerId = globalThis.setTimeout(() => {
@@ -64,6 +82,9 @@ export function CreateProjectFormContent({
         name: trimmedName,
         description: description.trim() || undefined,
         repositoryName: repositoryName.trim() || undefined,
+        existingChannelId: existingChannelId || undefined,
+        cloneUrl: cloneUrl.trim() || undefined,
+        webUrl: webUrl.trim() || undefined,
         channelVisibility: settings.channelVisibility,
         projectVisibility: settings.projectVisibility,
         agents: settings.buildAgents(),
@@ -158,6 +179,43 @@ export function CreateProjectFormContent({
         <div className="space-y-1.5">
           <label
             className="text-sm font-medium text-foreground"
+            htmlFor="create-project-existing-channel"
+          >
+            Channel
+          </label>
+          <div
+            className={cn(
+              "flex min-h-11 items-center px-3",
+              CREATE_FIELD_SHELL_CLASS,
+            )}
+          >
+            <select
+              className={cn("h-8 w-full px-0 py-0", CREATE_FIELD_CONTROL_CLASS)}
+              data-testid="create-project-existing-channel"
+              disabled={isCreating}
+              id="create-project-existing-channel"
+              onChange={(event) => {
+                setExistingChannelId(event.target.value);
+                setErrorMessage(null);
+              }}
+              value={existingChannelId}
+            >
+              <option value="">Create a new channel</option>
+              {existingChannels.map((channel) => (
+                <option key={channel.id} value={channel.id}>
+                  {channel.name}
+                </option>
+              ))}
+            </select>
+          </div>
+          <p className="text-xs text-muted-foreground">
+            Members of this channel can access project repositories.
+          </p>
+        </div>
+
+        <div className="space-y-1.5">
+          <label
+            className="text-sm font-medium text-foreground"
             htmlFor="create-project-description"
           >
             Description
@@ -222,7 +280,86 @@ export function CreateProjectFormContent({
           </p>
         </div>
 
-        <CreateProjectFormSettings disabled={isCreating} {...settings} />
+        <div className="space-y-1.5">
+          <label
+            className="text-sm font-medium text-foreground"
+            htmlFor="create-project-clone-url"
+          >
+            Repository clone URL
+            <span className={CREATE_LABEL_OPTIONAL_CLASS}>Optional</span>
+          </label>
+          <div
+            className={cn(
+              "flex min-h-11 items-center px-3",
+              CREATE_FIELD_SHELL_CLASS,
+            )}
+          >
+            <Input
+              autoCapitalize="none"
+              autoComplete="off"
+              autoCorrect="off"
+              className={cn(
+                "h-8 px-0 py-0 leading-6",
+                CREATE_FIELD_CONTROL_CLASS,
+              )}
+              data-testid="create-project-clone-url"
+              disabled={isCreating}
+              id="create-project-clone-url"
+              onChange={(event) => {
+                setCloneUrl(event.target.value);
+                setErrorMessage(null);
+              }}
+              placeholder="https://git.example.com/team/bee-garden.git"
+              spellCheck={false}
+              value={cloneUrl}
+            />
+          </div>
+          <p className="text-xs text-muted-foreground">
+            Leave empty to host the repository on this relay.
+          </p>
+        </div>
+
+        <div className="space-y-1.5">
+          <label
+            className="text-sm font-medium text-foreground"
+            htmlFor="create-project-web-url"
+          >
+            Repository web URL
+            <span className={CREATE_LABEL_OPTIONAL_CLASS}>Optional</span>
+          </label>
+          <div
+            className={cn(
+              "flex min-h-11 items-center px-3",
+              CREATE_FIELD_SHELL_CLASS,
+            )}
+          >
+            <Input
+              autoCapitalize="none"
+              autoComplete="off"
+              autoCorrect="off"
+              className={cn(
+                "h-8 px-0 py-0 leading-6",
+                CREATE_FIELD_CONTROL_CLASS,
+              )}
+              data-testid="create-project-web-url"
+              disabled={isCreating}
+              id="create-project-web-url"
+              onChange={(event) => {
+                setWebUrl(event.target.value);
+                setErrorMessage(null);
+              }}
+              placeholder="https://git.example.com/team/bee-garden"
+              spellCheck={false}
+              value={webUrl}
+            />
+          </div>
+        </div>
+
+        <CreateProjectFormSettings
+          disabled={isCreating}
+          createsChannel={!existingChannelId}
+          {...settings}
+        />
 
         {errorMessage ? (
           <p className="text-sm text-destructive">{errorMessage}</p>
