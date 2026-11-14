@@ -770,6 +770,73 @@ jobs:
             echo "Deleted v${version}"
           done < "$delete_list"
 
+  # Mirrors the installers on the desktop-v<version> GitHub Release so the
+  # repository has a downloads page. The CDN stays the update source:
+  # latest.json and the updater URLs are not changed here. A re-run replaces
+  # the assets and the notes of the same release.
+  github-release:
+    name: GitHub Release
+    runs-on: ubuntu-latest
+    needs: [setup, publish]
+    if: github.event_name != 'workflow_dispatch' || (inputs.publish && inputs.channel != 'canary')
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.setup.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: desktop-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create or update the release
+        run: |
+          set -euo pipefail
+          tag="desktop-v${VERSION}"
+          base_url="$(dirname "$BUZZ_UPDATER_ENDPOINT")/v${VERSION}"
+
+          one() {
+            local matches
+            mapfile -t matches < <(find dist -type f -name "$1")
+            if [[ ${#matches[@]} -ne 1 ]]; then
+              echo "::error::Expected one '$1' in dist, found ${#matches[@]}" >&2
+              return 1
+            fi
+            echo "${matches[0]}"
+          }
+          dmg=$(one "Buzz_${VERSION}_aarch64.dmg")
+          exe=$(one "Buzz_${VERSION}_x64-setup.exe")
+          appimage=$(one "Buzz_${VERSION}_amd64.AppImage")
+
+          notes="${RUNNER_TEMP}/release-notes.md"
+          cat > "$notes" <<NOTES
+          Buzz desktop ${VERSION}
+
+          Downloads (CDN):
+          - macOS (Apple silicon, signed and notarized): ${base_url}/$(basename "$dmg")
+          - Windows (x64): ${base_url}/$(basename "$exe")
+          - Linux (x64 AppImage): ${base_url}/$(basename "$appimage")
+
+          Installed apps update themselves from ${BUZZ_UPDATER_ENDPOINT}.
+          NOTES
+
+          # A new release stays a draft until every asset is attached.
+          if ! gh release view "$tag" > /dev/null 2>&1; then
+            gh release create "$tag" --verify-tag --draft \
+              --title "Buzz desktop ${VERSION}" --notes-file "$notes"
+          fi
+          gh release upload "$tag" "$dmg" "$exe" "$appimage" --clobber
+          gh release edit "$tag" --draft=false --latest \
+            --title "Buzz desktop ${VERSION}" --notes-file "$notes"
+          gh release view "$tag" --json url,assets \
+            --jq '"\(.url) assets=\([.assets[].name] | join(", "))"'
+          latest="$(gh api "repos/${GH_REPO}/releases/latest" --jq .tag_name)"
+          [[ "$latest" == "$tag" ]] || { echo "::error::Latest release is ${latest}, expected ${tag}"; exit 1; }
+
   notify:
     name: Notify Buzz
     needs: [setup, publish]

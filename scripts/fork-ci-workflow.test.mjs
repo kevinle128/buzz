@@ -987,6 +987,20 @@ test("the resume releases only after a sync pull request merge that contains the
   }
 });
 
+test("the desktop build mirrors the installers on the tag's GitHub Release after the CDN upload", () => {
+  const release = jobBlocks(buildWorkflow).get("github-release").join("\n");
+  assert.match(release, /needs: \[setup, publish\]/);
+  assert.match(release, /permissions:\n {6}contents: write\n/);
+  assert.match(release, /inputs\.channel != 'canary'/);
+  for (const asset of ["_aarch64.dmg", "_x64-setup.exe", "_amd64.AppImage"]) {
+    assert.ok(release.includes(asset), `release attaches ${asset}`);
+  }
+  assert.match(release, /gh release upload "\$tag" "\$dmg" "\$exe" "\$appimage" --clobber/);
+  assert.match(release, /gh release edit "\$tag" --draft=false --latest/);
+  // The updater feed stays on the CDN; this job never touches the bucket.
+  assert.doesNotMatch(release, /aws s3/);
+});
+
 test("the desktop build runs macOS on the Mac runner, cleans it, and can be started on a tag", () => {
   assert.match(
     buildWorkflow,
@@ -1000,6 +1014,7 @@ test("the desktop build runs macOS on the Mac runner, cleans it, and can be star
     "[self-hosted, macOS, ARM64, buzz]",
     "ubuntu-latest",
     "windows-latest",
+    "ubuntu-latest",
     "ubuntu-latest",
     "ubuntu-latest",
   ]);
