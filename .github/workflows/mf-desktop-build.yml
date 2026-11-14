@@ -832,8 +832,10 @@ jobs:
           gh release upload "$tag" "$dmg" "$exe" "$appimage" --clobber
           gh release edit "$tag" --draft=false --latest \
             --title "Buzz desktop ${VERSION}" --notes-file "$notes"
-          gh release view "$tag" --json url,isLatest,assets \
-            --jq '"\(.url) latest=\(.isLatest) assets=\([.assets[].name] | join(", "))"'
+          gh release view "$tag" --json url,assets \
+            --jq '"\(.url) assets=\([.assets[].name] | join(", "))"'
+          latest="$(gh api "repos/${GH_REPO}/releases/latest" --jq .tag_name)"
+          [[ "$latest" == "$tag" ]] || { echo "::error::Latest release is ${latest}, expected ${tag}"; exit 1; }
 
   notify:
     name: Notify Buzz
