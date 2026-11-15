@@ -356,7 +356,10 @@ function classifyDeveloperToolName(value: string | null | undefined) {
 export function parseBuzzCliCommand(
   command: string,
 ): AgentActivityDescriptor | null {
-  const tokens = tokenizeShellCommand(command);
+  const heredoc = extractQuotedHeredoc(command);
+  // Tokenize only the command line when a quoted heredoc is present: the body
+  // is literal text and must not be read as shell tokens or flags.
+  const tokens = tokenizeShellCommand(heredoc?.commandText ?? command);
   const range = findBuzzCommand(tokens);
   if (!range) return null;
 
@@ -375,7 +378,7 @@ export function parseBuzzCliCommand(
   const operation = `${group}.${verb}`;
   const isSend = group === "messages" && verb === "send";
   const preview = isSend
-    ? extractBuzzCliInlineContent(tokens, range)
+    ? extractBuzzCliInlineContent(tokens, range, heredoc?.body ?? null)
     : extractBuzzCliObjectPreview(tokens, range);
   const tone = buzzCliTone(group, verb);
   return {
@@ -463,11 +466,43 @@ function buzzCliTone(group: string, verb: string): AgentActivityTone {
 function extractBuzzCliInlineContent(
   tokens: string[],
   range: BuzzCommandRange,
+  heredocBody: string | null,
 ): string | null {
   const content = getFlagValue(tokens, range.verbIndex + 1, "--content");
-  if (!content || content === "-") return null;
+  if (content === "-") return heredocBody || null;
+  if (!content) return null;
   if (content.includes("$") || content.includes("`")) return null;
   return content;
+}
+
+type QuotedHeredoc = { commandText: string; body: string };
+
+// Matches `<<'EOF'`, `<<"EOF"` and `<<-'EOF'`. Unquoted delimiters are not
+// matched because the shell expands `$` and backticks in their body.
+const QUOTED_HEREDOC_OPERATOR = /<<(-?)[ \t]*(?:'([^'\n]+)'|"([^"\n]+)")/;
+
+function extractQuotedHeredoc(command: string): QuotedHeredoc | null {
+  const match = QUOTED_HEREDOC_OPERATOR.exec(command);
+  if (!match) return null;
+  const stripTabs = match[1] === "-";
+  const delimiter = match[2] ?? match[3];
+
+  const lineEnd = command.indexOf("\n", match.index + match[0].length);
+  if (lineEnd === -1) return null;
+
+  const bodyLines: string[] = [];
+  for (const rawLine of command.slice(lineEnd + 1).split("\n")) {
+    const line = rawLine.replace(/\r$/, "");
+    const candidate = stripTabs ? line.replace(/^\t+/, "") : line;
+    if (candidate === delimiter) {
+      return {
+        commandText: command.slice(0, lineEnd),
+        body: bodyLines.join("\n").trim(),
+      };
+    }
+    bodyLines.push(stripTabs ? candidate : line);
+  }
+  return null;
 }
 
 function extractBuzzCliObjectPreview(
