@@ -222,6 +222,7 @@ export function AppShell() {
   // opt-outs. Frames before the listener opens are permanently lost.
   const observerReconciled = useObserverArchiveReconciliation(
     identityQuery.data?.pubkey,
+    communitiesHook.activeCommunity?.relayUrl,
   );
   // useArchiveSync must wait for reconciliation, or listeners could open
   // before kind 24200 is guaranteed present in the subscription.
@@ -232,7 +233,10 @@ export function AppShell() {
   // Kind 44200 is relay-persisted (durable) and stays deferred: missed
   // startup frames can be replayed, so there's no ordering constraint.
   const deferredPubkey = startupReady ? identityQuery.data?.pubkey : undefined;
-  useAgentMetricArchiveSeed(deferredPubkey);
+  useAgentMetricArchiveSeed(
+    deferredPubkey,
+    communitiesHook.activeCommunity?.relayUrl,
+  );
   const profileQuery = useProfileQuery();
   useRelayAutoHeal();
   usePresenceSubscription();
