@@ -6,6 +6,7 @@ import {
   buildTranscriptDisplayBlocks,
   flattenDisplayBlocks,
 } from "./agentSessionTranscriptGrouping.ts";
+import { deriveAgentSessionRows } from "../agentSessionRows.ts";
 import { formatToolTitle } from "./agentSessionToolCatalog.ts";
 
 const baseEvent = {
@@ -2439,4 +2440,81 @@ test("buildTranscript_control_result_sent_does_not_mark_delivery_failed", () => 
     undefined,
     "deliveryFailed must not be set on sent control_result",
   );
+});
+
+// --- aborted turns ---
+
+function abortedTurnEvents(payload) {
+  const turn = { agentIndex: 0, channelId: "channel-1", turnId: "turn-1" };
+  return [
+    {
+      ...turn,
+      seq: 1,
+      timestamp: "2026-06-30T09:00:00.000Z",
+      kind: "turn_started",
+      payload: { threadRootEventId: "d".repeat(64), source: "channel" },
+    },
+    {
+      ...turn,
+      seq: 2,
+      timestamp: "2026-06-30T09:00:05.000Z",
+      kind: "turn_error",
+      payload: { error: "turn aborted", ...payload },
+    },
+    {
+      ...turn,
+      seq: 3,
+      timestamp: "2026-06-30T09:00:05.100Z",
+      kind: "turn_completed",
+      payload: {},
+    },
+  ];
+}
+
+const ABORT_PAYLOAD = {
+  outcome: "aborted",
+  abortReason: "context_over_budget",
+  usedTokens: 208000,
+  budgetTokens: 152000,
+  resetSession: true,
+};
+
+test("an aborted turn is a failed row even though turn_completed follows", () => {
+  const rows = deriveAgentSessionRows(
+    abortedTurnEvents(ABORT_PAYLOAD),
+    new Set(),
+    Date.parse("2026-06-30T10:00:00.000Z"),
+  );
+  assert.equal(rows.endedToday.length, 0);
+  assert.equal(rows.failed.length, 1);
+  assert.equal(rows.failed[0].kind, "failed");
+  assert.equal(
+    rows.failed[0].error,
+    "Stopped: conversation too long · 208k / 152k tokens",
+  );
+});
+
+test("a turn_error without abortReason keeps the old row text", () => {
+  const rows = deriveAgentSessionRows(
+    abortedTurnEvents({ outcome: "error", error: "boom" }),
+    new Set(),
+    Date.parse("2026-06-30T10:00:00.000Z"),
+  );
+  assert.equal(rows.failed[0].error, "boom");
+});
+
+test("the transcript shows the abort label and the new-session note", () => {
+  const [, card] = buildTranscript(abortedTurnEvents(ABORT_PAYLOAD)).filter(
+    (item) => item.type === "lifecycle",
+  );
+  assert.equal(
+    card.text,
+    "Stopped: conversation too long · 208k / 152k tokens",
+  );
+  assert.equal(card.note, "Next message starts a new session");
+
+  const [, kept] = buildTranscript(
+    abortedTurnEvents({ ...ABORT_PAYLOAD, resetSession: false }),
+  ).filter((item) => item.type === "lifecycle");
+  assert.equal(kept.note, undefined);
 });

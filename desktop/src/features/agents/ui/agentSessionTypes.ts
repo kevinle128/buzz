@@ -120,6 +120,8 @@ export type TranscriptItem =
       text: string;
       /** Resolved outcome for permission items (e.g. "Approved (allow_once)", "Denied (reject_once)", "Cancelled"). */
       outcome?: string;
+      /** Muted line shown under an error card (for example, session reset). */
+      note?: string;
       timestamp: string;
       descriptor?: AgentActivityDescriptor;
       acpSource?: TranscriptAcpSource;

@@ -27,7 +27,10 @@ import {
   parsePromptBlocks,
   parseSystemPromptSections,
 } from "./agentSessionTranscriptHelpers";
-import { friendlyTurnErrorCopy } from "../lib/friendlyAgentLastError";
+import {
+  friendlyTurnErrorCopy,
+  parseTurnAbort,
+} from "../lib/friendlyAgentLastError";
 import {
   describePermissionOutcome,
   describePermissionRequest,
@@ -120,6 +123,8 @@ function ensureMutable(d: TranscriptDraft) {
     d.changed = true;
   }
 }
+
+const NEW_SESSION_NOTE = "Next message starts a new session";
 
 function replaceItem(d: TranscriptDraft, id: string, updated: TranscriptItem) {
   ensureMutable(d);
@@ -708,19 +713,25 @@ export function processTranscriptEvent(
     const payload = asRecord(event.payload);
     const outcome = asString(payload.outcome) ?? "error";
     const error = asString(payload.error) ?? "Unknown error";
+    const abort = event.kind === "turn_error" ? parseTurnAbort(payload) : null;
     const displayError = friendlyTurnErrorCopy(error, payload.code);
     const title =
       event.kind === "agent_panic" ? "Agent error (crash)" : "Turn error";
+    const itemId = `${event.kind}:${ch}:${event.turnId ?? event.seq}`;
     upsertTextItem(
       d,
-      `${event.kind}:${ch}:${event.turnId ?? event.seq}`,
+      itemId,
       "lifecycle",
       title,
-      `${outcome}: ${displayError}`,
+      abort ? abort.label : `${outcome}: ${displayError}`,
       event.timestamp,
       ctx,
       event.kind,
     );
+    const card = d.itemsById.get(itemId);
+    if (abort?.resetSession && card?.type === "lifecycle") {
+      replaceItem(d, itemId, { ...card, note: NEW_SESSION_NOTE });
+    }
   } else if (event.kind === "acp_read" || event.kind === "acp_write") {
     const payload = asRecord(event.payload);
     const method = asString(payload.method);

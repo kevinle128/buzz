@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   friendlyAgentLastError,
   friendlyTurnErrorCopy,
+  parseTurnAbort,
   CLI_ACP_INTERNAL_ERROR_COPY,
   MODEL_NOT_FOUND_COPY,
   RELAY_MESH_DENIED_COPY,
@@ -315,4 +316,41 @@ test("-32603 does not affect -32001/-32002 classification (regression)", () => {
     severity: "denied",
     copy: MODEL_NOT_FOUND_COPY,
   });
+});
+
+test("parseTurnAbort labels known reasons with token numbers", () => {
+  assert.deepEqual(
+    parseTurnAbort({
+      outcome: "aborted",
+      abortReason: "context_over_budget",
+      usedTokens: 207600,
+      budgetTokens: 152000,
+      resetSession: true,
+    }),
+    {
+      label: "Stopped: conversation too long · 208k / 152k tokens",
+      resetSession: true,
+    },
+  );
+  assert.deepEqual(
+    parseTurnAbort({ outcome: "aborted", abortReason: "output_truncated" }),
+    { label: "Stopped: reply was cut off", resetSession: false },
+  );
+});
+
+test("parseTurnAbort keeps unknown reasons and skips numbers when one is missing", () => {
+  assert.equal(
+    parseTurnAbort({
+      outcome: "aborted",
+      abortReason: "tool_loop",
+      usedTokens: 5000,
+    })?.label,
+    "Stopped: tool_loop",
+  );
+});
+
+test("parseTurnAbort ignores errors without an abort reason", () => {
+  assert.equal(parseTurnAbort({ outcome: "aborted" }), null);
+  assert.equal(parseTurnAbort({ outcome: "error", abortReason: "x" }), null);
+  assert.equal(parseTurnAbort(null), null);
 });

@@ -1,5 +1,8 @@
 import { asRecord, asString } from "./ui/agentSessionUtils";
-import { friendlyTurnErrorCopy } from "./lib/friendlyAgentLastError";
+import {
+  friendlyTurnErrorCopy,
+  parseTurnAbort,
+} from "./lib/friendlyAgentLastError";
 import { extractTriggeringEventIds } from "./ui/agentSessionTranscriptHelpers";
 import { buildTranscriptState } from "./ui/agentSessionTranscript";
 import type { ObserverEvent, TranscriptItem } from "./ui/agentSessionTypes";
@@ -238,10 +241,12 @@ export function deriveAgentSessionRows(
     } else if (event.kind === "turn_error") {
       draft.failed = true;
       draft.endedAt = at;
-      draft.error = friendlyTurnErrorCopy(
-        asString(payload.error) ?? "Unknown error",
-        payload.code,
-      );
+      draft.error =
+        parseTurnAbort(payload)?.label ??
+        friendlyTurnErrorCopy(
+          asString(payload.error) ?? "Unknown error",
+          payload.code,
+        );
     } else if (event.kind === "turn_completed") {
       draft.completed = true;
       draft.endedAt = draft.endedAt ?? at;
