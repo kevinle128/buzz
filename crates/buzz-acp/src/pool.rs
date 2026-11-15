@@ -2606,6 +2606,9 @@ async fn run_turn(
     if let Some(root) = observer_thread_root {
         turn_started_payload["threadRootEventId"] = serde_json::json!(root);
     }
+    if let Some((_, pending)) = &wake {
+        turn_started_payload["wakeReason"] = serde_json::json!(pending.request.reason.as_str());
+    }
     agent.acp.observe("turn_started", turn_started_payload);
 
     // Emits `turn_completed` on any exit path. Captures observer handle and
