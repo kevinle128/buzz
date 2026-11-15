@@ -51,12 +51,42 @@ const MAX_TERMINAL_TOMBSTONES = MAX_TURNS_PER_AGENT * 4;
 /** Interval for pruning stale/expired turns. */
 const PRUNE_INTERVAL_MS = 5_000;
 
-type ActiveTurn = {
+/** Per-turn facts read from `turn_started` / `turn_liveness` payloads. */
+type ActiveTurnMeta = {
+  threadRootEventId: string | null;
+  agentIndex: number | null;
+  source: string | null;
+  wakeReason: string | null;
+};
+
+type ActiveTurn = ActiveTurnMeta & {
   turnId: string;
   channelId: string;
   startedAt: number;
   lastActivityAt: number;
 };
+
+/** One live turn surfaced to the UI, anchored to the desktop clock. */
+export type ActiveTurnDetail = ActiveTurnMeta & {
+  turnId: string;
+  channelId: string;
+  anchorAt: number;
+};
+
+function readTurnMeta(event: ObserverEvent): ActiveTurnMeta {
+  const payload =
+    event.payload && typeof event.payload === "object"
+      ? (event.payload as Record<string, unknown>)
+      : {};
+  const text = (value: unknown) =>
+    typeof value === "string" && value.length > 0 ? value : null;
+  return {
+    threadRootEventId: text(payload.threadRootEventId),
+    agentIndex: event.agentIndex ?? null,
+    source: text(payload.source),
+    wakeReason: text(payload.wakeReason),
+  };
+}
 
 /** One working channel surfaced to the UI, anchored to the desktop clock. */
 export type ActiveTurnSummary = {
@@ -97,6 +127,7 @@ const clockOffsetByAgent = new Map<string, number>();
 // Cached snapshots for useSyncExternalStore reference stability.
 // Only regenerated when the underlying turn map for an agent actually changes.
 const cachedTurnSummaries = new Map<string, ActiveTurnSummary[]>();
+const cachedTurnDetails = new Map<string, ActiveTurnDetail[]>();
 let cachedChannelTurnSummaries: ActiveChannelTurnSummary[] | null = null;
 
 // Composite watermark per (agent, channel): the newest observer event
@@ -143,6 +174,7 @@ let unsubscribePruneVisibility: (() => void) | null = null;
 
 function invalidateCache(agentKey: string) {
   cachedTurnSummaries.delete(agentKey);
+  cachedTurnDetails.delete(agentKey);
   cachedChannelTurnSummaries = null;
 }
 
@@ -179,6 +211,7 @@ function startTurn(
   channelId: string,
   turnId: string,
   timestamp: string,
+  meta: ActiveTurnMeta,
 ) {
   const key = normalizePubkey(agentPubkey);
   let agentTurns = activeTurnsByAgent.get(key);
@@ -204,6 +237,7 @@ function startTurn(
 
   const startedAt = parseTimestamp(timestamp) ?? Date.now();
   agentTurns.set(turnId, {
+    ...meta,
     turnId,
     channelId,
     startedAt,
@@ -212,7 +246,11 @@ function startTurn(
   invalidateCache(key);
 }
 
-function recordActivity(agentPubkey: string, turnId: string | null): boolean {
+function recordActivity(
+  agentPubkey: string,
+  turnId: string | null,
+  event?: ObserverEvent,
+): boolean {
   if (!turnId) return false;
   const key = normalizePubkey(agentPubkey);
   const agentTurns = activeTurnsByAgent.get(key);
@@ -220,6 +258,15 @@ function recordActivity(agentPubkey: string, turnId: string | null): boolean {
   const turn = agentTurns.get(turnId);
   if (turn) {
     turn.lastActivityAt = Date.now();
+    // Liveness frames repeat the thread root; adopt it when the turn was
+    // revived or started by an older harness without one.
+    if (event?.kind === "turn_liveness" && !turn.threadRootEventId) {
+      const meta = readTurnMeta(event);
+      if (meta.threadRootEventId) {
+        turn.threadRootEventId = meta.threadRootEventId;
+        invalidateCache(key);
+      }
+    }
     return true;
   }
   return false;
@@ -254,7 +301,13 @@ function resurrectTurn(agentPubkey: string, event: ObserverEvent): boolean {
     frameAt !== null && startedAtMs !== null && startedAtMs <= frameAt
       ? startedAt
       : event.timestamp;
-  startTurn(agentPubkey, event.channelId, event.turnId, safeStartedAt);
+  startTurn(
+    agentPubkey,
+    event.channelId,
+    event.turnId,
+    safeStartedAt,
+    readTurnMeta(event),
+  );
   return true;
 }
 
@@ -408,6 +461,7 @@ function processEvent(agentPubkey: string, event: ObserverEvent) {
           event.channelId,
           event.turnId ?? `seq-${event.seq}`,
           event.timestamp,
+          readTurnMeta(event),
         );
         notifyListeners();
         return;
@@ -432,7 +486,11 @@ function processEvent(agentPubkey: string, event: ObserverEvent) {
     // turn was pruned out from under a still-running host (a transient drop
     // raced the pause, or the lone-crash residual self-healed), resurrect it.
     case "turn_liveness": {
-      const refreshed = recordActivity(agentPubkey, event.turnId ?? null);
+      const refreshed = recordActivity(
+        agentPubkey,
+        event.turnId ?? null,
+        event,
+      );
       if (!refreshed && resurrectTurn(agentPubkey, event)) {
         notifyListeners();
         return;
@@ -527,6 +585,39 @@ export function getActiveTurnsForAgent(
 }
 
 const EMPTY_TURNS: ActiveTurnSummary[] = [];
+const EMPTY_TURN_DETAILS: ActiveTurnDetail[] = [];
+
+/**
+ * Returns one entry per live turn of the agent (not collapsed per channel),
+ * oldest first. The array reference is cached and stable until the turn map
+ * mutates, as `useSyncExternalStore` requires.
+ */
+export function getActiveTurnDetailsForAgent(
+  agentPubkey: string | null | undefined,
+): ActiveTurnDetail[] {
+  if (!agentPubkey) return EMPTY_TURN_DETAILS;
+  const key = normalizePubkey(agentPubkey);
+  const agentTurns = activeTurnsByAgent.get(key);
+  if (!agentTurns || agentTurns.size === 0) return EMPTY_TURN_DETAILS;
+
+  const cached = cachedTurnDetails.get(key);
+  if (cached) return cached;
+
+  const offset = clockOffsetByAgent.get(key) ?? 0;
+  const result = [...agentTurns.values()]
+    .map((turn) => ({
+      turnId: turn.turnId,
+      channelId: turn.channelId,
+      anchorAt: turn.startedAt + offset,
+      threadRootEventId: turn.threadRootEventId,
+      agentIndex: turn.agentIndex,
+      source: turn.source,
+      wakeReason: turn.wakeReason,
+    }))
+    .sort((a, b) => a.anchorAt - b.anchorAt);
+  cachedTurnDetails.set(key, result);
+  return result;
+}
 const EMPTY_CHANNEL_TURNS: ActiveChannelTurnSummary[] = [];
 
 /**
@@ -709,6 +800,7 @@ export function resetActiveAgentTurnsStore() {
   lastProcessed.clear();
   clockOffsetByAgent.clear();
   cachedTurnSummaries.clear();
+  cachedTurnDetails.clear();
   cachedChannelTurnSummaries = null;
   terminalAtByAgent.clear();
   notifyListeners();
@@ -825,6 +917,7 @@ export function restoreActiveAgentTurnsForCommunity(communityId: string): void {
   }
 
   cachedTurnSummaries.clear();
+  cachedTurnDetails.clear();
   cachedChannelTurnSummaries = null;
   notifyListeners();
 }

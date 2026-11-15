@@ -3,6 +3,8 @@ import { motion, useReducedMotion } from "motion/react";
 import { CheckCheck, Clock, Radio } from "lucide-react";
 
 import {
+  getActiveTurnDetailsForAgent,
+  subscribeActiveAgentTurns,
   useActiveAgentTurns,
   type ActiveTurnSummary,
 } from "@/features/agents/activeAgentTurnsStore";
@@ -60,6 +62,7 @@ import { shouldShowTranscriptRowTimestamp } from "./agentSessionTranscriptPresen
 import { formatTranscriptTimestampTitle } from "./agentSessionUtils";
 import { hasFileEditLineDiff } from "./FileEditDiffView";
 import { UserMessageBubble } from "./activityRenderClasses/UserMessageBubble";
+import { SessionDivider } from "./SessionDivider";
 
 const TRANSCRIPT_ACP_SOURCE_STORAGE_KEY = "buzz:show-transcript-acp-source";
 
@@ -123,6 +126,7 @@ export function AgentSessionTranscriptList({
   profiles,
   contentContainerClassName,
   scrollScopeKey,
+  turnId = null,
   variant = "default",
 }: AgentTranscriptIdentityProps & {
   autoTail?: boolean;
@@ -133,12 +137,25 @@ export function AgentSessionTranscriptList({
   profiles?: UserProfileLookup;
   contentContainerClassName?: string;
   scrollScopeKey?: string | null;
+  /** When set, liveness follows this one turn instead of the whole channel. */
+  turnId?: string | null;
   variant?: AgentSessionTranscriptVariant;
 }) {
   const activeTurns = useActiveAgentTurns(agentPubkey);
+  const getTurnDetails = React.useCallback(
+    () => getActiveTurnDetailsForAgent(agentPubkey),
+    [agentPubkey],
+  );
+  const turnDetails = React.useSyncExternalStore(
+    subscribeActiveAgentTurns,
+    getTurnDetails,
+  );
   const isTurnLive = React.useMemo(
-    () => isAgentTurnLive(activeTurns, channelId),
-    [activeTurns, channelId],
+    () =>
+      turnId
+        ? turnDetails.some((turn) => turn.turnId === turnId)
+        : isAgentTurnLive(activeTurns, channelId),
+    [activeTurns, channelId, turnDetails, turnId],
   );
 
   // Subscribe to the observer relay store so we read the latest-live-session-id
@@ -954,23 +971,19 @@ function SessionBoundaryDivider({
         : "Earlier observed session";
   const formattedDate = new Date(sessionStartTimestamp).toLocaleString();
   return (
-    <div
-      className="flex items-center gap-2 px-3 py-2"
-      data-testid="session-boundary-divider"
-    >
-      <div className="h-px flex-1 bg-border" />
-      <span className="flex items-center gap-1 text-xs text-muted-foreground">
-        {labelState === "current" ? (
+    <SessionDivider
+      icon={
+        labelState === "current" ? (
           <Radio aria-hidden="true" className="h-3 w-3" />
         ) : (
           <Clock aria-hidden="true" className="h-3 w-3" />
-        )}
-        {label}
-        {" · "}
-        {formattedDate}
-      </span>
-      <div className="h-px flex-1 bg-border" />
-    </div>
+        )
+      }
+    >
+      {label}
+      {" · "}
+      {formattedDate}
+    </SessionDivider>
   );
 }
 

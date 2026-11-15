@@ -5400,16 +5400,25 @@ fn dispatch_pending(
                     "busy-owner hold — thread session owner busy; awaiting its return"
                 );
                 if let Some(observer) = observer {
+                    let mut payload = serde_json::json!({
+                        "scope": scope.telemetry_label(),
+                        "ownerIndex": owner_index,
+                        "heldForSecs": held_for.as_secs_f64(),
+                        "timeoutSecs": pool::HOLD_BUSY_OWNER_TIMEOUT.as_secs_f64(),
+                        "triggeringEventIds": batch
+                            .events
+                            .iter()
+                            .map(|be| be.event.id.to_hex())
+                            .collect::<Vec<_>>(),
+                    });
+                    if let Some(root) = scope.root_event_id() {
+                        payload["threadRootEventId"] = serde_json::json!(root);
+                    }
                     observer.emit(
                         "busy_owner_hold",
                         None,
                         &observer::context_for(Some(channel_id), None, None),
-                        serde_json::json!({
-                            "scope": scope.telemetry_label(),
-                            "ownerIndex": owner_index,
-                            "heldForSecs": held_for.as_secs_f64(),
-                            "timeoutSecs": pool::HOLD_BUSY_OWNER_TIMEOUT.as_secs_f64(),
-                        }),
+                        payload,
                     );
                 }
                 held.push(batch);
@@ -5454,15 +5463,19 @@ fn dispatch_pending(
                 "busy-owner hold expired — forking fresh session on an idle worker"
             );
             if let Some(observer) = observer {
+                let mut payload = serde_json::json!({
+                    "scope": scope.telemetry_label(),
+                    "ownerIndex": owner_index,
+                    "heldForSecs": held_for.as_secs_f64(),
+                });
+                if let Some(root) = scope.root_event_id() {
+                    payload["threadRootEventId"] = serde_json::json!(root);
+                }
                 observer.emit(
                     "busy_owner_hold_forked",
                     None,
                     &observer::context_for(Some(channel_id), None, None),
-                    serde_json::json!({
-                        "scope": scope.telemetry_label(),
-                        "ownerIndex": owner_index,
-                        "heldForSecs": held_for.as_secs_f64(),
-                    }),
+                    payload,
                 );
             }
         }

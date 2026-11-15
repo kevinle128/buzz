@@ -26,6 +26,7 @@ import {
 import { buildVideoReviewPresentationByMessageId } from "@/features/messages/lib/videoReviewContext";
 import { useComposerHeightPadding } from "@/features/messages/ui/useComposerHeightPadding";
 import { UserProfilePanel } from "@/features/profile/ui/UserProfilePanel";
+import type { TimelineMessage } from "@/features/messages/types";
 import { AgentSessionThreadPanel } from "@/features/channels/ui/AgentSessionThreadPanel";
 import { ChannelManagementAuxiliaryPanel } from "@/features/channels/ui/ChannelManagementAuxiliaryPanel";
 import { IdleAuxiliaryPanel } from "@/features/channels/ui/IdleAuxiliaryPanel";
@@ -966,6 +967,10 @@ export const ChannelPane = React.memo(function ChannelPane({
                 profiles={profiles}
                 onBack={onBackFromAgentSession}
                 onClose={onCloseAgentSession}
+                // The thread opener only reads the message id.
+                onOpenThread={(threadRootEventId) =>
+                  onOpenThread({ id: threadRootEventId } as TimelineMessage)
+                }
                 widthPx={threadPanelWidthPx}
               />
             );

@@ -39,6 +39,7 @@ import {
   saveActiveAgentTurnsForCommunity,
   restoreActiveAgentTurnsForCommunity,
 } from "@/features/agents/activeAgentTurnsStore";
+import { resetAgentSessionAcknowledgements } from "@/features/agents/useAgentSessionRows";
 import { resetAgentWorkingSignal } from "@/features/agents/agentWorkingSignal";
 import { resetAgentObserverStore } from "@/features/agents/observerRelayStore";
 import { resetAvatarPresentations } from "@/features/profile/avatarPresentationStore";
@@ -73,6 +74,7 @@ async function resetCommunityState({
   clearAllDrafts();
   resetAgentObserverStore();
   resetActiveAgentTurnsStore();
+  resetAgentSessionAcknowledgements();
   resetAgentWorkingSignal();
   if (isTauri() && isMacPlatform()) {
     void clearTrayAgentActivity();

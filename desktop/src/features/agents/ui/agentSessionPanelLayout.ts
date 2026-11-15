@@ -13,6 +13,19 @@ export function scopeByChannel<T extends { channelId?: string | null }>(
 }
 
 /**
+ * Keep only the observer events of one turn. Frames outside a turn (session
+ * setup, harness startup) carry no `turnId` and are left out, so a single
+ * session's transcript never mixes with a concurrent session's tools.
+ */
+export function scopeByTurn(
+  events: readonly ObserverEvent[],
+  turnId: string | null | undefined,
+): ObserverEvent[] {
+  if (!turnId) return events as ObserverEvent[];
+  return events.filter((event) => event.turnId === turnId);
+}
+
+/**
  * Merge live and archived raw `ObserverEvent[]` arrays into a single
  * deduplicated, chronologically-sorted array.
  *
