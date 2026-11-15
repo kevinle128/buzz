@@ -9768,6 +9768,7 @@ mod observer_snapshot_race_tests {
 #[cfg(test)]
 mod observer_publish_queue_tests;
 
+#[cfg(test)]
 mod observer_publish_cadence_tests {
     use super::*;
     use nostr::Keys;
