@@ -211,17 +211,27 @@ export function LifecycleActivity(props: ActivityRenderClassItemProps) {
 
   if (isError) {
     return (
-      <div
-        className="rounded-md border border-destructive/20 bg-destructive/5 px-2 py-1.5 text-left text-xs text-destructive"
-        data-testid="transcript-lifecycle-item"
-        title={timestampTitle}
-      >
-        <AlertCircle className="mr-1.5 inline h-3.5 w-3.5 align-text-bottom" />
-        <span className="font-medium">{props.item.title}</span>
-        {props.item.text ? (
-          <span className="opacity-80"> · {props.item.text}</span>
+      <>
+        <div
+          className="rounded-md border border-destructive/20 bg-destructive/5 px-2 py-1.5 text-left text-xs text-destructive"
+          data-testid="transcript-lifecycle-item"
+          title={timestampTitle}
+        >
+          <AlertCircle className="mr-1.5 inline h-3.5 w-3.5 align-text-bottom" />
+          <span className="font-medium">{props.item.title}</span>
+          {props.item.text ? (
+            <span className="opacity-80"> · {props.item.text}</span>
+          ) : null}
+        </div>
+        {props.item.note ? (
+          <div
+            className="mt-1 px-2 text-left text-xs text-muted-foreground"
+            data-testid="transcript-lifecycle-note"
+          >
+            {props.item.note}
+          </div>
         ) : null}
-      </div>
+      </>
     );
   }
 

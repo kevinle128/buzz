@@ -11,6 +11,7 @@
 pub(crate) mod child_io;
 pub(crate) mod elicitation;
 mod launch;
+pub(crate) mod turn_abort;
 pub(crate) mod wake;
 
 use tokio::process::Child;
@@ -260,6 +261,12 @@ pub struct AcpClient {
     /// `buzz.wake` version 1. Set per turn; cleared when the turn returns its
     /// agent.
     turn_thread: Option<wake::WakeThread>,
+    /// The agent advertised `buzz.turnAbort` version 1 at `initialize`. Only
+    /// recorded and logged: the result key is read whether or not it is set.
+    turn_abort_supported: bool,
+    /// The abort read from the last `session/prompt` result. The pool takes
+    /// it when the turn returns; a new prompt clears it.
+    last_turn_abort: Option<turn_abort::TurnAbort>,
     /// Ends the reader and writer tasks and retires the child on drop.
     _io_guard: child_io::ChildIoGuard,
     /// Monotonically increasing JSON-RPC request id counter.
@@ -791,6 +798,8 @@ impl AcpClient {
             reader: io.lines,
             wake: io.link,
             turn_thread: None,
+            turn_abort_supported: false,
+            last_turn_abort: None,
             _io_guard: io.guard,
             next_id: 0,
             pending_permission_id: None,
@@ -923,6 +932,12 @@ impl AcpClient {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         self.wake.set_supported(wake::advertised_v1(&result));
+        self.turn_abort_supported = turn_abort::advertised_v1(&result);
+        tracing::info!(
+            target: "acp::init",
+            turn_abort_supported = self.turn_abort_supported,
+            "agent capability buzz.turnAbort"
+        );
         tracing::debug!(target: "acp::init", "initialize response: {result}");
         Ok(result)
     }
@@ -1106,6 +1121,7 @@ impl AcpClient {
         // cancel path still gets its `cancel` before the next turn starts.
         self.drain_elicitation(elicitation::CloseReason::Ended)
             .await;
+        self.last_turn_abort = None;
         let mut params = build_prompt_params(session_id, prompt_blocks);
         if let Some(thread) = self.thread_meta() {
             params["_meta"][wake::THREAD_META] = thread;
@@ -1235,6 +1251,16 @@ impl AcpClient {
     /// Whether the agent advertised `buzz.wake` version 1 at `initialize`.
     pub(crate) fn wake_supported(&self) -> bool {
         self.wake.supported()
+    }
+
+    /// Whether the agent advertised `buzz.turnAbort` version 1 at `initialize`.
+    pub(crate) fn turn_abort_supported(&self) -> bool {
+        self.turn_abort_supported
+    }
+
+    /// Take the abort that the last `session/prompt` result carried, if any.
+    pub(crate) fn take_turn_abort(&mut self) -> Option<turn_abort::TurnAbort> {
+        self.last_turn_abort.take()
     }
 
     /// Wake state of this child, shared with its reader task.
@@ -3135,6 +3161,7 @@ impl AcpClient {
         result: &serde_json::Value,
     ) -> Result<StopReason, AcpError> {
         let stop_reason = self.parse_stop_reason(result)?;
+        self.last_turn_abort = turn_abort::parse(result);
         if let Some(adapter) = self.standard_adapter {
             match serde_json::from_value::<PromptResponseUsage>(result["usage"].clone()) {
                 Ok(usage) => self

@@ -421,6 +421,56 @@ lines with an `id` are never dropped.
 The agent must stay alive between turns to send wakes: keep `--lazy-pool` off
 and `--idle-pool-sleep` and `--exit-after-inactivity` at 0.
 
+## Turns the Agent Ends on Purpose (`buzz.turnAbort`)
+
+An agent can end a turn on purpose, for example when its session no longer
+fits its context budget, and tell Buzz why. It puts `buzz.turnAbort` in the
+`_meta` of the `session/prompt` result:
+
+```json
+{"stopReason": "end_turn", "_meta": {"buzz.turnAbort": {
+  "reason": "context_over_budget",
+  "message": "This conversation is too long to continue. Start a new thread.",
+  "resetSession": true,
+  "usedTokens": 208000,
+  "budgetTokens": 152000
+}}}
+```
+
+| Field | Meaning |
+|---|---|
+| `reason` | Required, an open set of strings. Known values: `context_over_budget`, `output_truncated`. Other values are accepted. |
+| `message` | Optional text for the user. |
+| `resetSession` | Optional. Default `true` for `context_over_budget`, `false` for every other reason. |
+| `usedTokens`, `budgetTokens` | Optional numbers, for display only. |
+
+Buzz does the following:
+
+- It posts the trimmed `message`, capped at 500 characters, as one reply signed
+  by the agent key in the thread of the triggering message (the thread a reply
+  of the agent would go to). A wake turn posts in the wake's thread. A
+  heartbeat turn posts nothing. An empty or missing `message` posts nothing.
+- It emits the observer event `turn_error` with the existing fields plus
+  `outcome: "aborted"`, `abortReason`, `resetSession` (the effective value) and
+  `usedTokens` / `budgetTokens` when sent. `turn_completed` follows as usual.
+- When the effective `resetSession` is `true`, it drops the session for that
+  conversation or thread, so the next message opens a new session.
+- The abort is a clean end of the turn: the agent process stays in service,
+  and nothing is retried or counted as a failure.
+- The same rules apply when the abort comes back on the `initial_message`
+  setup prompt of a new session. When the abort resets the session, the turn
+  ends there: the triggering prompt is not sent and nothing is retried. When it
+  does not reset, the triggering prompt runs as usual.
+
+Unknown fields are ignored. A malformed value (not an object, or no `reason`)
+is logged at warn level and ignored, and the turn ends as a normal turn. A
+result without the key behaves as before.
+
+The agent advertises the extension with `"buzz.turnAbort": {"version": 1}` in
+`agentCapabilities._meta` of its `initialize` result, next to `buzz.wake`.
+Buzz records and logs it per agent process. Reading the result key does not
+depend on it.
+
 ## How It Works
 
 1. **Startup** — Spawns N agent subprocesses (default 1), sends ACP `initialize` to each, connects to the relay with NIP-42 auth.

@@ -124,3 +124,46 @@ export function friendlyTurnErrorCopy(raw: string, code: unknown): string {
   const safe = Number.isFinite(numeric) ? (numeric as number) : null;
   return friendlyAgentLastError(raw, safe)?.copy ?? raw;
 }
+
+const ABORT_REASON_COPY: Record<string, string> = {
+  context_over_budget: "Stopped: conversation too long",
+  output_truncated: "Stopped: reply was cut off",
+};
+
+function formatTokenCount(value: number): string {
+  return value >= 1000 ? `${Math.round(value / 1000)}k` : String(value);
+}
+
+function tokenCount(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? value
+    : null;
+}
+
+/** A turn the agent stopped on purpose, read from a `turn_error` payload. */
+export type TurnAbort = {
+  /** "Stopped: conversation too long", with token numbers when both exist. */
+  label: string;
+  /** The bridge dropped the session, so the next message opens a new one. */
+  resetSession: boolean;
+};
+
+/**
+ * Read the abort fields of a `turn_error` payload. Returns null for any other
+ * error, including those from bridges that send no `abortReason`.
+ */
+export function parseTurnAbort(payload: unknown): TurnAbort | null {
+  if (typeof payload !== "object" || payload === null) return null;
+  const record = payload as Record<string, unknown>;
+  if (record.outcome !== "aborted") return null;
+  const reason =
+    typeof record.abortReason === "string" ? record.abortReason.trim() : "";
+  if (reason.length === 0) return null;
+  let label = ABORT_REASON_COPY[reason] ?? `Stopped: ${reason}`;
+  const used = tokenCount(record.usedTokens);
+  const budget = tokenCount(record.budgetTokens);
+  if (used !== null && budget !== null) {
+    label += ` · ${formatTokenCount(used)} / ${formatTokenCount(budget)} tokens`;
+  }
+  return { label, resetSession: record.resetSession === true };
+}
