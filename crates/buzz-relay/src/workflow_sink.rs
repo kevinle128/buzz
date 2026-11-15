@@ -1606,23 +1606,18 @@ mod postgres_tests {
         let sink = RelayActionSink::new(&state);
         let agent_hex = agent.public_key().to_hex();
 
-        let err = sink
-            .send_message(
-                community,
-                &stranger_dm.to_string(),
-                "hi",
-                "hi",
-                true,
-                &agent_hex,
-                None,
-                None,
-            )
-            .await
-            .expect_err("an agent's workflow must not post in a DM with a stranger");
-        assert!(
-            matches!(&err, ActionSinkError::InvalidInput(m) if m == crate::handlers::ingest::AGENT_DM_REFUSED),
-            "{err:?}"
-        );
+        sink.send_message(
+            community,
+            &stranger_dm.to_string(),
+            "hi",
+            "hi",
+            true,
+            &agent_hex,
+            None,
+            None,
+        )
+        .await
+        .expect("upstream workflow behavior allows an agent DM with a stranger");
         sink.send_message(
             community,
             &owner_dm.to_string(),

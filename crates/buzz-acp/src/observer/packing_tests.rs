@@ -20,6 +20,7 @@ fn publish_queue_drain_probe() {
             session_id: Some("session".into()),
             turn_id: Some("turn".into()),
             started_at: None,
+            authorization: None,
             payload: json!({"text": "hello 🐝\n\"world\"", "seq": seq}),
         });
     }

@@ -230,6 +230,7 @@ fn publication_metadata_growth_keeps_live_events_bounded() {
         session_id: None,
         turn_id: None,
         started_at: None,
+        authorization: None,
         payload: json!({"body":""}),
     };
     template.payload = json!({"body":"x".repeat(OBSERVER_MAX_PLAINTEXT_LEN - bytes(&template))});
