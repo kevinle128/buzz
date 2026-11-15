@@ -3041,13 +3041,48 @@ async fn run_turn(
                         target: "pool::session",
                         "initial_message complete for channel {cid}: {stop_reason:?}"
                     );
-                    // The legacy agent has its standing context now; the turn
-                    // prompt below must not repeat it. Every other arm returns.
-                    standing_context_sent = true;
-                    if !agent.has_system_prompt_support() {
-                        agent
-                            .state
-                            .mark_scope_delivery_success(scope.clone(), true, [], []);
+                    // The setup prompt is not a reply, so it has no thread of
+                    // its own. A notice goes where the agent's reply to the
+                    // triggering message (or the wake) would go. A heartbeat
+                    // never sends a setup prompt, so the "no thread" case
+                    // that `handle_turn_abort` also covers cannot arise here.
+                    // The turn's routing is not complete yet: the main loop's
+                    // steer guard reads `prompt_routing` once the prompt is
+                    // formatted, so a local copy carries only the DM fact and
+                    // the notice replies to the thread root.
+                    let abort = agent.acp.take_turn_abort();
+                    // An abort that resets the session leaves nothing to send
+                    // the triggering prompt to: the turn ends here, like an
+                    // aborted turn, and nothing is retried.
+                    let ends_turn = abort
+                        .as_ref()
+                        .is_some_and(|abort| abort.effective_reset_session());
+                    if let Some(abort) = &abort {
+                        let notice_routing = crate::queue::PromptRouting::default();
+                        notice_routing.record_dm(prompt_is_dm);
+                        handle_turn_abort(
+                            &mut agent,
+                            &ctx,
+                            &source,
+                            &session_id,
+                            abort,
+                            abort_notice_thread(
+                                wake.as_ref().map(|(_, pending)| &pending.request.thread),
+                                batch.as_ref(),
+                                &notice_routing,
+                            ),
+                        )
+                        .await;
+                    }
+                    if !ends_turn {
+                        // The legacy agent has its standing context now; the
+                        // turn prompt below must not repeat it.
+                        standing_context_sent = true;
+                        if !agent.has_system_prompt_support() {
+                            agent
+                                .state
+                                .mark_scope_delivery_success(scope.clone(), true, [], []);
+                        }
                     }
                     let usage = agent.acp.take_turn_usage();
                     publish_agent_turn_metric(
@@ -3059,6 +3094,17 @@ async fn run_turn(
                         Some(acp_stop_to_core(&stop_reason)),
                     )
                     .await;
+                    if ends_turn {
+                        send_prompt_result(
+                            &result_tx,
+                            &turn_id,
+                            agent,
+                            source,
+                            PromptOutcome::Ok(stop_reason),
+                            None,
+                        );
+                        return;
+                    }
                 }
                 Err(AcpError::AgentExited) => {
                     agent.state.invalidate_all();
@@ -7782,46 +7828,21 @@ done"#
 
     // ── buzz.turnAbort ──────────────────────────────────────────────────────
 
-    /// What one turn against a stub agent that answers with `result_json`
-    /// left behind.
-    struct AbortTurn {
-        outcome_is_clean_end: bool,
-        session_kept: bool,
-        posted: Vec<nostr::Event>,
-        turn_errors: Vec<serde_json::Value>,
-        root_id: String,
-        agent_pubkey: nostr::PublicKey,
-        channel_id: Uuid,
-    }
-
-    /// Run one real channel (or heartbeat) turn through `run_prompt_task`. The
-    /// stub agent answers the prompt with `result_json`; the relay is a local
-    /// server that records every `POST /events` body.
-    async fn run_abort_turn(result_json: &str, heartbeat: bool) -> AbortTurn {
+    /// A relay stub that records the body of every `POST /events` and answers
+    /// every other request with an empty list. Returns its base URL, the
+    /// recorded bodies and the server task.
+    pub(crate) async fn recording_relay() -> (
+        String,
+        mpsc::UnboundedReceiver<String>,
+        tokio::task::JoinHandle<()>,
+    ) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let channel_id = Uuid::new_v4();
-        let agent_keys = Keys::generate();
-        let human_keys = Keys::generate();
-        let h_tag = Tag::parse(["h", channel_id.to_string().as_str()]).unwrap();
-        let root = EventBuilder::new(Kind::Custom(9), "original question")
-            .tags([h_tag.clone()])
-            .sign_with_keys(&human_keys)
-            .unwrap();
-        let root_id = root.id.to_hex();
-        let trigger = EventBuilder::new(Kind::Custom(9), "follow-up mention")
-            .tags([
-                h_tag,
-                Tag::parse(["e", root_id.as_str(), "", "reply"]).unwrap(),
-            ])
-            .sign_with_keys(&human_keys)
-            .unwrap();
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind relay stub");
         let base_url = format!("http://{}", listener.local_addr().unwrap());
-        let (body_tx, mut body_rx) = mpsc::unbounded_channel::<String>();
+        let (body_tx, body_rx) = mpsc::unbounded_channel::<String>();
         let server = tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
                 let mut request = Vec::new();
@@ -7852,13 +7873,55 @@ done"#
                     }
                     request.extend_from_slice(&chunk[..read]);
                 }
-                if head.starts_with("post /events") {
+                let is_post = head.starts_with("post /events");
+                if is_post {
                     let _ = body_tx.send(String::from_utf8_lossy(&request[body_start..]).into());
                 }
-                let reply = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+                let body = if is_post { "{}" } else { "[]" };
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
                 let _ = socket.write_all(reply.as_bytes()).await;
             }
         });
+        (base_url, body_rx, server)
+    }
+
+    /// What one turn against a stub agent that answers with `result_json`
+    /// left behind.
+    struct AbortTurn {
+        outcome_is_clean_end: bool,
+        session_kept: bool,
+        posted: Vec<nostr::Event>,
+        turn_errors: Vec<serde_json::Value>,
+        root_id: String,
+        agent_pubkey: nostr::PublicKey,
+        channel_id: Uuid,
+    }
+
+    /// Run one real channel (or heartbeat) turn through `run_prompt_task`. The
+    /// stub agent answers the prompt with `result_json`; the relay is a local
+    /// server that records every `POST /events` body.
+    async fn run_abort_turn(result_json: &str, heartbeat: bool) -> AbortTurn {
+        let channel_id = Uuid::new_v4();
+        let agent_keys = Keys::generate();
+        let human_keys = Keys::generate();
+        let h_tag = Tag::parse(["h", channel_id.to_string().as_str()]).unwrap();
+        let root = EventBuilder::new(Kind::Custom(9), "original question")
+            .tags([h_tag.clone()])
+            .sign_with_keys(&human_keys)
+            .unwrap();
+        let root_id = root.id.to_hex();
+        let trigger = EventBuilder::new(Kind::Custom(9), "follow-up mention")
+            .tags([
+                h_tag,
+                Tag::parse(["e", root_id.as_str(), "", "reply"]).unwrap(),
+            ])
+            .sign_with_keys(&human_keys)
+            .unwrap();
+
+        let (base_url, mut body_rx, server) = recording_relay().await;
 
         let result_file =
             std::env::temp_dir().join(format!("buzz-acp-abort-result-{}.json", Uuid::new_v4()));
@@ -8083,6 +8146,280 @@ done"#
         );
         assert_eq!(turn.turn_errors.len(), 1);
         assert!(!turn.session_kept);
+    }
+
+    /// What one turn with an `initial_message` setup prompt left behind.
+    struct SetupAbortTurn {
+        /// `session/prompt` requests the stub agent received.
+        prompts_sent: usize,
+        outcome_is_clean_end: bool,
+        session_kept: bool,
+        posted: Vec<nostr::Event>,
+        turn_errors: Vec<serde_json::Value>,
+        root_id: String,
+        channel_id: Uuid,
+    }
+
+    /// Run one real channel turn on a fresh session, so the `initial_message`
+    /// setup prompt runs first. The stub agent answers the setup prompt with
+    /// `setup_result_json` and every later prompt with a plain `end_turn`.
+    /// `dm` makes the channel a DM and the trigger a top-level message.
+    async fn run_setup_abort_turn(setup_result_json: &str, dm: bool) -> SetupAbortTurn {
+        let channel_id = Uuid::new_v4();
+        let agent_keys = Keys::generate();
+        let human_keys = Keys::generate();
+        let h_tag = Tag::parse(["h", channel_id.to_string().as_str()]).unwrap();
+        let root = EventBuilder::new(Kind::Custom(9), "original question")
+            .tags([h_tag.clone()])
+            .sign_with_keys(&human_keys)
+            .unwrap();
+        let root_id = root.id.to_hex();
+        let (trigger, scope) = if dm {
+            (
+                EventBuilder::new(Kind::Custom(9), "top-level dm message")
+                    .tags([h_tag])
+                    .sign_with_keys(&human_keys)
+                    .unwrap(),
+                conv(channel_id),
+            )
+        } else {
+            (
+                EventBuilder::new(Kind::Custom(9), "follow-up mention")
+                    .tags([
+                        h_tag,
+                        Tag::parse(["e", root_id.as_str(), "", "reply"]).unwrap(),
+                    ])
+                    .sign_with_keys(&human_keys)
+                    .unwrap(),
+                SessionScope::Thread {
+                    channel_id,
+                    root_event_id: root_id.clone(),
+                },
+            )
+        };
+
+        let (base_url, mut body_rx, server) = recording_relay().await;
+
+        let result_file =
+            std::env::temp_dir().join(format!("buzz-acp-setup-abort-{}.json", Uuid::new_v4()));
+        let record_file =
+            std::env::temp_dir().join(format!("buzz-acp-setup-abort-{}.jsonl", Uuid::new_v4()));
+        std::fs::write(&result_file, setup_result_json).expect("write stub result");
+        let quote = |path: &std::path::Path| path.to_string_lossy().replace('\'', "'\\''");
+        let script = r#"prompts=0
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/^{[^{]*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"setup-session"}}\n' "$id" ;;
+    *'"method":"session/prompt"'*)
+      printf '%s\n' "$line" >> 'RECORD'
+      prompts=$((prompts + 1))
+      if [ "$prompts" -eq 1 ]; then
+        printf '{"jsonrpc":"2.0","id":%s,"result":' "$id"
+        cat 'RESULT'
+        printf '}\n'
+      else
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      fi ;;
+    *'"method":'*)
+      if [ -n "$id" ]; then printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"; fi ;;
+  esac
+done"#
+            .replace("RECORD", &quote(&record_file))
+            .replace("RESULT", &quote(&result_file));
+        let mut acp = AcpClient::spawn("bash", &["-c".into(), script], &[], false)
+            .await
+            .expect("spawn stub agent");
+        let observer = crate::observer::ObserverHandle::in_process();
+        acp.set_observer(Some(observer.clone()), 0);
+
+        let agent = OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_model_request_id: None,
+            desired_model_pending_ack: false,
+            startup_effort: None,
+            agent_name: "stub-agent".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        };
+
+        let mut ctx = make_prompt_context_impl(&agent_keys, None);
+        ctx.rest_client.base_url = base_url;
+        ctx.initial_message = Some("inspect this project before the triggering turn".into());
+        ctx.channel_info = ChannelInfoResolver::new(
+            HashMap::from([(
+                channel_id,
+                crate::relay::ChannelInfo {
+                    name: "setup-abort".into(),
+                    channel_type: if dm { "dm" } else { "stream" }.into(),
+                    description: None,
+                },
+            )]),
+            ctx.rest_client.clone(),
+        );
+        let batch = FlushBatch {
+            channel_id,
+            scope: scope.clone(),
+            events: vec![crate::queue::BatchEvent {
+                edit: None,
+                event: trigger,
+                prompt_tag: "@mention".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+        run_prompt_task(
+            agent,
+            Some(batch),
+            None,
+            Arc::new(ctx),
+            result_tx,
+            None,
+            "setup-abort-turn".into(),
+            Default::default(),
+        )
+        .await;
+        let mut result = result_rx.recv().await.expect("prompt result");
+        let session_kept = result.agent.state.sessions.contains_key(&scope);
+        let outcome_is_clean_end = matches!(result.outcome, PromptOutcome::Ok(StopReason::EndTurn))
+            && result.batch.is_none();
+        result.agent.acp.shutdown().await;
+        // Every post is awaited inside the turn, so the server has them all.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        server.abort();
+        let prompts_sent = std::fs::read_to_string(&record_file)
+            .unwrap_or_default()
+            .lines()
+            .count();
+        let _ = std::fs::remove_file(&result_file);
+        let _ = std::fs::remove_file(&record_file);
+
+        let mut posted = Vec::new();
+        while let Ok(body) = body_rx.try_recv() {
+            let event: nostr::Event = serde_json::from_str(&body).expect("posted event JSON");
+            // Turn metrics share the endpoint; only chat messages are notices.
+            if event.kind == Kind::Custom(9) {
+                posted.push(event);
+            }
+        }
+        let turn_errors = observer
+            .snapshot()
+            .into_iter()
+            .filter(|event| event.kind == "turn_error")
+            .map(|event| event.payload)
+            .collect();
+        SetupAbortTurn {
+            prompts_sent,
+            outcome_is_clean_end,
+            session_kept,
+            posted,
+            turn_errors,
+            root_id,
+            channel_id,
+        }
+    }
+
+    fn reply_target(notice: &nostr::Event) -> Option<String> {
+        notice.tags.iter().find_map(|tag| {
+            let tag = tag.clone().to_vec();
+            (tag.first().map(String::as_str) == Some("e"))
+                .then(|| tag.get(1).cloned())
+                .flatten()
+        })
+    }
+
+    #[tokio::test]
+    async fn setup_prompt_abort_with_reset_posts_one_notice_and_ends_the_turn() {
+        let turn = run_setup_abort_turn(
+            &abort_result(
+                r#"{"reason":"context_over_budget","message":"Too long to continue.","usedTokens":208000,"budgetTokens":152000}"#,
+            ),
+            false,
+        )
+        .await;
+        assert_eq!(
+            turn.prompts_sent, 1,
+            "the triggering prompt must not go to a reset session"
+        );
+        assert!(turn.outcome_is_clean_end, "an abort is a clean end");
+        assert!(!turn.session_kept, "context_over_budget resets the session");
+        assert_eq!(turn.posted.len(), 1, "exactly one notice");
+        assert_eq!(turn.posted[0].content, "Too long to continue.");
+        assert_eq!(
+            reply_target(&turn.posted[0]).as_deref(),
+            Some(turn.root_id.as_str()),
+            "the notice replies into the triggering thread"
+        );
+        assert_eq!(turn.turn_errors.len(), 1);
+        let payload = &turn.turn_errors[0];
+        assert_eq!(payload["outcome"], "aborted");
+        assert_eq!(payload["abortReason"], "context_over_budget");
+        assert_eq!(payload["resetSession"], true);
+        assert_eq!(payload["usedTokens"], 208000);
+        assert_eq!(payload["budgetTokens"], 152000);
+    }
+
+    #[tokio::test]
+    async fn setup_prompt_abort_without_reset_posts_and_still_runs_the_turn() {
+        let turn = run_setup_abort_turn(
+            &abort_result(r#"{"reason":"output_truncated","message":"Output was cut off."}"#),
+            false,
+        )
+        .await;
+        assert_eq!(turn.prompts_sent, 2, "the triggering prompt still runs");
+        assert!(turn.outcome_is_clean_end);
+        assert!(turn.session_kept, "output_truncated does not reset");
+        assert_eq!(turn.posted.len(), 1, "only the setup prompt aborted");
+        assert_eq!(turn.turn_errors.len(), 1);
+        assert_eq!(turn.turn_errors[0]["abortReason"], "output_truncated");
+        assert_eq!(turn.turn_errors[0]["resetSession"], false);
+    }
+
+    #[tokio::test]
+    async fn setup_prompt_abort_without_message_records_but_posts_nothing() {
+        let turn =
+            run_setup_abort_turn(&abort_result(r#"{"reason":"context_over_budget"}"#), false).await;
+        assert!(turn.posted.is_empty());
+        assert_eq!(turn.turn_errors.len(), 1);
+        assert!(!turn.session_kept);
+        assert_eq!(turn.prompts_sent, 1);
+    }
+
+    #[tokio::test]
+    async fn setup_prompt_abort_in_a_dm_replies_at_the_top_of_the_conversation() {
+        let turn = run_setup_abort_turn(
+            &abort_result(r#"{"reason":"context_over_budget","message":"Too long."}"#),
+            true,
+        )
+        .await;
+        assert_eq!(turn.posted.len(), 1);
+        assert_eq!(
+            reply_target(&turn.posted[0]),
+            None,
+            "a DM top-level message is answered without a thread"
+        );
+        assert!(turn.posted[0]
+            .tags
+            .iter()
+            .any(|tag| tag.clone().to_vec().get(1) == Some(&turn.channel_id.to_string())));
+    }
+
+    #[tokio::test]
+    async fn setup_prompt_without_an_abort_runs_the_triggering_turn_as_before() {
+        let turn = run_setup_abort_turn(r#"{"stopReason":"end_turn"}"#, false).await;
+        assert_eq!(turn.prompts_sent, 2);
+        assert!(turn.outcome_is_clean_end);
+        assert!(turn.session_kept);
+        assert!(turn.posted.is_empty());
+        assert!(turn.turn_errors.is_empty());
     }
 
     #[test]

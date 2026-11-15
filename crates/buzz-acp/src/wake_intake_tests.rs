@@ -568,34 +568,15 @@ async fn wake_from_old_child_generation_ignored() {
     let _ = std::fs::remove_file(new_record);
 }
 
-/// A relay fixture that answers every HTTP query with an empty list.
-async fn empty_relay() -> (String, tokio::task::JoinHandle<()>) {
-    let relay = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind relay fixture");
-    let base_url = format!("http://{}", relay.local_addr().expect("addr"));
-    let task = tokio::spawn(async move {
-        use tokio::io::AsyncReadExt;
-        loop {
-            let Ok((mut socket, _)) = relay.accept().await else {
-                return;
-            };
-            tokio::spawn(async move {
-                let mut request = [0; 16384];
-                let _ = socket.read(&mut request).await;
-                let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]";
-                let _ = socket.write_all(response.as_bytes()).await;
-            });
-        }
-    });
-    (base_url, task)
-}
-
 /// A stub child that answers `initialize` with the wake capability,
-/// `session/new` with `wake-session`, and `session/prompt` with `end_turn`
-/// after the shell code `on_prompt` ran. It records every stdin line in the
-/// file `$REC`.
-async fn responder_client(record: &std::path::Path, on_prompt: &str) -> AcpClient {
+/// `session/new` with `wake-session`, and `session/prompt` with
+/// `prompt_result` (a JSON object) after the shell code `on_prompt` ran. It
+/// records every stdin line in the file `$REC`.
+async fn responder_client(
+    record: &std::path::Path,
+    on_prompt: &str,
+    prompt_result: &str,
+) -> AcpClient {
     let script = format!(
         r#"REC='{record}'
 while IFS= read -r line; do
@@ -605,11 +586,11 @@ while IFS= read -r line; do
     *'"method":"initialize"'*) printf '{{"jsonrpc":"2.0","id":%s,"result":{{"protocolVersion":2,"agentCapabilities":{{"_meta":{{"buzz.wake":{{"version":1}}}}}}}}}}\n' "$id" ;;
     *'"method":"session/new"'*) printf '{{"jsonrpc":"2.0","id":%s,"result":{{"sessionId":"wake-session"}}}}\n' "$id" ;;
     *'"method":"session/prompt"'*) {on_prompt}
-      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"stopReason":"end_turn"}}}}\n' "$id" ;;
+      printf '{{"jsonrpc":"2.0","id":%s,"result":%s}}\n' "$id" '{prompt_result}' ;;
     *'"method":'*) if [ -n "$id" ]; then printf '{{"jsonrpc":"2.0","id":%s,"result":{{}}}}\n' "$id"; fi ;;
   esac
 done"#,
-        record = record.display()
+        record = record.display(),
     );
     let mut client = AcpClient::spawn("bash", &["-c".into(), script], &[], false)
         .await
@@ -628,16 +609,26 @@ struct WakeTurnFixture {
     channel_id: Uuid,
     root: String,
     record: std::path::PathBuf,
+    /// Bodies of the events the turn posted to the relay.
+    posts: mpsc::UnboundedReceiver<String>,
+    observer: observer::ObserverHandle,
     _relay: tokio::task::JoinHandle<()>,
 }
 
 impl WakeTurnFixture {
     async fn new(on_prompt: &str) -> Self {
+        Self::with_prompt_result(on_prompt, r#"{"stopReason":"end_turn"}"#).await
+    }
+
+    /// A wake turn whose `session/prompt` result is `prompt_result`.
+    async fn with_prompt_result(on_prompt: &str, prompt_result: &str) -> Self {
         let channel_id = Uuid::new_v4();
         let root = "ab".repeat(32);
         let record = record_path();
-        let client = responder_client(&record, on_prompt).await;
-        let (base_url, relay) = empty_relay().await;
+        let mut client = responder_client(&record, on_prompt, prompt_result).await;
+        let observer = observer::ObserverHandle::in_process();
+        client.set_observer(Some(observer.clone()), 0);
+        let (base_url, posts, relay) = pool::tests::recording_relay().await;
         let mut ctx = pool::tests::make_prompt_context_no_owner();
         ctx.rest_client.base_url = base_url;
         ctx.channel_info = pool::ChannelInfoResolver::new(
@@ -668,8 +659,33 @@ impl WakeTurnFixture {
             channel_id,
             root,
             record,
+            posts,
+            observer,
             _relay: relay,
         }
+    }
+
+    /// The chat messages (kind 9) that the turn posted. Turn metrics share
+    /// the endpoint and are left out.
+    fn notices(&mut self) -> Vec<nostr::Event> {
+        let mut notices = Vec::new();
+        while let Ok(body) = self.posts.try_recv() {
+            let event: nostr::Event = serde_json::from_str(&body).expect("posted event JSON");
+            if event.kind == nostr::Kind::Custom(9) {
+                notices.push(event);
+            }
+        }
+        notices
+    }
+
+    /// Payloads of the `turn_error` events the turn emitted.
+    fn turn_errors(&self) -> Vec<serde_json::Value> {
+        self.observer
+            .snapshot()
+            .into_iter()
+            .filter(|event| event.kind == "turn_error")
+            .map(|event| event.payload)
+            .collect()
     }
 
     fn dispatch(&mut self) -> Vec<(scope::SessionScope, ThreadTags)> {
@@ -782,6 +798,92 @@ async fn wake_opens_turn_in_thread() {
     );
     shutdown_agent_pool(&mut fx.pool).await;
     let _ = std::fs::remove_file(&fx.record);
+}
+
+fn abort_prompt_result(abort: &str) -> String {
+    format!(r#"{{"stopReason":"end_turn","_meta":{{"buzz.turnAbort":{abort}}}}}"#)
+}
+
+/// A wake turn whose result carries `buzz.turnAbort` runs through the
+/// production dispatch and result path. Returns whether the wake's session
+/// was kept, after the notice, `turn_error` and requeue checks that hold for
+/// every abort.
+async fn run_aborted_wake_turn(abort: &str, expected_reason: &str, expected_reset: bool) -> bool {
+    let mut fx = WakeTurnFixture::with_prompt_result(":", &abort_prompt_result(abort)).await;
+    assert_eq!(fx.dispatch().len(), 1, "one wake turn starts");
+    let result = fx.result().await;
+    assert!(matches!(&result.source, PromptSource::Wake(scope) if *scope == fx.scope));
+    assert!(
+        matches!(result.outcome, PromptOutcome::Ok(acp::StopReason::EndTurn))
+            && result.batch.is_none(),
+        "an abort is a clean end of the wake turn"
+    );
+    let session_kept = result.agent.state.sessions.contains_key(&fx.scope);
+    fx.handle(result);
+    assert!(!fx.queue.is_scope_in_flight(&fx.scope));
+    assert!(
+        fx.queue.ready_wake_scopes().is_empty(),
+        "an aborted wake turn is not queued again"
+    );
+    assert!(!fx.queue.is_wake_in_flight(&fx.scope));
+
+    let notices = fx.notices();
+    assert_eq!(notices.len(), 1, "exactly one notice");
+    assert_eq!(notices[0].content, "Stopped on purpose.");
+    let tags: Vec<Vec<String>> = notices[0]
+        .tags
+        .iter()
+        .map(|tag| tag.clone().to_vec())
+        .collect();
+    assert!(
+        tags.iter()
+            .any(|tag| tag.first().map(String::as_str) == Some("e")
+                && tag.get(1) == Some(&fx.root)),
+        "the notice replies into the wake's thread: {tags:?}"
+    );
+    assert!(tags
+        .iter()
+        .any(|tag| tag.get(1) == Some(&fx.channel_id.to_string())));
+    let turn_errors = fx.turn_errors();
+    assert_eq!(turn_errors.len(), 1);
+    assert_eq!(turn_errors[0]["outcome"], "aborted");
+    assert_eq!(turn_errors[0]["abortReason"], expected_reason);
+    assert_eq!(turn_errors[0]["resetSession"], expected_reset);
+
+    let lines = recorded(&fx.record, 3).await;
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line["method"] == "session/prompt")
+            .count(),
+        1,
+        "the wake turn is not run again"
+    );
+    shutdown_agent_pool(&mut fx.pool).await;
+    let _ = std::fs::remove_file(&fx.record);
+    session_kept
+}
+
+#[tokio::test]
+async fn wake_turn_abort_over_budget_posts_in_the_thread_and_resets_the_session() {
+    let kept = run_aborted_wake_turn(
+        r#"{"reason":"context_over_budget","message":"Stopped on purpose."}"#,
+        "context_over_budget",
+        true,
+    )
+    .await;
+    assert!(!kept, "context_over_budget resets the wake's session");
+}
+
+#[tokio::test]
+async fn wake_turn_abort_output_truncated_keeps_the_session() {
+    let kept = run_aborted_wake_turn(
+        r#"{"reason":"output_truncated","message":"Stopped on purpose."}"#,
+        "output_truncated",
+        false,
+    )
+    .await;
+    assert!(kept, "output_truncated does not reset");
 }
 
 #[tokio::test]

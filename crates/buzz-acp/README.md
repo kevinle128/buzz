@@ -457,6 +457,10 @@ Buzz does the following:
   conversation or thread, so the next message opens a new session.
 - The abort is a clean end of the turn: the agent process stays in service,
   and nothing is retried or counted as a failure.
+- The same rules apply when the abort comes back on the `initial_message`
+  setup prompt of a new session. When the abort resets the session, the turn
+  ends there: the triggering prompt is not sent and nothing is retried. When it
+  does not reset, the triggering prompt runs as usual.
 
 Unknown fields are ignored. A malformed value (not an object, or no `reason`)
 is logged at warn level and ignored, and the turn ends as a normal turn. A
