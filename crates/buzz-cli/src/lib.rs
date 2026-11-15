@@ -144,7 +144,7 @@ Configuration (flags override env vars):
     an assertion, the adapter mints it, and the CLI sends it on every request.
   BUZZ_OUTPUT_FORMAT Default --format; unknown values fall back to json  [optional]
 
-The 'pack' subcommand runs locally and does not require a relay connection.
+The 'pack' and 'guide' subcommands run locally and do not require a relay connection.
 
 Exit codes: 0=ok  1=bad input  2=relay/network error  3=auth error  4=other  5=write conflict
 Errors are JSON on stderr: {\"error\": \"<category>\", \"message\": \"<detail>\"}"
@@ -355,6 +355,11 @@ enum Cmd {
     /// Persona pack operations (local, no relay connection needed)
     #[command(subcommand)]
     Pack(PackCmd),
+    /// Print on-demand guidance for a kind of work (local, no relay connection needed)
+    Guide {
+        /// Topic to print; omit to list the topics and when to open each
+        topic: Option<String>,
+    },
     /// Credentials: pair this CLI with the running Buzz desktop
     #[command(subcommand)]
     Auth(AuthCmd),
@@ -2735,6 +2740,11 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         };
     }
 
+    // Guides are compiled in — no relay connection or credentials needed.
+    if let Cmd::Guide { ref topic } = cli.command {
+        return commands::guide::cmd_guide(topic.as_deref());
+    }
+
     // Credential chain: the first link that applies to this relay is the
     // identity (see `credentials`).
     let settings = credentials::Settings {
@@ -2786,7 +2796,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Cmd::Upload(sub) => commands::upload::dispatch(sub, &client).await,
         Cmd::Mem(sub) => commands::mem::dispatch(sub, &client).await,
         Cmd::Moderation(sub) => commands::moderation::dispatch(sub, &client, &cli.format).await,
-        Cmd::Pack(_) | Cmd::Auth(_) => unreachable!("handled above"),
+        Cmd::Pack(_) | Cmd::Guide { .. } | Cmd::Auth(_) => unreachable!("handled above"),
     }
 }
 
@@ -3063,6 +3073,7 @@ mod tests {
             "emoji",
             "feed",
             "gifs",
+            "guide",
             "huddles",
             "issues",
             "media",
@@ -3366,6 +3377,32 @@ mod tests {
         let cli = Cli::try_parse_from(["buzz", "--format", "compact", "apps", "list"])
             .expect("global --format compact apps list");
         assert!(matches!(cli.format, OutputFormat::Compact));
+    }
+
+    #[test]
+    fn guide_cli_parses_with_and_without_a_topic() {
+        use clap::Parser;
+        let list = Cli::try_parse_from(["buzz", "guide"]).expect("guide without topic");
+        assert!(matches!(list.command, Cmd::Guide { topic: None }));
+        let one = Cli::try_parse_from(["buzz", "guide", "memory"]).expect("guide with topic");
+        assert!(matches!(one.command, Cmd::Guide { topic: Some(ref t) } if t == "memory"));
+        assert!(Cli::try_parse_from(["buzz", "guide", "a", "b"]).is_err());
+    }
+
+    /// `buzz guide` runs without a relay or credentials: the full entry point
+    /// exits 0 for the list and every topic, and 1 for an unknown topic.
+    #[tokio::test]
+    async fn guide_exit_codes_through_the_real_entry_point() {
+        assert_eq!(run_from_args(["buzz", "guide"]).await, 0);
+        for guide in buzz_sdk::guides::GUIDES {
+            assert_eq!(
+                run_from_args(["buzz", "guide", guide.name]).await,
+                0,
+                "topic {}",
+                guide.name
+            );
+        }
+        assert_eq!(run_from_args(["buzz", "guide", "nope"]).await, 1);
     }
 
     #[test]

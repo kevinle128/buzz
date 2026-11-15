@@ -259,7 +259,7 @@ pub async fn cmd_create_issue(
     let event_id = event.id.to_hex();
     let resp = client.submit_event(event).await?;
     // `link` renders as a rich preview card in Buzz Desktop when included in
-    // a chat message — agents announce issues with it (see base_prompt.md).
+    // a chat message — agents announce issues with it (see `buzz guide projects`).
     let link = crate::links::issue_link(&event_id, repo_owner, repo_id);
     crate::client::print_create_response(&resp, "link", &link);
     Ok(())
