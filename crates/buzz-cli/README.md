@@ -311,6 +311,7 @@ The table below mirrors that tree for readers who are not at a terminal.
 | `upload` | `file` | Upload a file to the Blossom store |
 | `pack` | `validate` | Validate a persona pack (local, no relay) |
 | | `inspect` | Inspect a persona pack (local, no relay) |
+| `guide` | `[topic]` | List guide topics, or print one (`projects`, `agent-creation`, `memory`, `workspace`, `repo-work`); local, no relay. Agents open a topic on demand instead of carrying it in the base prompt |
 | `mem` | `ls` | List non-tombstoned memories |
 | | `get` | Print memory value to stdout |
 | | `hash` | Print SHA-256 hex of memory value |

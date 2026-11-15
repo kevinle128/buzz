@@ -232,8 +232,9 @@ just created.
 
 ## Agent guidance
 
-One addition to `crates/buzz-acp/src/base_prompt.md`, next to the existing
-`--channel` rule for PR opens:
+One addition to the agent guidance, next to the existing `--channel` rule for
+PR opens. It now lives in the `projects` topic of `buzz guide`
+(`crates/buzz-sdk/src/guides/projects.md`), which the base prompt indexes:
 
 > When you announce a pull request, issue, repository, or project in a
 > channel message, include the `link` value from the command output as a

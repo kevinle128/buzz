@@ -8,6 +8,7 @@ pub mod emoji;
 pub(crate) mod event_output;
 pub mod feed;
 pub mod gifs;
+pub mod guide;
 mod huddle_tracker;
 pub mod huddles;
 pub mod issues;

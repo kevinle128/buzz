@@ -301,7 +301,7 @@ fn make_tag(parts: &[&str]) -> Result<Tag, CliError> {
 /// `link_slug` carries the project's d-tag on creates whose slug fits the
 /// `buzz://` link charset; the response then also carries a `link` field,
 /// which renders as a rich preview card in Buzz Desktop when included in a
-/// chat message — agents announce projects with it (see base_prompt.md).
+/// chat message — agents announce projects with it (see `buzz guide projects`).
 async fn submit_project(
     client: &BuzzClient,
     builder: EventBuilder,
