@@ -13,7 +13,32 @@ import {
   mergeObserverEventWindows,
   observerEventScrollId,
   scopeByChannel,
+  scopeByTurn,
 } from "@/features/agents/ui/agentSessionPanelLayout";
+import type { AgentSessionRow } from "@/features/agents/agentSessionRows";
+import {
+  acknowledgeFailedSession,
+  useAgentSessionRows,
+} from "@/features/agents/useAgentSessionRows";
+import { AgentSessionList } from "@/features/agents/ui/AgentSessionList";
+import { AgentSessionContextStrip } from "@/features/agents/ui/AgentSessionContextStrip";
+import {
+  formatClockTime,
+  sessionOriginLabel,
+  sessionRowTitle,
+  sessionShortId,
+} from "@/features/agents/ui/agentSessionRowPresentation";
+import { formatElapsed } from "@/features/agents/ui/agentSessionUtils";
+import {
+  useSessionEventLookup,
+  type SessionEventLookup,
+} from "@/features/agents/ui/useSessionEventText";
+import { SessionDivider } from "@/features/agents/ui/SessionDivider";
+import {
+  describeWaitReason,
+  WaitingForSlotCard,
+} from "@/features/agents/ui/WaitingForSlotCard";
+import { useChannelReferences } from "@/features/channels/openChannelDirectory";
 import { deriveTranscriptBlockIds } from "@/features/agents/ui/agentSessionTranscriptGrouping";
 import type { ObserverEvent } from "@/features/agents/ui/agentSessionTypes";
 import { ManagedAgentSessionPanel } from "@/features/agents/ui/ManagedAgentSessionPanel";
@@ -83,9 +108,34 @@ type AgentSessionThreadPanelProps = {
    */
   onBack?: () => void;
   onClose: () => void;
+  /**
+   * Opens the Thread panel for a thread root in this panel's channel. Omit
+   * when the thread cannot be shown next to this panel.
+   */
+  onOpenThread?: (threadRootEventId: string) => void;
   widthPx: number;
   transparentChrome?: boolean;
 };
+
+type PanelView =
+  | { kind: "default" }
+  | { kind: "list" }
+  | { kind: "turn"; turnId: string }
+  | {
+      kind: "waiting";
+      key: string;
+      channelId: string;
+      threadRootEventId: string | null;
+    };
+type PanelViewState = { scopeKey: string; view: PanelView };
+
+const DEFAULT_PANEL_VIEW: PanelView = { kind: "default" };
+const LIST_VIEW: PanelView = { kind: "list" };
+
+/** Open on the session list when the agent runs several sessions at once. */
+function initialPanelView(openCount: number): PanelView {
+  return openCount >= 2 ? LIST_VIEW : DEFAULT_PANEL_VIEW;
+}
 
 export function AgentSessionThreadPanel({
   agent,
@@ -97,6 +147,7 @@ export function AgentSessionThreadPanel({
   profiles,
   onBack,
   onClose,
+  onOpenThread,
   widthPx,
   transparentChrome = false,
 }: AgentSessionThreadPanelProps) {
@@ -118,9 +169,76 @@ export function AgentSessionThreadPanel({
   const topSentinelRef = React.useRef<HTMLDivElement>(null);
   const now = useNow(1000);
   const { connectionState, events } = useObserverEvents(isLive, agent.pubkey);
+  const sessionView = useAgentSessionRows(
+    agent.pubkey,
+    sessionChannelId,
+    isLive,
+  );
+  const lookupEvent = useSessionEventLookup();
+  const [viewState, setViewState] = React.useState<PanelViewState>(() => ({
+    scopeKey: `${agent.pubkey}:${sessionChannelId ?? "all"}`,
+    view: initialPanelView(sessionView.openCount),
+  }));
+  const viewScopeKey = `${agent.pubkey}:${sessionChannelId ?? "all"}`;
+  if (viewState.scopeKey !== viewScopeKey) {
+    setViewState({
+      scopeKey: viewScopeKey,
+      view: initialPanelView(sessionView.openCount),
+    });
+  }
+  const view =
+    viewState.scopeKey === viewScopeKey ? viewState.view : DEFAULT_PANEL_VIEW;
+  const setView = React.useCallback(
+    (next: PanelView) => setViewState({ scopeKey: viewScopeKey, view: next }),
+    [viewScopeKey],
+  );
+  const allRows = React.useMemo(
+    () => [
+      ...sessionView.live,
+      ...sessionView.waiting,
+      ...sessionView.needsAttention,
+      ...sessionView.endedToday,
+    ],
+    [sessionView],
+  );
+  const selectedTurnRow =
+    view.kind === "turn"
+      ? (allRows.find((row) => row.turnId === view.turnId) ?? null)
+      : null;
+  const selectedWaitingRow =
+    view.kind === "waiting"
+      ? (sessionView.waiting.find((row) => row.key === view.key) ?? null)
+      : null;
+  // A held message becomes a turn: follow the thread into its new session.
+  React.useEffect(() => {
+    if (
+      view.kind !== "waiting" ||
+      selectedWaitingRow ||
+      !view.threadRootEventId
+    )
+      return;
+    const started = sessionView.live.find(
+      (row) =>
+        row.channelId === view.channelId &&
+        row.threadRootEventId === view.threadRootEventId,
+    );
+    setView(
+      started?.turnId ? { kind: "turn", turnId: started.turnId } : LIST_VIEW,
+    );
+  }, [selectedWaitingRow, sessionView.live, setView, view]);
+  const selectedTurnId = view.kind === "turn" ? view.turnId : null;
+  const rowChannelIds = React.useMemo(
+    () => allRows.map((row) => row.channelId),
+    [allRows],
+  );
+  const { channelsById: rowChannels } = useChannelReferences(rowChannelIds);
+  const channelNameOf = React.useCallback(
+    (id: string) => rowChannels.get(id)?.name ?? null,
+    [rowChannels],
+  );
   const scopedEvents = React.useMemo(
-    () => scopeByChannel(events, sessionChannelId),
-    [events, sessionChannelId],
+    () => scopeByTurn(scopeByChannel(events, sessionChannelId), selectedTurnId),
+    [events, selectedTurnId, sessionChannelId],
   );
   // Archived channel events merged with live scoped events so the header's
   // "Last updated" timestamp reflects the full loaded history, not just the
@@ -130,8 +248,12 @@ export function AgentSessionThreadPanel({
     sessionChannelId,
   );
   const combinedHeaderEvents = React.useMemo(
-    () => mergeObserverEventWindows(scopedEvents, archivedChannelEvents),
-    [scopedEvents, archivedChannelEvents],
+    () =>
+      scopeByTurn(
+        mergeObserverEventWindows(scopedEvents, archivedChannelEvents),
+        selectedTurnId,
+      ),
+    [scopedEvents, archivedChannelEvents, selectedTurnId],
   );
   const latestActivityAt = React.useMemo(
     () => getLatestActivityTimestamp(combinedHeaderEvents),
@@ -183,9 +305,14 @@ export function AgentSessionThreadPanel({
   // latestLiveSessionId is omitted: it only affects boundary `labelState`,
   // never keys (agentSessionTranscriptGrouping.ts:557-574), so we avoid
   // subscribing to the observer store from the outer panel.
+  const showList = view.kind === "list" && !showRawFeed;
+  const showWaiting = view.kind === "waiting" && !showRawFeed;
   const transcriptBlockIds = React.useMemo(
-    () => (showRawFeed ? [] : deriveTranscriptBlockIds(combinedHeaderEvents)),
-    [combinedHeaderEvents, showRawFeed],
+    () =>
+      showRawFeed || showList || showWaiting
+        ? []
+        : deriveTranscriptBlockIds(combinedHeaderEvents),
+    [combinedHeaderEvents, showList, showRawFeed, showWaiting],
   );
 
   // Stabilize the id array by VALUE so the hook's restoration effect (keyed on
@@ -215,7 +342,9 @@ export function AgentSessionThreadPanel({
     // Fold view mode into the reset key so toggling raw ↔ transcript
     // re-initializes the anchor (clean re-pin) instead of carrying an anchor
     // across disjoint id namespaces.
-    channelId: `${rawFeedScopeKey}:${showRawFeed ? "raw" : "transcript"}`,
+    channelId: `${rawFeedScopeKey}:${showRawFeed ? "raw" : "transcript"}:${
+      selectedTurnId ?? view.kind
+    }`,
     contentRef,
     isLoading: connectionState === "connecting",
     messages: showRawFeed ? rawScrollMessages : transcriptScrollMessages,
@@ -242,7 +371,49 @@ export function AgentSessionThreadPanel({
     preferResolvedSelfLabel: true,
   });
   const viewLabel = showRawFeed ? "Raw ACP activity" : "Activity";
-  const headerScopeLabel = `${viewLabel} · ${scopeLabel}`;
+  const sessionRow = selectedTurnRow ?? selectedWaitingRow;
+  const sessionScopeLabel = sessionRow
+    ? [
+        rowChannels.get(sessionRow.channelId)?.name
+          ? `#${rowChannels.get(sessionRow.channelId)?.name}`
+          : scopeLabel,
+        sessionShortId(sessionRow),
+      ].join(" · ")
+    : scopeLabel;
+  const headerScopeLabel = showList
+    ? `${viewLabel} · ${
+        sessionView.openCount === 0
+          ? "0 live"
+          : `${sessionView.openCount} sessions`
+      }`
+    : `${viewLabel} · ${view.kind === "turn" || view.kind === "waiting" ? sessionScopeLabel : scopeLabel}`;
+  // The list header is short so the "N sessions" scope label is not clipped.
+  const sessionRecencyLabel = sessionRow
+    ? describeSessionRecency(sessionRow, now)
+    : showList && latestActivityAt !== null
+      ? formatClockTime(latestActivityAt)
+      : null;
+  const onSelectSession = React.useCallback(
+    (row: AgentSessionRow) => {
+      if (row.kind === "waiting") {
+        setView({
+          kind: "waiting",
+          key: row.key,
+          channelId: row.channelId,
+          threadRootEventId: row.threadRootEventId,
+        });
+        return;
+      }
+      if (!row.turnId) return;
+      if (row.kind === "failed") acknowledgeFailedSession(row.turnId);
+      setView({ kind: "turn", turnId: row.turnId });
+    },
+    [setView],
+  );
+  const handleBack =
+    view.kind === "turn" || view.kind === "waiting"
+      ? () => setView(LIST_VIEW)
+      : onBack;
   const animateActivity = useTranscriptAnimationEnabled();
   const showTimestamps = useTranscriptTimestampsEnabled();
   async function handleInterruptTurn() {
@@ -457,7 +628,7 @@ export function AgentSessionThreadPanel({
         align="start"
         backButtonAriaLabel="Back from activity"
         backButtonTestId="agent-session-back"
-        onBack={onBack}
+        onBack={handleBack}
       >
         <ProfileAvatar
           avatarUrl={agentProfile?.avatarUrl ?? null}
@@ -489,7 +660,7 @@ export function AgentSessionThreadPanel({
               data-testid="agent-session-recency-label"
               title={lastUpdatedTitle}
             >
-              {lastUpdatedLabel}
+              {sessionRecencyLabel ?? lastUpdatedLabel}
             </span>
           </div>
         </div>
@@ -524,20 +695,61 @@ export function AgentSessionThreadPanel({
       >
         <div ref={topSentinelRef} aria-hidden className="h-px" />
         <div ref={contentRef}>
-          <ManagedAgentSessionPanel
-            agent={agent}
-            channelId={sessionChannelId}
-            className="border-0 bg-transparent px-0 py-2 shadow-none"
-            emptyDescription={
-              sessionChannelId
-                ? `Mention ${agent.name} in the channel to see its work here.`
-                : `Mention ${agent.name} in any channel to see its work here.`
-            }
-            profiles={profiles}
-            rawLayout="exclusive"
-            showHeader={false}
-            showRaw={showRawFeed}
-          />
+          {showList ? (
+            <AgentSessionList
+              agentAvatarUrl={agentProfile?.avatarUrl ?? null}
+              agentName={agent.name}
+              agentPubkey={agent.pubkey}
+              channelNames={channelNameOf}
+              lookup={lookupEvent}
+              now={now}
+              onSelect={onSelectSession}
+              view={sessionView}
+            />
+          ) : (
+            <>
+              {sessionRow && !showRawFeed ? (
+                <AgentSessionContextStrip
+                  meta={describeSessionMeta(sessionRow, channelNameOf)}
+                  onOpenThread={
+                    onOpenThread &&
+                    sessionRow.threadRootEventId &&
+                    channel?.id === sessionRow.channelId
+                      ? () => onOpenThread(sessionRow.threadRootEventId ?? "")
+                      : undefined
+                  }
+                  title={sessionRowTitle(sessionRow, lookupEvent)}
+                />
+              ) : null}
+              {showWaiting ? (
+                selectedWaitingRow ? (
+                  <AgentSessionWaitingView
+                    liveRows={sessionView.live}
+                    lookup={lookupEvent}
+                    now={now}
+                    profiles={profiles}
+                    row={selectedWaitingRow}
+                  />
+                ) : null
+              ) : (
+                <ManagedAgentSessionPanel
+                  agent={agent}
+                  channelId={sessionChannelId}
+                  className="border-0 bg-transparent px-0 py-2 shadow-none"
+                  emptyDescription={
+                    sessionChannelId
+                      ? `Mention ${agent.name} in the channel to see its work here.`
+                      : `Mention ${agent.name} in any channel to see its work here.`
+                  }
+                  profiles={profiles}
+                  rawLayout="exclusive"
+                  showHeader={false}
+                  showRaw={showRawFeed}
+                  turnId={selectedTurnId}
+                />
+              )}
+            </>
+          )}
         </div>
       </AuxiliaryPanelBody>
     </AuxiliaryPanel>
@@ -600,4 +812,93 @@ function formatRelativeActivityTime(timestamp: number, now: number): string {
 
   const totalWeeks = Math.floor(totalDays / 7);
   return `${totalWeeks}w ago`;
+}
+
+function describeSessionRecency(row: AgentSessionRow, now: number): string {
+  if (row.kind === "waiting") {
+    return `queued · ${formatElapsed(now - row.startedAt)}`;
+  }
+  if (row.kind === "running") {
+    const slot = row.agentIndex === null ? "" : `slot ${row.agentIndex} · `;
+    return `${slot}${formatElapsed(now - row.startedAt)}`;
+  }
+  const label = row.kind === "failed" ? "aborted" : "ended";
+  return `${label} · ${formatClockTime(row.endedAt ?? row.startedAt)}`;
+}
+
+function describeSessionMeta(
+  row: AgentSessionRow,
+  channelNameOf: (channelId: string) => string | null,
+): string[] {
+  const name = channelNameOf(row.channelId);
+  return [
+    name ? `#${name}` : "channel",
+    row.kind === "waiting"
+      ? "queued"
+      : row.agentIndex === null
+        ? null
+        : `slot ${row.agentIndex}`,
+    row.kind === "waiting" && row.ownerIndex !== null
+      ? `owner slot ${row.ownerIndex}`
+      : sessionOriginLabel(row),
+  ].filter((part): part is string => Boolean(part));
+}
+
+function AgentSessionWaitingView({
+  liveRows,
+  lookup,
+  now,
+  profiles,
+  row,
+}: {
+  liveRows: readonly AgentSessionRow[];
+  lookup: SessionEventLookup;
+  now: number;
+  profiles?: UserProfileLookup;
+  row: AgentSessionRow;
+}) {
+  return (
+    <div className="flex w-full flex-col gap-4" role="log">
+      <SessionDivider>
+        Message received · {formatClockTime(row.heldSince ?? row.startedAt)}
+      </SessionDivider>
+      {row.triggeringEventIds.length === 0 ? (
+        <p className="px-3 text-sm text-muted-foreground">
+          The held message is not available yet.
+        </p>
+      ) : (
+        row.triggeringEventIds.map((eventId) => {
+          const event = lookup(row.channelId, eventId);
+          return (
+            <div
+              className="rounded-lg border border-border/70 bg-background px-3 py-2 text-sm"
+              data-testid="agent-session-waiting-message"
+              key={eventId}
+            >
+              {event ? (
+                <>
+                  <span className="text-muted-foreground">
+                    {resolveUserLabel({ pubkey: event.pubkey, profiles })}:
+                  </span>{" "}
+                  {event.content}
+                </>
+              ) : (
+                <span className="text-muted-foreground">
+                  Message {eventId.slice(0, 8)} is not loaded yet.
+                </span>
+              )}
+            </div>
+          );
+        })
+      )}
+      <WaitingForSlotCard
+        detail={describeWaitReason(row, liveRows, now, true)}
+        title={
+          row.ownerIndex === null
+            ? "Waiting for a slot"
+            : `Waiting for slot ${row.ownerIndex}`
+        }
+      />
+    </div>
+  );
 }

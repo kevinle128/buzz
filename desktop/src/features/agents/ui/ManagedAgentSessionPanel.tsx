@@ -30,6 +30,7 @@ import {
   resolveDisplayEvents,
   resolveRawRailLayout,
   scopeByChannel,
+  scopeByTurn,
 } from "./agentSessionPanelLayout";
 import { shorten } from "./agentSessionUtils";
 import {
@@ -49,6 +50,8 @@ type ManagedAgentSessionPanelProps = {
   emptyDescription?: string;
   emptyState?: AgentSessionTranscriptEmptyState;
   panelPadding?: boolean;
+  /** Narrow the transcript to one turn (one agent session). */
+  turnId?: string | null;
   rawLayout?: "responsive" | "exclusive";
   showHeader?: boolean;
   showRaw?: boolean;
@@ -67,6 +70,7 @@ export function ManagedAgentSessionPanel({
   emptyDescription = "Mention this agent in a channel to watch the next turn.",
   emptyState = "idle",
   panelPadding = true,
+  turnId = null,
   rawLayout = "responsive",
   showHeader = true,
   showRaw = true,
@@ -105,8 +109,12 @@ export function ManagedAgentSessionPanel({
   // sorted ascending. Used as the single source for both the transcript and the
   // raw event rail / header count.
   const combinedEvents = React.useMemo(
-    () => mergeObserverEventWindows(scopedLiveEvents, archivedChannelEvents),
-    [scopedLiveEvents, archivedChannelEvents],
+    () =>
+      scopeByTurn(
+        mergeObserverEventWindows(scopedLiveEvents, archivedChannelEvents),
+        turnId,
+      ),
+    [scopedLiveEvents, archivedChannelEvents, turnId],
   );
 
   // Derive transcript once from the combined raw window. When transcriptOverride
@@ -165,6 +173,7 @@ export function ManagedAgentSessionPanel({
         transcript={displayTranscript}
         transcriptContentClassName={transcriptContentClassName}
         transcriptVariant={transcriptVariant}
+        turnId={turnId}
       />
     </section>
   );
@@ -224,6 +233,7 @@ function SessionBody({
   transcript,
   transcriptContentClassName,
   transcriptVariant,
+  turnId,
 }: {
   agentAvatarUrl: string | null;
   agentName: string;
@@ -243,6 +253,7 @@ function SessionBody({
   transcript: TranscriptItem[];
   transcriptContentClassName?: string;
   transcriptVariant: AgentSessionTranscriptVariant;
+  turnId: string | null;
 }) {
   const rawRail = resolveRawRailLayout(showRaw, rawLayout);
 
@@ -291,8 +302,9 @@ function SessionBody({
             items={transcript}
             profiles={profiles}
             contentContainerClassName={transcriptContentClassName}
-            scrollScopeKey={`${agentPubkey}:${channelId ?? "all"}`}
+            scrollScopeKey={`${agentPubkey}:${channelId ?? "all"}${turnId ? `:${turnId}` : ""}`}
             autoTail={autoTail}
+            turnId={turnId}
             variant={transcriptVariant}
           />
           {rawRail.mode === "side" ? <RawEventRail events={events} /> : null}

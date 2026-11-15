@@ -1,3 +1,4 @@
+import { useAgentSessionRows } from "@/features/agents/useAgentSessionRows";
 import * as React from "react";
 import type { LucideIcon } from "lucide-react";
 import {
@@ -422,6 +423,19 @@ function ProfileLiveActivityEmbed({
     null;
   const emptyState = feedScope.isLive ? "loading" : "idle";
   const emptyDescription = "Live activity will appear here.";
+  const sessionView = useAgentSessionRows(
+    activityAgent.pubkey,
+    activeChannelId,
+    feedScope.isLive,
+  );
+  const latestActivityLabel =
+    sessionView.openCount >= 2
+      ? `Latest Activity · ${sessionView.live.length} running${
+          sessionView.waiting.length > 0
+            ? ` · ${sessionView.waiting.length} waiting`
+            : ""
+        }`
+      : "Latest Activity";
   const openSelectedActivity = React.useCallback(() => {
     onOpenActivity(activeChannelId);
   }, [activeChannelId, onOpenActivity]);
@@ -473,7 +487,7 @@ function ProfileLiveActivityEmbed({
           <div className="absolute inset-x-0 bottom-0 flex flex-col items-start bg-linear-to-t from-background via-background/90 to-transparent px-3 pb-3 pt-24">
             <div className="min-w-0">
               <span className="block text-sm font-semibold text-muted-foreground">
-                Latest Activity
+                {latestActivityLabel}
               </span>
             </div>
           </div>
@@ -548,7 +562,7 @@ function ProfileLiveActivityEmbed({
           <div className="absolute inset-x-0 bottom-0 flex flex-col items-start bg-linear-to-t from-background via-background/80 to-transparent px-3 pb-3 pt-16">
             <div className="min-w-0">
               <span className="block text-xs font-semibold text-muted-foreground">
-                Latest Activity
+                {latestActivityLabel}
               </span>
               {activeChannelName ? (
                 <span

@@ -1,6 +1,10 @@
 import * as React from "react";
 import { Loader2 } from "lucide-react";
 
+import {
+  formatSessionCountLabel,
+  useAgentSessionRows,
+} from "@/features/agents/useAgentSessionRows";
 import { useAgentTranscript } from "@/features/agents/ui/useObserverEvents";
 import {
   getActivityHeadline,
@@ -61,6 +65,14 @@ export function BotActivityComposerAction({
     Boolean(singleWorkingAgent),
     singleWorkingAgent?.pubkey,
   );
+  const sessionView = useAgentSessionRows(
+    singleWorkingAgent?.pubkey,
+    channelId,
+    Boolean(singleWorkingAgent),
+  );
+  const sessionCountLabel = singleWorkingAgent
+    ? formatSessionCountLabel(sessionView)
+    : null;
   const activityHeadlines = React.useMemo(() => {
     if (!singleWorkingAgent) {
       return [];
@@ -155,6 +167,7 @@ export function BotActivityComposerAction({
   const visibleStatusLabel =
     workingAgents.length === 1
       ? `${workingAgents[0]?.name ?? "Agent"}: ${
+          sessionCountLabel ??
           activityHeadlines[headlineIndex % activityHeadlines.length] ??
           "Working"
         }`
@@ -175,6 +188,12 @@ export function BotActivityComposerAction({
           onBlur={closeWithDelay}
           onClick={() => {
             clearHoverTimer();
+            if (sessionCountLabel && singleWorkingAgent) {
+              // Several sessions: go straight to the session list.
+              setOpen(false);
+              onOpenAgentSession(singleWorkingAgent.pubkey, channelId);
+              return;
+            }
             setOpen((current) => !current);
           }}
           onFocus={() => setOpen(true)}
