@@ -231,3 +231,70 @@ test("classifyTool falls back once to a generic descriptor", () => {
   assert.equal(descriptor.preview, "notes.md");
   assert.equal(descriptor.source, "fallback");
 });
+
+const HEREDOC_BODY = "Use `code` and $HOME here\nsecond line";
+
+test("parseBuzzCliCommand reads content from a quoted heredoc piped into --content -", () => {
+  const descriptor = parseBuzzCliCommand(
+    `cat <<'EOF' | buzz messages send --channel c --reply-to e --content -\n${HEREDOC_BODY}\nEOF`,
+  );
+  assert.equal(descriptor?.label, "Send Message");
+  assert.equal(descriptor?.preview, HEREDOC_BODY);
+});
+
+test("parseBuzzCliCommand reads content from a heredoc redirected after the command", () => {
+  const descriptor = parseBuzzCliCommand(
+    `buzz messages send --channel c --content - <<'EOF'\n${HEREDOC_BODY}\nEOF\n`,
+  );
+  assert.equal(descriptor?.preview, HEREDOC_BODY);
+});
+
+test("parseBuzzCliCommand accepts double-quoted and custom heredoc delimiters", () => {
+  const descriptor = parseBuzzCliCommand(
+    'cat <<"MSG_END" | buzz messages send --channel c --content -\nhello\nMSG_END',
+  );
+  assert.equal(descriptor?.preview, "hello");
+});
+
+test("parseBuzzCliCommand strips leading tabs for <<- heredocs", () => {
+  const descriptor = parseBuzzCliCommand(
+    "cat <<-'EOF' | buzz messages send --channel c --content -\n\thello\n\tEOF",
+  );
+  assert.equal(descriptor?.preview, "hello");
+});
+
+test("parseBuzzCliCommand does not read flags from the heredoc body", () => {
+  const descriptor = parseBuzzCliCommand(
+    "cat <<'EOF' | buzz messages send --channel c --content -\nrun buzz --help | more\nEOF",
+  );
+  assert.equal(descriptor?.preview, "run buzz --help | more");
+});
+
+test("parseBuzzCliCommand returns null preview for unquoted heredocs", () => {
+  const descriptor = parseBuzzCliCommand(
+    "cat <<EOF | buzz messages send --channel c --content -\nhello $HOME\nEOF",
+  );
+  assert.equal(descriptor?.label, "Send Message");
+  assert.equal(descriptor?.preview, null);
+});
+
+test("parseBuzzCliCommand returns null preview for an unterminated heredoc", () => {
+  const descriptor = parseBuzzCliCommand(
+    "cat <<'EOF' | buzz messages send --channel c --content -\nhello",
+  );
+  assert.equal(descriptor?.preview, null);
+});
+
+test("parseBuzzCliCommand returns null preview for double-quoted content with backticks", () => {
+  const descriptor = parseBuzzCliCommand(
+    'buzz messages send --channel c --content "run `date` now"',
+  );
+  assert.equal(descriptor?.preview, null);
+});
+
+test("parseBuzzCliCommand keeps plain double-quoted content unchanged", () => {
+  const descriptor = parseBuzzCliCommand(
+    'buzz messages send --channel c --content "plain text"',
+  );
+  assert.equal(descriptor?.preview, "plain text");
+});
