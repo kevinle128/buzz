@@ -1,174 +1,194 @@
 /**
- * Tests for useAgentMetricArchiveSeed seeding logic.
+ * Tests for the agent-turn-metric archive seed.
  *
- * Archive defaults to enabled for all builds. The seed fires for any identity
- * without an explicit prior choice.
+ * Archive defaults to enabled for all builds. The seed fires once per identity
+ * per community relay, using the real preference read/write functions over a
+ * fake localStorage so a regression in the key scheme fails here.
  */
 
 import assert from "node:assert/strict";
 import test from "node:test";
 
-// ── Fake deps factory ────────────────────────────────────────────────────────
+import {
+  hasExplicitAgentMetricArchiveChoice,
+  setExplicitAgentMetricArchiveChoice,
+} from "./agentMetricArchivePreference.ts";
+import {
+  readExplicitObserverArchiveChoice,
+  setExplicitObserverArchiveChoice,
+} from "./observerArchivePreference.ts";
+import { seedAgentMetricArchive } from "./useAgentMetricArchiveSeed.ts";
+import { reconcileObserverArchive } from "./useObserverArchiveSeed.ts";
 
-function makeDeps({ hasExplicitChoice = false, mergeShouldFail = false } = {}) {
-  const calls = { mergeSaveSubscriptionKinds: [], setExplicitChoice: [] };
+const RELAY_A = "wss://relay-a.example";
+const RELAY_B = "wss://relay-b.example";
+const LEGACY_KEY = "buzz:agent-metric-archive-default-seeded:pk1";
+const scopedKey = (relayUrl) =>
+  `buzz:agent-metric-archive-default-seeded:${encodeURIComponent(relayUrl)}:pk1`;
 
-  return {
-    calls,
-    mergeSaveSubscriptionKinds: async (kind) => {
-      if (mergeShouldFail) throw new Error("merge failed");
-      calls.mergeSaveSubscriptionKinds.push({ kind });
+function installFakeStorage(initial = {}) {
+  const store = new Map(Object.entries(initial));
+  const hadWindow = "window" in globalThis;
+  const prevWindow = globalThis.window;
+  globalThis.window = {
+    localStorage: {
+      getItem: (k) => (store.has(k) ? store.get(k) : null),
+      setItem: (k, v) => void store.set(k, String(v)),
+      removeItem: (k) => void store.delete(k),
     },
-    hasExplicitChoice: (_pubkey) => hasExplicitChoice,
-    setExplicitChoice: (pubkey, enabled) => {
-      calls.setExplicitChoice.push({ pubkey, enabled });
+  };
+  return {
+    store,
+    restore() {
+      if (hadWindow) globalThis.window = prevWindow;
+      else delete globalThis.window;
     },
   };
 }
 
-// Minimal re-implementation of the seeding logic from useAgentMetricArchiveSeed.ts.
-// Kept in sync with the source by structural mirroring.
-const KIND_AGENT_TURN_METRIC = 44200;
-
-async function runSeed(pubkey, deps) {
-  if (!pubkey) return;
-  if (deps.hasExplicitChoice(pubkey)) return;
-
-  try {
-    await deps.mergeSaveSubscriptionKinds(KIND_AGENT_TURN_METRIC);
-  } catch {
-    return; // transient failure — do NOT set explicit choice
-  }
-
-  deps.setExplicitChoice(pubkey, true);
+function realDeps({ mergeShouldFail = false } = {}) {
+  const merges = [];
+  return {
+    merges,
+    deps: {
+      mergeSaveSubscriptionKinds: async (kind) => {
+        if (mergeShouldFail) throw new Error("merge failed");
+        merges.push(kind);
+      },
+      hasExplicitChoice: hasExplicitAgentMetricArchiveChoice,
+      setExplicitChoice: setExplicitAgentMetricArchiveChoice,
+    },
+  };
 }
 
-// ── Tests ────────────────────────────────────────────────────────────────────
-
-test("test_default_enabled_seeds_owner_p_subscription", async () => {
-  const deps = makeDeps({ hasExplicitChoice: false });
-  await runSeed("pubkey123", deps);
-
-  assert.equal(
-    deps.calls.mergeSaveSubscriptionKinds.length,
-    1,
-    "should call mergeSaveSubscriptionKinds once",
-  );
-  const call = deps.calls.mergeSaveSubscriptionKinds[0];
-  assert.equal(call.kind, 44200);
-});
-
-test("test_default_enabled_persists_explicit_choice_after_seed", async () => {
-  const deps = makeDeps({ hasExplicitChoice: false });
-  await runSeed("pubkey123", deps);
-
-  assert.equal(
-    deps.calls.setExplicitChoice.length,
-    1,
-    "should persist explicit choice after successful seed",
-  );
-  assert.equal(deps.calls.setExplicitChoice[0].pubkey, "pubkey123");
-  assert.equal(deps.calls.setExplicitChoice[0].enabled, true);
-});
-
-test("test_explicit_choice_set_does_not_reseed", async () => {
-  const deps = makeDeps({ hasExplicitChoice: true });
-  await runSeed("pubkey123", deps);
-
-  assert.equal(
-    deps.calls.mergeSaveSubscriptionKinds.length,
-    0,
-    "should not call mergeSaveSubscriptionKinds when explicit choice is already set",
-  );
-  assert.equal(
-    deps.calls.setExplicitChoice.length,
-    0,
-    "should not update explicit choice when already set",
-  );
-});
-
-test("test_merge_failure_does_not_persist_explicit_choice", async () => {
-  const deps = makeDeps({
-    hasExplicitChoice: false,
-    mergeShouldFail: true,
-  });
-  await runSeed("pubkey123", deps);
-
-  assert.equal(
-    deps.calls.setExplicitChoice.length,
-    0,
-    "should NOT persist explicit choice after a transient merge failure",
-  );
-});
-
-test("test_empty_pubkey_does_nothing", async () => {
-  const deps = makeDeps({ hasExplicitChoice: false });
-  await runSeed("", deps);
-
-  assert.equal(deps.calls.mergeSaveSubscriptionKinds.length, 0);
-  assert.equal(deps.calls.setExplicitChoice.length, 0);
-});
-
-test("test_undefined_pubkey_does_nothing", async () => {
-  const deps = makeDeps({ hasExplicitChoice: false });
-  await runSeed(undefined, deps);
-
-  assert.equal(deps.calls.mergeSaveSubscriptionKinds.length, 0);
-  assert.equal(deps.calls.setExplicitChoice.length, 0);
-});
-
-// ── Concurrent-interleave test ───────────────────────────────────────────────
-//
-// Verifies the scenario where both observer and metric seeds race on first
-// run. With the atomic merge, running both seeds concurrently leaves both
-// kinds present.
-
-test("test_concurrent_seeds_both_kinds_survive", async () => {
-  // Shared in-memory "db" — the atomic merge impl would serialize via SQLite
-  // write lock; here we simulate by letting calls accumulate and checking
-  // the final state.
-  const db = new Set(); // kinds present after all merges
-
-  function makeConcurrentDeps() {
-    return {
-      // Simulates the atomic merge: each call simply adds its kind to the set,
-      // regardless of what was there before (atomicity guarantee).
-      mergeSaveSubscriptionKinds: async (kind) => {
-        db.add(kind);
-      },
-      hasExplicitChoice: (_pubkey) => false,
-      setExplicitChoice: () => {},
-    };
+test("test_no_prior_choice_seeds_44200_and_records_relay_scoped_flag", async () => {
+  const fake = installFakeStorage();
+  try {
+    const { deps, merges } = realDeps();
+    await seedAgentMetricArchive("pk1", RELAY_A, deps);
+    assert.deepEqual(merges, [44200]);
+    assert.equal(fake.store.get(scopedKey(RELAY_A)), "1");
+    assert.equal(fake.store.has(LEGACY_KEY), false, "legacy key never written");
+  } finally {
+    fake.restore();
   }
+});
 
-  const observerDeps = makeConcurrentDeps();
-  const metricDeps = makeConcurrentDeps();
+test("test_legacy_seeded_flag_seeds_new_relay_once", async () => {
+  const fake = installFakeStorage({ [LEGACY_KEY]: "1" });
+  try {
+    const { deps, merges } = realDeps();
+    await seedAgentMetricArchive("pk1", RELAY_B, deps);
+    assert.deepEqual(merges, [44200]);
+    assert.equal(fake.store.get(scopedKey(RELAY_B)), "1");
+    assert.equal(fake.store.get(LEGACY_KEY), "1", "legacy key is kept");
 
-  // Replace the kind constant in the observer runSeed equivalent with 24200.
-  async function runObserverSeed(pubkey, deps) {
-    if (!pubkey) return;
-    if (deps.hasExplicitChoice(pubkey)) return;
+    await seedAgentMetricArchive("pk1", RELAY_B, deps);
+    assert.equal(merges.length, 1, "second run on same relay is a no-op");
+  } finally {
+    fake.restore();
+  }
+});
+
+test("test_legacy_optout_blocks_seed_on_every_relay", async () => {
+  const fake = installFakeStorage({ [LEGACY_KEY]: "0" });
+  try {
+    const { deps, merges } = realDeps();
+    await seedAgentMetricArchive("pk1", RELAY_A, deps);
+    await seedAgentMetricArchive("pk1", RELAY_B, deps);
+    assert.deepEqual(merges, []);
+  } finally {
+    fake.restore();
+  }
+});
+
+test("test_relay_scoped_choice_skips_merge", async () => {
+  for (const value of ["0", "1"]) {
+    const fake = installFakeStorage({ [scopedKey(RELAY_A)]: value });
     try {
-      await deps.mergeSaveSubscriptionKinds(24200);
-    } catch {
-      return;
+      const { deps, merges } = realDeps();
+      await seedAgentMetricArchive("pk1", RELAY_A, deps);
+      assert.deepEqual(merges, [], `scoped "${value}" must skip the merge`);
+    } finally {
+      fake.restore();
     }
-    deps.setExplicitChoice(pubkey, true);
   }
+});
 
-  // Run both seeds concurrently — no await between them.
-  await Promise.all([
-    runObserverSeed("pubkey123", observerDeps),
-    runSeed("pubkey123", metricDeps),
-  ]);
+test("test_seeded_on_relay_a_then_seeds_relay_b", async () => {
+  const fake = installFakeStorage();
+  try {
+    const { deps, merges } = realDeps();
+    await seedAgentMetricArchive("pk1", RELAY_A, deps);
+    await seedAgentMetricArchive("pk1", RELAY_A, deps);
+    assert.equal(merges.length, 1);
+    await seedAgentMetricArchive("pk1", RELAY_B, deps);
+    assert.equal(merges.length, 2, "relay B must seed after relay A");
+  } finally {
+    fake.restore();
+  }
+});
 
-  assert.ok(
-    db.has(24200),
-    "observer kind 24200 must be present after concurrent seeds",
-  );
-  assert.ok(
-    db.has(44200),
-    "metric kind 44200 must be present after concurrent seeds",
-  );
-  assert.equal(db.size, 2, "exactly two kinds, no extras");
+test("test_storage_read_error_fails_closed_without_merge", async () => {
+  const fake = installFakeStorage();
+  globalThis.window.localStorage.getItem = () => {
+    throw new Error("denied");
+  };
+  try {
+    const { deps, merges } = realDeps();
+    await seedAgentMetricArchive("pk1", RELAY_A, deps);
+    assert.deepEqual(merges, []);
+  } finally {
+    fake.restore();
+  }
+});
+
+test("test_merge_failure_does_not_persist_choice", async () => {
+  const fake = installFakeStorage();
+  try {
+    const { deps } = realDeps({ mergeShouldFail: true });
+    await seedAgentMetricArchive("pk1", RELAY_A, deps);
+    assert.equal(fake.store.has(scopedKey(RELAY_A)), false);
+  } finally {
+    fake.restore();
+  }
+});
+
+test("test_cancelled_seed_does_not_persist_choice", async () => {
+  const fake = installFakeStorage();
+  try {
+    const { deps, merges } = realDeps();
+    await seedAgentMetricArchive("pk1", RELAY_A, deps, () => true);
+    assert.deepEqual(merges, [44200]);
+    assert.equal(fake.store.has(scopedKey(RELAY_A)), false);
+  } finally {
+    fake.restore();
+  }
+});
+
+// Observer and metric seeds race on first run; the DB merge is atomic, so both
+// kinds must survive. Flags are independent per feature.
+test("test_concurrent_seeds_both_kinds_survive", async () => {
+  const fake = installFakeStorage();
+  try {
+    const db = new Set();
+    const merge = async (kind) => {
+      db.add(kind);
+    };
+    await Promise.all([
+      reconcileObserverArchive("pk1", RELAY_A, {
+        mergeSaveSubscriptionKinds: merge,
+        readExplicitChoice: readExplicitObserverArchiveChoice,
+        setExplicitChoice: setExplicitObserverArchiveChoice,
+      }),
+      seedAgentMetricArchive("pk1", RELAY_A, {
+        mergeSaveSubscriptionKinds: merge,
+        hasExplicitChoice: hasExplicitAgentMetricArchiveChoice,
+        setExplicitChoice: setExplicitAgentMetricArchiveChoice,
+      }),
+    ]);
+    assert.deepEqual([...db].sort(), [24200, 44200]);
+  } finally {
+    fake.restore();
+  }
 });

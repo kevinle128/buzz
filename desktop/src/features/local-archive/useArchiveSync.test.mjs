@@ -10,7 +10,7 @@
  * `archive/sync_tests.rs`.
  *
  * These mount the two real hooks composed exactly as AppShell composes them
- * (`useArchiveSync(useObserverArchiveReconciliation(pubkey))`) and assert on
+ * (`useArchiveSync(useObserverArchiveReconciliation(pubkey, relayUrl))`) and assert on
  * the Tauri commands that actually cross the boundary. They replace the
  * ordering tests that drove the deleted `ArchiveSyncManager`: the invariant
  * survived the move to Rust, only its observable did.
@@ -28,6 +28,7 @@ import { useObserverArchiveReconciliation } from "./useObserverArchiveSeed.ts";
 import { useArchiveSync } from "./useArchiveSync.ts";
 
 const PUBKEY = "pk1";
+const RELAY_URL = "wss://relay.example";
 
 /**
  * Loads a fresh instance of the hook module — a new JS realm.
@@ -104,7 +105,11 @@ function mountGate({
   });
 
   function Harness() {
-    const reconciled = useObserverArchiveReconciliation(PUBKEY, deps);
+    const reconciled = useObserverArchiveReconciliation(
+      PUBKEY,
+      RELAY_URL,
+      deps,
+    );
     useArchiveSyncImpl(reconciled);
     return null;
   }

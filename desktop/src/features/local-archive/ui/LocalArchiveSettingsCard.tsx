@@ -16,6 +16,7 @@ import {
   KIND_AGENT_TURN_METRIC,
 } from "@/shared/constants/kinds";
 import { useChannelsQuery } from "@/features/channels/hooks";
+import { useCommunities } from "@/features/communities/useCommunities";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import { Button } from "@/shared/ui/button";
 import { Checkbox } from "@/shared/ui/checkbox";
@@ -398,7 +399,9 @@ export function LocalArchiveSettingsCard() {
   const [observerToggling, setObserverToggling] = React.useState(false);
   const [metricToggling, setMetricToggling] = React.useState(false);
 
+  const { activeCommunity } = useCommunities();
   const pubkey = identityQuery.data?.pubkey ?? "";
+  const relayUrl = activeCommunity?.relayUrl ?? "";
 
   const channelNameById = React.useMemo<Map<string, string>>(() => {
     const map = new Map<string, string>();
@@ -458,7 +461,7 @@ export function LocalArchiveSettingsCard() {
 
   const handleObserverToggle = React.useCallback(
     async (checked: boolean) => {
-      if (!pubkey) return;
+      if (!pubkey || !relayUrl) return;
       setObserverToggling(true);
       try {
         if (checked) {
@@ -466,7 +469,7 @@ export function LocalArchiveSettingsCard() {
         } else {
           await removeSaveSubscriptionKind(KIND_AGENT_OBSERVER_FRAME);
         }
-        setExplicitObserverArchiveChoice(pubkey, checked);
+        setExplicitObserverArchiveChoice(pubkey, relayUrl, checked);
         toast.success(
           checked
             ? "Observer feed archive enabled."
@@ -483,12 +486,12 @@ export function LocalArchiveSettingsCard() {
         setObserverToggling(false);
       }
     },
-    [pubkey, reload],
+    [pubkey, relayUrl, reload],
   );
 
   const handleMetricToggle = React.useCallback(
     async (checked: boolean) => {
-      if (!pubkey) return;
+      if (!pubkey || !relayUrl) return;
       setMetricToggling(true);
       try {
         if (checked) {
@@ -496,7 +499,7 @@ export function LocalArchiveSettingsCard() {
         } else {
           await removeSaveSubscriptionKind(KIND_AGENT_TURN_METRIC);
         }
-        setExplicitAgentMetricArchiveChoice(pubkey, checked);
+        setExplicitAgentMetricArchiveChoice(pubkey, relayUrl, checked);
         toast.success(
           checked
             ? "Agent turn metric archive enabled."
@@ -513,7 +516,7 @@ export function LocalArchiveSettingsCard() {
         setMetricToggling(false);
       }
     },
-    [pubkey, reload],
+    [pubkey, relayUrl, reload],
   );
 
   // Non-owner_p subscriptions shown in the active-subscriptions list.
