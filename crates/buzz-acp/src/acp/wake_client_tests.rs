@@ -148,3 +148,54 @@ async fn wake_request_inside_request_is_not_method_not_found() {
     assert_eq!(lines[1]["result"]["outcome"], "busy", "{lines:?}");
     client.shutdown().await;
 }
+
+const ABORT_INIT_RESULT: &str = r#"{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":2,"agentCapabilities":{"_meta":{"buzz.turnAbort":{"version":1}}}}}"#;
+
+/// Initialize against `init_result`, run one prompt that the stub answers
+/// with `prompt_result`, and return whether the capability was recorded and
+/// what the client took from the prompt result.
+async fn turn_abort_after_prompt(
+    init_result: &str,
+    prompt_result: &str,
+) -> (bool, Option<turn_abort::TurnAbort>) {
+    let record = elicitation_record_path();
+    let body = format!(
+        "rec; printf '%s\\n' '{init_result}'\n\
+         rec; printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{prompt_result}}}'\n\
+         sleep 5"
+    );
+    let mut client = spawn_script(&elicitation_script(&record, &body)).await;
+    client.initialize().await.expect("initialize");
+    let supported = client.turn_abort_supported();
+    client
+        .session_prompt_with_idle_timeout(
+            "s1",
+            "hi",
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("prompt");
+    let abort = client.take_turn_abort();
+    assert!(client.take_turn_abort().is_none(), "taken once");
+    client.shutdown().await;
+    (supported, abort)
+}
+
+#[tokio::test]
+async fn turn_abort_capability_is_recorded_and_the_result_key_does_not_need_it() {
+    let aborted = r#"{"stopReason":"end_turn","_meta":{"buzz.turnAbort":{"reason":"output_truncated","message":"cut"}}}"#;
+    let (supported, abort) = turn_abort_after_prompt(ABORT_INIT_RESULT, aborted).await;
+    assert!(supported);
+    assert_eq!(abort.expect("abort").reason, "output_truncated");
+
+    // An agent that sends the key without advertising it is still honored.
+    let (supported, abort) = turn_abort_after_prompt(PLAIN_INIT_RESULT, aborted).await;
+    assert!(!supported);
+    assert!(abort.is_some());
+
+    // No key, no abort.
+    let (_, abort) =
+        turn_abort_after_prompt(ABORT_INIT_RESULT, r#"{"stopReason":"end_turn"}"#).await;
+    assert!(abort.is_none());
+}
