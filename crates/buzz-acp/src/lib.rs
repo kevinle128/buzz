@@ -1386,24 +1386,32 @@ impl ObserverPublishQueue {
         let owner_only = owner_only_observer_event(&self.events.front()?.2);
 
         let mut picked: Vec<observer::ObserverEvent> = Vec::new();
+        let mut picked_bytes = 0;
         let mut kept: VecDeque<(usize, u64, observer::ObserverEvent)> =
             VecDeque::with_capacity(self.events.len());
         let mut gathering = true;
         while let Some((bytes, source_events, event)) = self.events.pop_front() {
-            if gathering
-                && event.channel_id == channel
-                && owner_only_observer_event(&event) == owner_only
-            {
-                picked.push(event);
-                if picked.len() > 1
-                    && serialized_len(&batch_envelope(&picked)) > OBSERVER_MAX_PLAINTEXT_LEN
+            if gathering && event.channel_id == channel {
+                // The empty envelope already includes the array brackets.
+                // Add cached event sizes and one comma per preceding event;
+                // only the newest event's envelope metadata needs measuring.
+                if owner_only_observer_event(&event) != owner_only {
+                    kept.push_back((bytes, source_events, event));
+                    gathering = false;
+                } else if !picked.is_empty()
+                    && serialized_len(&empty_batch_envelope(&event))
+                        + picked_bytes
+                        + bytes
+                        + picked.len()
+                        > OBSERVER_MAX_PLAINTEXT_LEN
                 {
                     // Frame full: the overflow event stays queued and leads
                     // its channel's next slot.
-                    let event = picked.pop().expect("len > 1");
                     kept.push_back((bytes, source_events, event));
                     gathering = false;
                 } else {
+                    picked.push(event);
+                    picked_bytes += bytes;
                     self.pending_bytes -= bytes;
                 }
             } else {
@@ -1437,6 +1445,12 @@ fn batch_envelope(events: &[observer::ObserverEvent]) -> observer::ObserverEvent
     let last = events
         .last()
         .expect("batch envelope needs at least 1 event");
+    let mut envelope = empty_batch_envelope(last);
+    envelope.payload["events"] = serde_json::to_value(events).unwrap_or_default();
+    envelope
+}
+
+fn empty_batch_envelope(last: &observer::ObserverEvent) -> observer::ObserverEvent {
     observer::ObserverEvent {
         seq: last.seq,
         timestamp: last.timestamp.clone(),
@@ -1447,9 +1461,7 @@ fn batch_envelope(events: &[observer::ObserverEvent]) -> observer::ObserverEvent
         turn_id: last.turn_id.clone(),
         started_at: last.started_at.clone(),
         authorization: None,
-        payload: serde_json::json!({
-            "events": serde_json::to_value(events).unwrap_or_default(),
-        }),
+        payload: serde_json::json!({ "events": [] }),
     }
 }
 
@@ -9868,7 +9880,7 @@ mod observer_snapshot_race_tests {
 }
 
 #[cfg(test)]
-mod observer_publish_queue_tests {
+mod observer_publish_queue_fork_tests {
     use super::*;
 
     fn event(seq: u64, kind: &str, channel: Option<&str>) -> observer::ObserverEvent {
@@ -10489,6 +10501,9 @@ mod observer_publish_queue_tests {
         assert_eq!(queue.dropped_events, 0);
     }
 }
+
+#[cfg(test)]
+mod observer_publish_queue_tests;
 
 #[cfg(test)]
 mod observer_publish_cadence_tests {
