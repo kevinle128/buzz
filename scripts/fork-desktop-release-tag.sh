@@ -1,18 +1,25 @@
 #!/usr/bin/env bash
-# Tags a fork commit as the next desktop release and starts MF Desktop Build on
-# that tag.
+# Tags a fork commit as the next desktop release. MF Desktop Build then runs
+# exactly once, started by one of two paths that the caller picks.
 #
 # Usage: scripts/fork-desktop-release-tag.sh <sha>
-# Needs: GH_REPO (owner/name), GH_TOKEN with contents and actions write, and a
-# git checkout that has <sha> and an `origin` remote.
+# Needs: GH_REPO (owner/name), GH_TOKEN with contents write (and actions write
+# when FORK_RELEASE_DISPATCH=true), and a git checkout that has <sha> and an
+# `origin` remote.
+#
+# Who starts the build depends on the token that creates the tag:
+#   - A personal access token (default): the tag push triggers the `push: tags`
+#     rule of mf-desktop-build.yml by itself. The script starts nothing more,
+#     because a second run would build and publish the same release twice.
+#   - GITHUB_TOKEN inside GitHub Actions: a tag that GITHUB_TOKEN creates
+#     triggers no workflow. The caller sets FORK_RELEASE_DISPATCH=true and the
+#     script starts the build with `workflow_dispatch` on the tag.
+# The script cannot read the kind of a token reliably, so the caller states it.
 #
 # The version core comes from desktop/src-tauri/tauri.conf.json at <sha>. N is
 # one more than the highest published desktop-v<core>-mf.<N> tag (1 when there
-# is none), read from the remote, so a run number never decides it. The tag is
-# created through the API and the build is started by `workflow_dispatch` on
-# the tag: a tag that GITHUB_TOKEN creates starts no workflow by itself, so the
-# build starts exactly once. A commit that already has a fork release tag gets
-# no second tag and no second build.
+# is none), read from the remote, so a run number never decides it. A commit
+# that already has a fork release tag gets no second tag and no second build.
 set -euo pipefail
 
 if [[ $# -ne 1 || ! "$1" =~ ^[0-9a-f]{40}$ ]]; then
@@ -42,5 +49,9 @@ tag="desktop-v${core}-mf.$(( ${last:-0} + 1 ))"
 
 gh api "repos/${GH_REPO}/git/refs" -f ref="refs/tags/${tag}" -f sha="$sha" > /dev/null
 echo "Created tag ${tag} at ${sha:0:9}."
-gh workflow run mf-desktop-build.yml --ref "$tag"
-echo "Started MF Desktop Build for ${tag}."
+if [[ "${FORK_RELEASE_DISPATCH:-}" == "true" ]]; then
+  gh workflow run mf-desktop-build.yml --ref "$tag"
+  echo "Started MF Desktop Build for ${tag}."
+else
+  echo "The tag push starts MF Desktop Build for ${tag}; no dispatch."
+fi

@@ -872,7 +872,10 @@ test("the release tag is the next mf number of the desktop version and is built 
           `scripts/fork-desktop-release-tag.sh ${mergeSha}`,
           {
             cwd: repo,
-            env: { GH_REPO: "kevinle128/buzz" },
+            env: {
+              GH_REPO: "kevinle128/buzz",
+              FORK_RELEASE_DISPATCH: "true",
+            },
           },
         );
         assert.equal(result.status, scenario.status ?? 0, result.stdout);
@@ -889,6 +892,37 @@ test("the release tag is the next mf number of the desktop version and is built 
       });
     });
   }
+});
+
+test("a tag created with a personal access token is not dispatched, because the tag push starts the build", () => {
+  withReleaseRepo({}, ({ repo, mergeSha }) => {
+    const result = runScript(
+      `scripts/fork-desktop-release-tag.sh ${mergeSha}`,
+      {
+        cwd: repo,
+        env: { GH_REPO: "kevinle128/buzz" },
+      },
+    );
+    assert.equal(result.status, 0, result.stdout);
+    assert.deepEqual(tagCalls(result.calls), [
+      releaseCalls(mergeSha, "desktop-v0.5.28-mf.1")[0],
+    ]);
+    assert.match(
+      result.stdout,
+      /tag push starts MF Desktop Build for desktop-v0\.5\.28-mf\.1; no dispatch/,
+    );
+  });
+});
+
+test("both workflows tell the release script to dispatch, because GITHUB_TOKEN tags start no build", () => {
+  assert.match(
+    stepBlock(syncWorkflow, "release"),
+    /\n {8}env:\n(?: {10}\S.*\n)*? {10}FORK_RELEASE_DISPATCH: "true"\n(?: {10}\S.*\n)* {8}run: scripts\/fork-desktop-release-tag\.sh /,
+  );
+  assert.match(
+    resumeWorkflow,
+    /- name: Close the conflict issue and start the build\n {8}env:\n(?: {10}\S.*\n)*? {10}FORK_RELEASE_DISPATCH: "true"\n(?: {10}\S.*\n)* {8}run: \|\n(?: {10}.*\n|\n)*? {10}.*scripts\/fork-desktop-release-tag\.sh "\$SHA"/,
+  );
 });
 
 test("the resume releases only after a sync pull request merge that contains the issue's upstream commit", async (t) => {
@@ -966,7 +1000,11 @@ test("the resume releases only after a sync pull request merge that contains the
               },
             ],
             pulls: scenario.pulls,
-            env: { GH_REPO: "kevinle128/buzz", SHA: mergeSha },
+            env: {
+              GH_REPO: "kevinle128/buzz",
+              SHA: mergeSha,
+              FORK_RELEASE_DISPATCH: "true",
+            },
           });
           assert.equal(result.status, 0, result.stdout);
           assert.deepEqual(
@@ -995,7 +1033,10 @@ test("the desktop build mirrors the installers on the tag's GitHub Release after
   for (const asset of ["_aarch64.dmg", "_x64-setup.exe", "_amd64.AppImage"]) {
     assert.ok(release.includes(asset), `release attaches ${asset}`);
   }
-  assert.match(release, /gh release upload "\$tag" "\$dmg" "\$exe" "\$appimage" --clobber/);
+  assert.match(
+    release,
+    /gh release upload "\$tag" "\$dmg" "\$exe" "\$appimage" --clobber/,
+  );
   assert.match(release, /gh release edit "\$tag" --draft=false --latest/);
   // The updater feed stays on the CDN; this job never touches the bucket.
   assert.doesNotMatch(release, /aws s3/);

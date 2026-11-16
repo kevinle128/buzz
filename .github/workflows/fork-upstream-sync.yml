@@ -552,6 +552,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          FORK_RELEASE_DISPATCH: "true"
         run: scripts/fork-desktop-release-tag.sh "$(git rev-parse HEAD)"
 
       - name: Find failed stage
