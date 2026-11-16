@@ -1439,6 +1439,34 @@ impl ReplyAncestry {
     }
 }
 
+/// Why [`resolve_relay_reply_thread_meta`] could not resolve a reply target.
+///
+/// Callers that persist a deterministic rejection must not persist a database
+/// failure, so the two are kept apart. `Display` keeps the historic messages.
+#[derive(Debug)]
+pub(crate) enum ReplyAncestryError {
+    /// The parent ID is not valid hex.
+    InvalidParentId,
+    /// The parent is unknown, not readable, or in another channel. One variant
+    /// for all cases, so a rejection never reveals whether or where it exists.
+    ParentNotFound,
+    /// The reply would exceed the thread depth limit.
+    DepthExceeded,
+    /// A database lookup failed.
+    Database(String),
+}
+
+impl std::fmt::Display for ReplyAncestryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidParentId => f.write_str("invalid parent event ID hex"),
+            Self::ParentNotFound => f.write_str("reply parent not found"),
+            Self::DepthExceeded => f.write_str("thread depth limit exceeded"),
+            Self::Database(message) => f.write_str(message),
+        }
+    }
+}
+
 /// Resolve thread ancestry for a reply built by the relay (workflow path).
 ///
 /// Unlike [`resolve_nip10_thread_meta`], which validates client-supplied NIP-10
@@ -1451,9 +1479,8 @@ pub(crate) async fn resolve_relay_reply_thread_meta(
     channel_id: Uuid,
     reader: &[u8],
     state: &AppState,
-) -> Result<ReplyAncestry, String> {
-    let parent_bytes =
-        hex::decode(parent_hex).map_err(|_| "invalid parent event ID hex".to_string())?;
+) -> Result<ReplyAncestry, ReplyAncestryError> {
+    let parent_bytes = hex::decode(parent_hex).map_err(|_| ReplyAncestryError::InvalidParentId)?;
 
     let (parent_event_result, parent_meta_result) = tokio::join!(
         state
@@ -1465,16 +1492,17 @@ pub(crate) async fn resolve_relay_reply_thread_meta(
     );
 
     let parent_event = parent_event_result
-        .map_err(|e| format!("db error looking up parent: {e}"))?
+        .map_err(|e| ReplyAncestryError::Database(format!("db error looking up parent: {e}")))?
         .filter(|parent| target_readable_in_channel(parent, channel_id, reader))
-        .ok_or_else(|| "reply parent not found".to_string())?;
+        .ok_or(ReplyAncestryError::ParentNotFound)?;
 
     let parent_created =
         chrono::DateTime::from_timestamp(parent_event.event.created_at.as_secs() as i64, 0)
             .unwrap_or_else(Utc::now);
 
-    let parent_meta =
-        parent_meta_result.map_err(|e| format!("db error looking up thread metadata: {e}"))?;
+    let parent_meta = parent_meta_result.map_err(|e| {
+        ReplyAncestryError::Database(format!("db error looking up thread metadata: {e}"))
+    })?;
 
     // Root = parent's root if the parent is itself a reply, else the parent.
     // Depth = parent depth + 1 (a direct reply to a top-level message is depth 1).
@@ -1511,7 +1539,7 @@ pub(crate) async fn resolve_relay_reply_thread_meta(
     };
 
     if depth > 100 {
-        return Err("thread depth limit exceeded".to_string());
+        return Err(ReplyAncestryError::DepthExceeded);
     }
 
     Ok(ReplyAncestry {

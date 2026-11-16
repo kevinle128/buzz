@@ -60,6 +60,8 @@ pub enum RouteFailure {
     RouteStale,
     /// Idempotency key reused with a different payload hash.
     IdempotencyConflict,
+    /// The requested reply target is unknown, not readable, or in another channel.
+    ReplyTargetInvalid,
 }
 
 impl RouteFailure {
@@ -78,6 +80,7 @@ impl RouteFailure {
             Self::RouteUnauthorized => "route_unauthorized",
             Self::RouteStale => "route_stale",
             Self::IdempotencyConflict => "idempotency_conflict",
+            Self::ReplyTargetInvalid => "reply_target_invalid",
         }
     }
 
@@ -105,6 +108,7 @@ impl RouteFailure {
             Self::RouteUnauthorized => "route is unauthorized",
             Self::RouteStale => "route is no longer valid",
             Self::IdempotencyConflict => "idempotency key already used with a different payload",
+            Self::ReplyTargetInvalid => "reply target could not be resolved",
         }
     }
 
@@ -123,6 +127,7 @@ impl RouteFailure {
             "route_unauthorized" => Some(Self::RouteUnauthorized),
             "route_stale" => Some(Self::RouteStale),
             "idempotency_conflict" => Some(Self::IdempotencyConflict),
+            "reply_target_invalid" => Some(Self::ReplyTargetInvalid),
             _ => None,
         }
     }
@@ -296,6 +301,14 @@ where
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn reply_target_invalid_round_trips_as_admission_rejection() {
+        let failure = RouteFailure::ReplyTargetInvalid;
+        assert_eq!(RouteFailure::from_code(failure.code()), Some(failure));
+        assert_eq!(failure.http_status(), 422);
+        assert!(failure.is_admission_rejection());
+    }
 
     #[test]
     fn idempotency_key_requires_a_non_empty_string() {

@@ -31,6 +31,7 @@ use uuid::Uuid;
 
 use crate::api::api_error_with_code;
 use crate::handlers::event::dispatch_persistent_event;
+use crate::handlers::ingest::{resolve_relay_reply_thread_meta, ReplyAncestry, ReplyAncestryError};
 use crate::message_mentions::resolve_mention_pubkeys;
 use crate::project_route::{
     authorize_unique_project_route, project_head_from_event, repository_head_from_event,
@@ -52,6 +53,7 @@ const ALLOWED_KEYS: &[&str] = &[
     "event_type",
     "content",
     "metadata",
+    "reply_to",
 ];
 
 /// Handle `POST /hooks/apps/{app_id}` after the bridge extracts route data.
@@ -309,7 +311,17 @@ struct ValidatedCallback {
     target: CallbackTarget,
     event_type: String,
     content: String,
+    /// Lowercase hex ID of the event this callback replies to, if any.
+    reply_to: Option<String>,
     payload: Value,
+}
+
+/// True when `value` is a 64-character lowercase hex event ID.
+fn valid_event_id_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 fn non_empty_string(
@@ -362,6 +374,11 @@ fn parse_callback(body: Value) -> Result<ValidatedCallback, ParseError> {
             return Err(ParseError::InvalidControl);
         }
     }
+    let reply_to = match obj.get("reply_to") {
+        None => None,
+        Some(Value::String(id)) if valid_event_id_hex(id) => Some(id.clone()),
+        Some(_) => return Err(ParseError::InvalidControl),
+    };
     let payload = strip_idempotency_key(body);
     let key_hash = hash_idempotency_key(&idempotency_key);
     drop(idempotency_key);
@@ -370,6 +387,7 @@ fn parse_callback(body: Value) -> Result<ValidatedCallback, ParseError> {
         target,
         event_type,
         content,
+        reply_to,
         payload,
     })
 }
@@ -507,6 +525,22 @@ fn named_member_pairs(
         .collect()
 }
 
+/// NIP-10 `e` tags for a reply, in the shape every Buzz writer uses: a direct
+/// reply (parent is the root) has one `reply` tag; a nested reply has a `root`
+/// tag and a `reply` tag. A lone `root` tag does not make a reply.
+fn nip10_reply_tags(root_hex: &str, parent_hex: &str) -> Result<Vec<Tag>, ()> {
+    if root_hex == parent_hex {
+        return Ok(vec![
+            Tag::parse(["e", root_hex, "", "reply"]).map_err(|_| ())?
+        ]);
+    }
+    Ok(vec![
+        Tag::parse(["e", root_hex, "", "root"]).map_err(|_| ())?,
+        Tag::parse(["e", parent_hex, "", "reply"]).map_err(|_| ())?,
+    ])
+}
+
+#[allow(clippy::too_many_arguments)] // Each argument is one distinct part of the signed event.
 fn build_app_event(
     state: &AppState,
     app_id: Uuid,
@@ -514,6 +548,7 @@ fn build_app_event(
     event_type: &str,
     content: &str,
     route: &AppRouteSnapshot,
+    reply: Option<&ReplyAncestry>,
     mention_pubkeys: &[String],
 ) -> Result<Event, ()> {
     let mut tags = vec![
@@ -528,6 +563,9 @@ fn build_app_event(
     }
     tags.push(Tag::parse(["buzz:app-delivery", &delivery_id.to_string()]).map_err(|_| ())?);
     tags.push(Tag::parse(["buzz:app-event", event_type]).map_err(|_| ())?);
+    if let Some(reply) = reply {
+        tags.extend(nip10_reply_tags(&reply.root_hex(), &reply.parent_hex())?);
+    }
     for pubkey in mention_pubkeys {
         tags.push(Tag::parse(["p", pubkey]).map_err(|_| ())?);
     }
@@ -855,6 +893,50 @@ async fn admit_vacant(
         }
     };
 
+    let reply = match &validated.reply_to {
+        None => None,
+        Some(parent_hex) => {
+            let reader = state.relay_keypair.public_key().to_bytes();
+            match resolve_relay_reply_thread_meta(
+                community_id,
+                parent_hex,
+                snapshot.channel_id,
+                &reader,
+                &state,
+            )
+            .await
+            {
+                Ok(ancestry) => Some(ancestry),
+                Err(ReplyAncestryError::Database(_)) => {
+                    drop(guard);
+                    return Err((
+                        unavailable_err(),
+                        observe(
+                            Some(community_uuid),
+                            Some(app_id),
+                            None,
+                            "unavailable",
+                            "none",
+                        ),
+                    ));
+                }
+                Err(
+                    ReplyAncestryError::InvalidParentId
+                    | ReplyAncestryError::ParentNotFound
+                    | ReplyAncestryError::DepthExceeded,
+                ) => {
+                    return reject_vacant(
+                        community_uuid,
+                        app_id,
+                        guard,
+                        RouteFailure::ReplyTargetInvalid,
+                    )
+                    .await;
+                }
+            }
+        }
+    };
+
     let members = match guard
         .list_named_destination_members(snapshot.channel_id)
         .await
@@ -884,6 +966,7 @@ async fn admit_vacant(
         &validated.event_type,
         &validated.content,
         &snapshot,
+        reply.as_ref(),
         &mention_pubkeys,
     ) {
         Ok(event) => event,
@@ -902,7 +985,23 @@ async fn admit_vacant(
         }
     };
 
-    let commit = match guard.deliver(&event, &snapshot).await {
+    let thread_meta = reply.map(|ancestry| {
+        let created_at = chrono::DateTime::from_timestamp(event.created_at.as_secs() as i64, 0)
+            .unwrap_or_else(chrono::Utc::now);
+        ancestry.into_thread_meta(
+            event.id.as_bytes().to_vec(),
+            created_at,
+            snapshot.channel_id,
+        )
+    });
+    let commit = match guard
+        .deliver(
+            &event,
+            &snapshot,
+            thread_meta.as_ref().map(|meta| meta.as_params()),
+        )
+        .await
+    {
         Ok(commit) => commit,
         Err(_) => {
             return Err((
@@ -928,6 +1027,16 @@ async fn admit_vacant(
         None,
     )
     .await;
+    // A reply changes its thread's counters; push a fresh thread summary the
+    // same way the ingest and workflow reply paths do.
+    if let Some(meta) = &thread_meta {
+        crate::handlers::side_effects::emit_live_thread_summary(
+            &tenant,
+            &state,
+            snapshot.channel_id,
+            meta.root_event_id.clone(),
+        );
+    }
 
     let ok = delivered_json(&commit.record, false);
     Ok((
@@ -1266,6 +1375,93 @@ mod tests {
             canonical_payload_hash(&omitted.payload).unwrap(),
             canonical_payload_hash(&empty.payload).unwrap()
         );
+    }
+
+    fn reply_body(reply_to: Value) -> Value {
+        json!({
+            "idempotency_key": "k",
+            "channel_name": "ops",
+            "event_type": "push",
+            "content": "hi",
+            "reply_to": reply_to,
+        })
+    }
+
+    #[test]
+    fn parse_callback_accepts_lowercase_hex_reply_to() {
+        let id = "ab".repeat(32);
+        let parsed = parse_callback(reply_body(json!(id))).expect("valid reply_to");
+        assert_eq!(parsed.reply_to.as_deref(), Some(id.as_str()));
+
+        let without = parse_callback(json!({
+            "idempotency_key": "k",
+            "channel_name": "ops",
+            "event_type": "push",
+            "content": "hi",
+        }))
+        .expect("no reply_to");
+        assert!(without.reply_to.is_none());
+    }
+
+    #[test]
+    fn parse_callback_rejects_invalid_reply_to() {
+        let cases = [
+            json!(null),
+            json!(""),
+            json!(42),
+            json!(["ab".repeat(32)]),
+            json!("ab".repeat(31)),
+            json!("ab".repeat(33)),
+            json!("AB".repeat(32)),
+            json!(format!("{}zz", "ab".repeat(31))),
+            json!(format!("0x{}", "ab".repeat(31))),
+        ];
+        for value in cases {
+            assert!(
+                matches!(
+                    parse_callback(reply_body(value.clone())),
+                    Err(ParseError::InvalidControl)
+                ),
+                "reply_to {value} must be rejected as an invalid control field"
+            );
+        }
+    }
+
+    #[test]
+    fn reply_to_is_part_of_the_payload_hash() {
+        let first = parse_callback(reply_body(json!("ab".repeat(32)))).expect("first");
+        let second = parse_callback(reply_body(json!("cd".repeat(32)))).expect("second");
+        let none = parse_callback(json!({
+            "idempotency_key": "k",
+            "channel_name": "ops",
+            "event_type": "push",
+            "content": "hi",
+        }))
+        .expect("none");
+        let first_hash = canonical_payload_hash(&first.payload).unwrap();
+        assert_ne!(first_hash, canonical_payload_hash(&second.payload).unwrap());
+        assert_ne!(first_hash, canonical_payload_hash(&none.payload).unwrap());
+    }
+
+    #[test]
+    fn nip10_reply_tags_match_the_shared_resolver() {
+        let root = "aa".repeat(32);
+        let parent = "bb".repeat(32);
+        let cases = [(root.clone(), root.clone()), (root.clone(), parent.clone())];
+        for (root_hex, parent_hex) in cases {
+            let tags = nostr::Tags::from_list(
+                nip10_reply_tags(&root_hex, &parent_hex).expect("build tags"),
+            );
+            assert_eq!(
+                buzz_core::nip10::parse_thread_markers(&tags).resolve(),
+                Some((root_hex.clone(), parent_hex.clone())),
+                "tags for root={root_hex} parent={parent_hex} must resolve to the same pair"
+            );
+        }
+        let direct = nip10_reply_tags(&root, &root).expect("direct");
+        assert_eq!(direct.len(), 1, "a direct reply has one reply tag");
+        let nested = nip10_reply_tags(&root, &parent).expect("nested");
+        assert_eq!(nested.len(), 2, "a nested reply has root and reply tags");
     }
 
     #[test]
