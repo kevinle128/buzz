@@ -915,9 +915,14 @@ test("a tag created with a personal access token is not dispatched, because the 
 });
 
 test("both workflows tell the release script to dispatch, because GITHUB_TOKEN tags start no build", () => {
-  for (const workflow of [syncWorkflow, resumeWorkflow]) {
-    assert.match(workflow, /FORK_RELEASE_DISPATCH: "true"/);
-  }
+  assert.match(
+    stepBlock(syncWorkflow, "release"),
+    /\n {8}env:\n(?: {10}\S.*\n)*? {10}FORK_RELEASE_DISPATCH: "true"\n(?: {10}\S.*\n)* {8}run: scripts\/fork-desktop-release-tag\.sh /,
+  );
+  assert.match(
+    resumeWorkflow,
+    /- name: Close the conflict issue and start the build\n {8}env:\n(?: {10}\S.*\n)*? {10}FORK_RELEASE_DISPATCH: "true"\n(?: {10}\S.*\n)* {8}run: \|\n(?: {10}.*\n|\n)*? {10}.*scripts\/fork-desktop-release-tag\.sh "\$SHA"/,
+  );
 });
 
 test("the resume releases only after a sync pull request merge that contains the issue's upstream commit", async (t) => {
