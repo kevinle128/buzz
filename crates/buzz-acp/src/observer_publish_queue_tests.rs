@@ -10,6 +10,7 @@ fn event(seq: u64, kind: &str, channel: Option<&str>) -> observer::ObserverEvent
         session_id: Some("session-1".to_string()),
         turn_id: Some("turn-1".to_string()),
         started_at: None,
+        authorization: None,
         payload: serde_json::json!({ "seq": seq }),
     }
 }
