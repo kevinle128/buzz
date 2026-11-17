@@ -529,7 +529,6 @@ class ComposeBar extends HookConsumerWidget {
     // Insert `#` at the cursor to manually trigger channel mode.
     void triggerChannel() => _insertTriggerAtCursor(controller, focusNode, '#');
 
-    // Insert a selected emoji at the cursor without replacing the draft.
     void insertEmoji(String emoji) {
       final text = controller.text;
       final selection = controller.selection;
@@ -560,7 +559,6 @@ class ComposeBar extends HookConsumerWidget {
       _removePendingAttachment(attachments, draftRevision, id);
     }
 
-    // Send the message.
     Future<void> send() async {
       final text = controller.text.trim();
       if ((draftMembers != null && preparingAttachments.value > 0) ||
